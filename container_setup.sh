@@ -221,9 +221,20 @@ cargo check || log_warning "Failed to check Aya crate"
 # Build Nushell to ensure all dependencies are cached (if Cargo.toml exists)
 log_info "Checking if Nushell can be built..."
 if [ -f "/workspace/nushell/Cargo.toml" ]; then
-    log_info "Building Nushell to cache dependencies..."
+    log_info "Caching Nushell dependencies (including test dependencies)..."
     cd /workspace/nushell
+    
+    # Cache main dependencies
     cargo check || log_warning "Failed to check Nushell"
+    
+    # Cache test dependencies by fetching them
+    log_info "Caching test dependencies..."
+    cargo fetch || log_warning "Failed to fetch all dependencies"
+    
+    # Try to cache test dependencies for specific packages
+    log_info "Caching nu-command test dependencies..."
+    cargo test -p nu-command --no-run 2>/dev/null || log_warning "Failed to cache nu-command test dependencies"
+    
 else
     log_info "No Cargo.toml found in /workspace/nushell - skipping Nushell build"
 fi

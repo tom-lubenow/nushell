@@ -50,3 +50,6 @@ tarpaulin-report.html
 
 # pre-commit-hooks
 .pre-commit-config.yaml
+
+# eBPF development offline resources (created by container_setup.sh)
+/offline_resources/

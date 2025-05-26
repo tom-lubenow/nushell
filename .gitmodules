@@ -1,0 +1,3 @@
+[submodule "external/aya"]
+	path = external/aya
+	url = https://github.com/aya-rs/aya.git

@@ -4,6 +4,7 @@ mod any;
 mod append;
 mod assignment;
 mod base;
+mod bpf_kprobe;
 mod break_;
 mod bytes;
 mod cal;

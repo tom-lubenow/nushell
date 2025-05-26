@@ -455,6 +455,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             JobId,
             JobTag,
             Job,
+            BpfKprobe,
         };
 
         #[cfg(not(target_family = "wasm"))]

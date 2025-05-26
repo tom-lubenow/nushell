@@ -41,51 +41,6 @@ KERNEL_DIR="$OFFLINE_DIR/kernel"
 log_info "Creating offline resource directories..."
 mkdir -p "$DOCS_DIR" "$REPOS_DIR" "$TOOLS_DIR" "$KERNEL_DIR"
 
-# # Update system and install essential packages
-# log_info "Installing system dependencies..."
-# apt-get update
-# apt-get install -y \
-#     build-essential \
-#     clang \
-#     llvm \
-#     libbpf-dev \
-#     linux-headers-generic \
-#     linux-tools-common \
-#     linux-tools-generic \
-#     git \
-#     curl \
-#     wget \
-#     unzip \
-#     jq \
-#     tree \
-#     vim \
-#     less \
-#     man-db \
-#     manpages-dev \
-#     strace \
-#     ltrace \
-#     gdb \
-#     valgrind \
-#     pkg-config \
-#     libssl-dev \
-#     zlib1g-dev
-
-# # Try to install bpftool from available packages
-# log_info "Installing bpftool..."
-# apt-get install -y linux-tools-$(uname -r) || \
-# apt-get install -y linux-hwe-6.5-tools-common || \
-# apt-get install -y linux-tools-6.5.0-45-generic || \
-# log_warning "Could not install bpftool via package manager"
-
-# # Install Rust if not already present (codex-universal should have it)
-# if ! command -v rustc &> /dev/null; then
-#     log_info "Installing Rust..."
-#     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-#     source ~/.cargo/env
-# else
-#     log_success "Rust already installed"
-# fi
-
 # # Install nightly Rust (required for -Z build-std and eBPF development)
 log_info "Installing Rust nightly (required for eBPF development)..."
 rustup install nightly
@@ -223,9 +178,6 @@ log_info "Checking if Nushell can be built..."
 if [ -f "/workspace/nushell/Cargo.toml" ]; then
     log_info "Caching Nushell dependencies (including test dependencies)..."
     cd /workspace/nushell
-    
-    # Cache main dependencies
-    cargo check || log_warning "Failed to check Nushell"
     
     # Cache test dependencies by fetching them
     log_info "Caching test dependencies..."

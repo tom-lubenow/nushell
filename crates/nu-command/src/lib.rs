@@ -6,6 +6,7 @@ mod conversions;
 mod date;
 mod debug;
 mod default_context;
+mod ebpf;
 mod env;
 mod example_test;
 mod experimental;
@@ -41,6 +42,7 @@ pub use conversions::*;
 pub use date::*;
 pub use debug::*;
 pub use default_context::*;
+pub use ebpf::*;
 pub use env::*;
 #[cfg(test)]
 pub use example_test::{test_examples, test_examples_with_commands};

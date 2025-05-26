@@ -41,6 +41,35 @@ KERNEL_DIR="$OFFLINE_DIR/kernel"
 log_info "Creating offline resource directories..."
 mkdir -p "$DOCS_DIR" "$REPOS_DIR" "$TOOLS_DIR" "$KERNEL_DIR"
 
+# Update system and install essential packages
+log_info "Installing system dependencies..."
+apt-get update
+apt-get install -y \
+    build-essential \
+    clang \
+    llvm \
+    libbpf-dev \
+    linux-headers-generic \
+    linux-tools-common \
+    linux-tools-generic \
+    git \
+    curl \
+    wget \
+    unzip \
+    jq \
+    tree \
+    vim \
+    less \
+    man-db \
+    manpages-dev \
+    strace \
+    ltrace \
+    gdb \
+    valgrind \
+    pkg-config \
+    libssl-dev \
+    zlib1g-dev
+
 # # Install nightly Rust (required for -Z build-std and eBPF development)
 log_info "Installing Rust nightly (required for eBPF development)..."
 rustup install nightly

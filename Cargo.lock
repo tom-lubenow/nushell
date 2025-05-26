@@ -3770,6 +3770,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nu-ebpf"
+version = "0.104.2"
+dependencies = [
+ "nu-protocol",
+]
+
+[[package]]
 name = "nu-engine"
 version = "0.104.2"
 dependencies = [

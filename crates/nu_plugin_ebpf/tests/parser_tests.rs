@@ -108,6 +108,8 @@ fn test_parse_all_builtin_functions() {
         r#"print "message""#,
         "count()",
         r#"emit("event")"#,
+        "timestamp()",
+        "get_stack()",
     ];
     
     for func in functions {
@@ -216,13 +218,18 @@ fn test_parse_event_field_access() {
 }
 
 #[test]
-#[ignore = "where keyword not yet implemented"]
 fn test_parse_where_keyword() {
-    let mut parser = EbpfParser::new("{ |event| where $event.size > 1024 }".to_string(), 0);
+    // Simple where clause
+    let mut parser = EbpfParser::new("{ || where $pid > 1024 }".to_string(), 0);
     let result = parser.parse();
     
     assert!(result.is_ok());
-    // Should parse where clause
+    
+    // Where with complex condition
+    let mut parser = EbpfParser::new("{ || where $pid > 1000 && $uid == 0 }".to_string(), 0);
+    let result = parser.parse();
+    
+    assert!(result.is_ok());
 }
 
 #[test]

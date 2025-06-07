@@ -7,8 +7,9 @@ use std::collections::HashMap;
 /// - Comparisons: ==, !=, <, <=, >, >=
 /// - Boolean operations: &&, ||
 /// - Variables: $pid, $uid, $comm
-/// - Functions: print(), count(), emit()
+/// - Functions: print(), count(), emit(), timestamp(), get_stack()
 /// - Literals: strings and integers
+/// - Keywords: if/else, where
 /// - Simple if/else statements
 pub struct EbpfParser {
     source: String,
@@ -286,6 +287,8 @@ impl EbpfParser {
                 // Check for keywords
                 if ident == "if" {
                     return self.parse_if_expression();
+                } else if ident == "where" {
+                    return self.parse_where_expression();
                 }
                 
                 // Function call
@@ -483,6 +486,19 @@ impl EbpfParser {
         // For now, return a placeholder expression
         // In actual implementation, we'd need to generate proper control flow
         Ok(self.create_function_call("if".to_string(), vec![condition]))
+    }
+    
+    fn parse_where_expression(&mut self) -> Result<Expression, String> {
+        // Parse 'where' as a filter expression
+        // where $condition acts as a filter that only allows execution when condition is true
+        self.skip_whitespace();
+        
+        // Parse the filter condition
+        let condition = self.parse_or_expression()?;
+        
+        // Create a where expression as a special function call
+        // In code generation, this will be translated to a conditional return
+        Ok(self.create_function_call("where".to_string(), vec![condition]))
     }
     
     fn parse_block_body(&mut self) -> Result<Expression, String> {

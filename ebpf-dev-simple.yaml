@@ -1,0 +1,93 @@
+# Simplified Lima configuration for eBPF development with Nushell
+
+# VM type: Ubuntu 22.04 with kernel headers
+images:
+- location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+  arch: "x86_64"
+- location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+
+# CPU and memory for eBPF compilation
+cpus: 4
+memory: "8GiB"
+disk: "20GiB"
+
+# Mounts to share code with host
+mounts:
+- location: "~/proj/nushell"
+  writable: true
+- location: "/tmp/lima"
+  writable: true
+
+# SSH configuration
+ssh:
+  localPort: 0
+  loadDotSSHPubKeys: true
+
+# Provision script to set up eBPF development environment
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    
+    # Update packages
+    apt-get update
+    
+    # Install essential build tools
+    apt-get install -y \
+      build-essential \
+      pkg-config \
+      libssl-dev \
+      cmake \
+      git \
+      curl \
+      wget \
+      clang \
+      llvm \
+      libelf-dev \
+      linux-tools-common \
+      linux-tools-generic \
+      linux-headers-$(uname -r) \
+      bpftool \
+      libbpf-dev
+    
+    # Enable BPF syscall for unprivileged users (development only)
+    sysctl kernel.unprivileged_bpf_disabled=0 || true
+
+- mode: user
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    
+    # Install Rust
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source "$HOME/.cargo/env"
+    
+    # Install cargo-bpf for eBPF development
+    cargo install cargo-bpf || true
+    
+    # Install bpf-linker
+    cargo install bpf-linker || true
+    
+    # Add rust target for eBPF
+    rustup target add bpfel-unknown-none
+    rustup target add bpfeb-unknown-none
+
+# Message to display after VM starts
+message: |
+  eBPF Development VM for Nushell
+  ================================
+  
+  To get started:
+    limactl shell ebpf-dev-simple
+    cd ~/proj/nushell
+    cargo build --release
+    
+  To test eBPF programs (requires sudo):
+    sudo cargo test --package nu_plugin_ebpf
+    
+  BPF tools available:
+    - bpftool
+    - cargo-bpf
+    - bpf-linker

@@ -3,10 +3,6 @@ use nu_protocol::{Category, LabeledError, Signature, SyntaxShape, Type, Value, a
 use nu_ebpf::generate_kprobe;
 use crate::parser::EbpfParser;
 
-#[cfg(target_os = "linux")]
-use std::process::Command;
-#[cfg(target_os = "linux")]
-use std::fs;
 
 use crate::EbpfPlugin;
 
@@ -117,18 +113,45 @@ On non-Linux systems, this command will only generate and validate the eBPF code
         
         show_phase4_features(&block);
 
-        // Try to compile the generated code
+        // Try to compile and load the generated code
         #[cfg(target_os = "linux")]
         {
-            match compile_rust_to_ebpf(&rust_source, &probe_name) {
-                Ok(object_path) => {
-                    eprintln!("✅ Successfully compiled eBPF program to: {}", object_path);
-                    eprintln!("📝 Note: Program generated but not loaded (Phase 4 implementation)");
+            use crate::loader::{compile_ebpf_source, load_kprobe_program};
+            use std::path::PathBuf;
+            
+            // Create a temporary path for the compiled program
+            let temp_dir = std::env::temp_dir();
+            let bytecode_path = temp_dir.join(format!("{}.o", probe_name));
+            
+            // First compile the eBPF program
+            match compile_ebpf_source(&rust_source, &bytecode_path) {
+                Ok(()) => {
+                    eprintln!("✅ Successfully compiled eBPF program");
                     
-                    Ok(Value::string(
-                        format!("eBPF program generated and compiled for function '{}'. Enhanced with Phase 4 language features.", function_name),
-                        call.head,
-                    ))
+                    // Try to load it into the kernel
+                    match load_kprobe_program(&bytecode_path, &function_name, &probe_name) {
+                        Ok(handle) => {
+                            eprintln!("🚀 Successfully loaded eBPF program into kernel!");
+                            eprintln!("📊 Program attached to: {}", handle.function_name());
+                            
+                            // Store the handle in plugin state for later use
+                            // For now, we just demonstrate successful loading
+                            
+                            Ok(Value::string(
+                                format!("eBPF program successfully loaded and attached to function '{}'. Phase 5 implementation active!", function_name),
+                                call.head,
+                            ))
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  Failed to load into kernel: {}", e);
+                            eprintln!("📝 This typically requires root privileges");
+                            
+                            Ok(Value::string(
+                                format!("eBPF program compiled but not loaded ({}). Try running with sudo.", e),
+                                call.head,
+                            ))
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("❌ Compilation failed: {}", e);
@@ -265,66 +288,4 @@ fn show_ebpf_constraints() {
     eprintln!("{}", nu_ebpf::constraints::max_constraints());
 }
 
-/// Compile Rust source code to eBPF bytecode (Linux only)
-#[cfg(target_os = "linux")]
-fn compile_rust_to_ebpf(rust_source: &str, program_name: &str) -> Result<String, String> {
-    // Create a temporary directory for our eBPF project
-    let temp_dir = tempfile::tempdir().map_err(|e| format!("Failed to create temp dir: {}", e))?;
-    let project_path = temp_dir.path();
-    
-    // Create a minimal Cargo.toml for the eBPF program with Phase 4 dependencies
-    let cargo_toml = format!(r#"
-[package]
-name = "{}"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-aya-bpf = "0.1"
-aya-log-ebpf = "0.1"
-
-[[bin]]
-name = "{}"
-path = "src/main.rs"
-
-[profile.release]
-lto = true
-panic = "abort"
-debug = false
-
-# Phase 4: Enhanced eBPF compilation settings
-[package.metadata.cargo-ebpf]
-target = "bpfel-unknown-none"
-"#, program_name, program_name);
-
-    // Write Cargo.toml
-    let cargo_toml_path = project_path.join("Cargo.toml");
-    fs::write(&cargo_toml_path, cargo_toml)
-        .map_err(|e| format!("Failed to write Cargo.toml: {}", e))?;
-
-    // Create src directory and write the generated Rust source
-    let src_dir = project_path.join("src");
-    fs::create_dir_all(&src_dir)
-        .map_err(|e| format!("Failed to create src directory: {}", e))?;
-    
-    let main_rs_path = src_dir.join("main.rs");
-    fs::write(&main_rs_path, rust_source)
-        .map_err(|e| format!("Failed to write main.rs: {}", e))?;
-
-    // Try to compile with cargo (enhanced for Phase 4)
-    eprintln!("🔨 Compiling eBPF program with enhanced Phase 4 features...");
-    let output = Command::new("cargo")
-        .arg("check")
-        .arg("--release")
-        .current_dir(project_path)
-        .output()
-        .map_err(|e| format!("Failed to run cargo: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Cargo check failed:\n{}", stderr));
-    }
-
-    eprintln!("✅ Phase 4 eBPF program compilation check passed!");
-    Ok(format!("{}/target/release/{}", project_path.display(), program_name))
-} 
+ 

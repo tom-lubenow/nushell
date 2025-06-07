@@ -20,6 +20,11 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
         // Adds all related commands to query databases
         #[cfg(feature = "sqlite")]
         add_database_decls(&mut working_set);
+        
+        // eBPF-related
+        // Adds all eBPF commands for kernel tracing
+        #[cfg(feature = "ebpf")]
+        nu_cmd_ebpf::add_ebpf_decls(&mut working_set);
 
         // Charts
         bind_command! {
@@ -455,7 +460,6 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             JobId,
             JobTag,
             Job,
-            BpfKprobe,
         };
 
         #[cfg(not(target_family = "wasm"))]

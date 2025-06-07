@@ -103,7 +103,7 @@ On non-Linux systems, this command will only generate and validate the eBPF code
 
         // Generate the eBPF Rust source code using the nu-ebpf crate
         let probe_name = format!("probe_{}", function_name.replace(":", "_"));
-        let rust_source = generate_kprobe(&block, &probe_name);
+        let rust_source = nu_ebpf::generate_kprobe_with_context(&block, &probe_name, Some(&function_name));
 
         // Show the generated code
         eprintln!("Generated eBPF Rust source for function '{}':", function_name);

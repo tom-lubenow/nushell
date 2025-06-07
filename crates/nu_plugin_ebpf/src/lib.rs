@@ -5,6 +5,7 @@ mod ebpf_plugin;
 pub mod parser;  // Made public for tests
 pub mod loader;  // Made public for tests
 mod streaming;
+pub mod probe_context;  // Made public for tests
 
 pub use commands::*;
 pub use ebpf_plugin::EbpfPlugin;

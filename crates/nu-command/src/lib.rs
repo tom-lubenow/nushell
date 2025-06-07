@@ -6,6 +6,7 @@ mod conversions;
 mod date;
 mod debug;
 mod default_context;
+#[cfg(not(feature = "ebpf"))]
 mod ebpf;
 mod env;
 mod example_test;
@@ -42,6 +43,7 @@ pub use conversions::*;
 pub use date::*;
 pub use debug::*;
 pub use default_context::*;
+#[cfg(not(feature = "ebpf"))]
 pub use ebpf::*;
 pub use env::*;
 #[cfg(test)]

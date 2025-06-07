@@ -251,8 +251,19 @@ impl EbpfParser {
             let var_name = self.parse_identifier()?;
             eprintln!("  📊 Found eBPF variable: ${}", var_name);
             
-            // Create a variable expression
-            return Ok(self.create_variable_expression(var_name));
+            // Check for field access
+            let mut expr = self.create_variable_expression(var_name.clone());
+            
+            while self.peek_char() == Some('.') {
+                self.advance(); // consume .
+                let field_name = self.parse_identifier()?;
+                eprintln!("  📍 Found field access: ${}.{}", var_name, field_name);
+                
+                // Create a field access expression
+                expr = self.create_field_access(expr, field_name);
+            }
+            
+            return Ok(expr);
         }
         
         // String literals
@@ -407,12 +418,33 @@ impl EbpfParser {
         }
     }
     
-    fn create_variable_expression(&self, var_name: String) -> Expression {
+    fn create_variable_expression(&self, _var_name: String) -> Expression {
         Expression {
             expr: Expr::Var(VarId::new(0)), // Placeholder - would need proper variable resolution
             span: self.current_span(),
             span_id: SpanId::new(0),
             ty: Type::Any, // eBPF variables could be various types
+            custom_completion: None,
+        }
+    }
+    
+    fn create_field_access(&self, base_expr: Expression, field_name: String) -> Expression {
+        // Create a cell path for field access
+        let member = PathMember::String {
+            val: field_name,
+            span: self.current_span(),
+            optional: false,
+            casing: Default::default(), // Use default casing
+        };
+        
+        Expression {
+            expr: Expr::FullCellPath(Box::new(FullCellPath {
+                head: base_expr,
+                tail: vec![member],
+            })),
+            span: self.current_span(),
+            span_id: SpanId::new(0),
+            ty: Type::Any,
             custom_completion: None,
         }
     }

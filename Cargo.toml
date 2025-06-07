@@ -29,6 +29,7 @@ members = [
   "crates/nu-parser",
   "crates/nu-system",
   "crates/nu-cmd-base",
+  "crates/nu-cmd-ebpf",
   "crates/nu-cmd-extra",
   "crates/nu-cmd-lang",
   "crates/nu-cmd-plugin",
@@ -303,6 +304,9 @@ trash-support = ["nu-command/trash-support", "nu-cmd-lang/trash-support"]
 
 # SQLite commands for nushell
 sqlite = ["nu-command/sqlite", "nu-cmd-lang/sqlite", "nu-std/sqlite"]
+
+# eBPF commands for Linux kernel tracing
+ebpf = ["nu-command/ebpf"]
 
 [profile.release]
 opt-level = "s"     # Optimize for size

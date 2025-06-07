@@ -208,13 +208,26 @@ fn test_parse_boolean_operators() {
 }
 
 #[test]
-#[ignore = "Event field access not yet implemented"]
 fn test_parse_event_field_access() {
-    let mut parser = EbpfParser::new("{ |event| $event.filename }".to_string(), 0);
+    // Simple field access
+    let mut parser = EbpfParser::new("{ || $ctx.filename }".to_string(), 0);
     let result = parser.parse();
     
     assert!(result.is_ok());
-    // Should parse field access
+    
+    // Multiple field access patterns
+    let test_cases = vec![
+        "{ || $ctx.size }",
+        "{ || $event.timestamp }",
+        "{ || $ctx.daddr }",
+        "{ || $ctx.filename }",
+    ];
+    
+    for test in test_cases {
+        let mut parser = EbpfParser::new(test.to_string(), 0);
+        let result = parser.parse();
+        assert!(result.is_ok(), "Failed to parse: {}", test);
+    }
 }
 
 #[test]

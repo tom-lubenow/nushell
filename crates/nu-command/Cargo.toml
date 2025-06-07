@@ -17,6 +17,7 @@ workspace = true
 
 [dependencies]
 nu-cmd-base = { path = "../nu-cmd-base", version = "0.104.2" }
+nu-cmd-ebpf = { path = "../nu-cmd-ebpf", version = "0.104.2", optional = true }
 nu-color-config = { path = "../nu-color-config", version = "0.104.2" }
 nu-engine = { path = "../nu-engine", version = "0.104.2", default-features = false }
 nu-glob = { path = "../nu-glob", version = "0.104.2" }
@@ -222,6 +223,7 @@ rustls-tls = [
 plugin = ["nu-parser/plugin", "os"]
 sqlite = ["rusqlite"]
 trash-support = ["trash"]
+ebpf = ["nu-cmd-ebpf"]
 
 [dev-dependencies]
 nu-cmd-lang = { path = "../nu-cmd-lang", version = "0.104.2" }

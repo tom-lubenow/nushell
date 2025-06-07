@@ -13,8 +13,9 @@ impl Plugin for EbpfPlugin {
 
     fn commands(&self) -> Vec<Box<dyn PluginCommand<Plugin = Self>>> {
         vec![
-            // Basic eBPF commands
+            // Phase 4: Expanded eBPF commands for different probe types
             Box::new(BpfKprobe),
+            Box::new(BpfTracepoint),
         ]
     }
 } 

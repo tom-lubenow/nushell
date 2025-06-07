@@ -1,0 +1,31 @@
+[package]
+authors = ["The Nushell Project Developers"]
+description = "eBPF tracing plugin for Nushell"
+repository = "https://github.com/nushell/nushell/tree/main/crates/nu_plugin_ebpf"
+edition = "2024"
+license = "MIT"
+name = "nu_plugin_ebpf"
+version = "0.104.2"
+
+[[bin]]
+name = "nu_plugin_ebpf"
+bench = false
+
+[lib]
+bench = false
+
+[dependencies]
+nu-plugin = { path = "../nu-plugin", version = "0.104.2" }
+nu-protocol = { path = "../nu-protocol", version = "0.104.2", features = ["plugin"] }
+nu-ebpf = { path = "../nu-ebpf", version = "0.104.2" }
+tempfile = "3.20"
+
+# eBPF framework dependencies - only on Linux
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.12", features = ["async_tokio"] }
+aya-log = "0.2"
+tokio = { version = "1.0", features = ["full"] }
+
+[dev-dependencies]
+nu-plugin-test-support = { path = "../nu-plugin-test-support", version = "0.104.2" }
+nu-cmd-lang = { path = "../nu-cmd-lang", version = "0.104.2" } 

@@ -2,8 +2,8 @@ use nu_plugin::{Plugin, PluginCommand};
 
 mod commands;
 mod ebpf_plugin;
-mod parser;
-mod loader;
+pub mod parser;  // Made public for tests
+pub mod loader;  // Made public for tests
 mod streaming;
 
 pub use commands::*;

@@ -633,35 +633,17 @@ dependencies = [
 
 [[package]]
 name = "aya"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90eea657cc8028447cbda5068f4e10c4fadba0131624f4f7dd1a9c46ffc8d81f"
-dependencies = [
- "assert_matches",
- "aya-obj 0.1.0",
- "bitflags 2.6.0",
- "bytes",
- "lazy_static",
- "libc",
- "log",
- "object 0.32.2",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "aya"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d18bc4e506fbb85ab7392ed993a7db4d1a452c71b75a246af4a80ab8c9d2dd50"
 dependencies = [
  "assert_matches",
- "aya-obj 0.2.1",
+ "aya-obj",
  "bitflags 2.6.0",
  "bytes",
  "libc",
  "log",
- "object 0.36.5",
+ "object",
  "once_cell",
  "thiserror 1.0.69",
  "tokio",
@@ -673,7 +655,7 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b600d806c1d07d3b81ab5f4a2a95fd80f479a0d3f1d68f29064d660865f85f02"
 dependencies = [
- "aya 0.13.1",
+ "aya",
  "aya-log-common",
  "bytes",
  "log",
@@ -692,20 +674,6 @@ dependencies = [
 
 [[package]]
 name = "aya-obj"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c02024a307161cf3d1f052161958fd13b1a33e3e038083e58082c0700fdab85"
-dependencies = [
- "bytes",
- "core-error",
- "hashbrown 0.14.5",
- "log",
- "object 0.32.2",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "aya-obj"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c51b96c5a8ed8705b40d655273bc4212cbbf38d4e3be2788f36306f154523ec7"
@@ -714,7 +682,7 @@ dependencies = [
  "core-error",
  "hashbrown 0.15.2",
  "log",
- "object 0.36.5",
+ "object",
  "thiserror 1.0.69",
 ]
 
@@ -728,7 +696,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "miniz_oxide",
- "object 0.36.5",
+ "object",
  "rustc-demangle",
  "windows-targets 0.52.6",
 ]
@@ -4208,7 +4176,7 @@ dependencies = [
 name = "nu_plugin_ebpf"
 version = "0.104.2"
 dependencies = [
- "aya 0.12.0",
+ "aya",
  "aya-log",
  "bytes",
  "chrono",
@@ -4570,15 +4538,6 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
-]
-
-[[package]]
-name = "object"
-version = "0.32.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6a622008b6e321afc04970976f62ee297fdbaa6f95318ca343e3eebb9648441"
-dependencies = [
- "memchr",
 ]
 
 [[package]]

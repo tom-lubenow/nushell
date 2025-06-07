@@ -2,6 +2,7 @@ use nu_plugin::{Plugin, PluginCommand};
 
 mod commands;
 mod ebpf_plugin;
+mod parser;
 
 pub use commands::*;
 pub use ebpf_plugin::EbpfPlugin;

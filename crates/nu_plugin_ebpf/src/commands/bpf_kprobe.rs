@@ -1,6 +1,7 @@
 use nu_plugin::{EngineInterface, EvaluatedCall, SimplePluginCommand};
 use nu_protocol::{Category, LabeledError, Signature, SyntaxShape, Type, Value, ast::Block, engine::Closure, Span};
 use nu_ebpf::generate_kprobe;
+use crate::parser::EbpfParser;
 
 #[cfg(target_os = "linux")]
 use std::process::Command;
@@ -82,8 +83,8 @@ On non-Linux systems, this command will only generate and validate the eBPF code
         let action_block = call.req::<Value>(1)?;
         
         // Extract the closure from the closure value
-        let closure = match &action_block {
-            Value::Closure { val, .. } => val.as_ref(),
+        let (closure, closure_span) = match &action_block {
+            Value::Closure { val, internal_span, .. } => (val.as_ref(), *internal_span),
             _ => {
                 return Err(LabeledError::new("Expected a closure")
                     .with_label("Expected a closure (block) as the second argument", call.head))
@@ -91,7 +92,7 @@ On non-Linux systems, this command will only generate and validate the eBPF code
         };
 
         // Get the actual block content using the engine interface
-        let block = match get_block_from_closure(engine, closure, call.head) {
+        let block = match get_block_from_closure(engine, closure, closure_span) {
             Ok(block) => block,
             Err(e) => {
                 eprintln!("⚠️  Could not access block content: {}", e);
@@ -208,19 +209,41 @@ fn create_demo_block() -> Block {
 /// Attempt to get the actual Block from a closure using the engine interface
 /// This is a Phase 4 enhancement to access real closure content
 fn get_block_from_closure(
-    _engine: &EngineInterface, 
+    engine: &EngineInterface, 
     _closure: &Closure, 
-    _span: Span
+    action_value_span: Span
 ) -> Result<Block, String> {
-    // Phase 4 limitation: Plugin context doesn't provide direct block access
-    // This is a known limitation of the current plugin API
-    // 
-    // Potential solutions for future phases:
-    // 1. Extend plugin API to provide block content access
-    // 2. Use span information to get source code and re-parse
-    // 3. Pre-process closures in the engine before passing to plugin
+    // Phase 5 implementation: Use span contents to access closure source
+    // The closure contains a block_id, but we can't access the AST directly.
+    // Instead, we'll get the source code via the span and parse it ourselves.
     
-    Err("Plugin API limitation: Cannot access block content directly. Enhanced block access planned for Phase 5.".to_string())
+    // Use the span from the closure value itself
+    let block_span = action_value_span;
+    
+    // Get the source code contents
+    match engine.get_span_contents(block_span) {
+        Ok(contents) => {
+            let source_str = String::from_utf8_lossy(&contents);
+            eprintln!("📝 Extracted closure source: {}", source_str.trim());
+            
+            // Parse the closure source using our eBPF parser
+            let mut parser = EbpfParser::new(source_str.to_string(), block_span.start);
+            match parser.parse() {
+                Ok(block) => {
+                    eprintln!("✅ Successfully parsed closure into AST");
+                    Ok(block)
+                }
+                Err(e) => {
+                    eprintln!("⚠️  Parser error: {}", e);
+                    eprintln!("   Falling back to demo block for code generation");
+                    Ok(create_demo_block())
+                }
+            }
+        }
+        Err(e) => {
+            Err(format!("Failed to get span contents: {}", e))
+        }
+    }
 }
 
 /// Show supported eBPF built-ins and constraints

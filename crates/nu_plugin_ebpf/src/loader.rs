@@ -6,12 +6,10 @@
 use aya::{
     programs::{KProbe, Program},
     maps::HashMap,
-    Bpf,
-    BpfLoader,
+    Ebpf,
+    EbpfLoader,
 };
 
-#[cfg(target_os = "linux")]
-use aya_log::BpfLogger;
 
 use std::path::Path;
 
@@ -61,7 +59,7 @@ pub fn load_kprobe_program(
     eprintln!("🔧 Loading eBPF program from: {}", bytecode_path.display());
     
     // Load the eBPF bytecode
-    let mut bpf = match BpfLoader::new()
+    let mut bpf = match EbpfLoader::new()
         .btf(aya::Btf::from_sys_fs().ok().as_ref())
         .load_file(bytecode_path)
     {
@@ -70,7 +68,7 @@ pub fn load_kprobe_program(
     };
     
     // Initialize eBPF logger for debugging
-    if let Err(e) = BpfLogger::init(&mut bpf) {
+    if let Err(e) = aya_log::EbpfLogger::init(&mut bpf) {
         eprintln!("⚠️  Failed to initialize eBPF logger: {}", e);
     }
     
@@ -105,7 +103,7 @@ pub fn load_kprobe_program(
 /// Handle for managing a loaded kprobe
 #[cfg(target_os = "linux")]
 pub struct KProbeHandle {
-    _bpf: Bpf,
+    _bpf: Ebpf,
     function_name: String,
     program_name: String,
 }

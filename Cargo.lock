@@ -4210,6 +4210,8 @@ version = "0.104.2"
 dependencies = [
  "aya 0.12.0",
  "aya-log",
+ "bytes",
+ "chrono",
  "nu-cmd-lang",
  "nu-ebpf",
  "nu-plugin",

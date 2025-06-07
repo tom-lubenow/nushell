@@ -6,11 +6,7 @@ set -e
 echo "🐧 Testing eBPF plugin in Lima VM..."
 echo "==================================="
 
-# Copy test scripts to Lima VM
-echo "📝 Copying test scripts to VM..."
-limactl cp scripts/test-ebpf-linux.sh ebpf-dev:~/proj/nushell/scripts/
-limactl cp test_ebpf_parser.nu ebpf-dev:~/proj/nushell/
-limactl cp test_ebpf_simple.nu ebpf-dev:~/proj/nushell/
+# The files are already available via mount, no need to copy
 
 # Build in the VM
 echo ""

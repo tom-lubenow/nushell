@@ -4,6 +4,7 @@ mod commands;
 mod ebpf_plugin;
 mod parser;
 mod loader;
+mod streaming;
 
 pub use commands::*;
 pub use ebpf_plugin::EbpfPlugin;
@@ -18,6 +19,8 @@ impl Plugin for EbpfPlugin {
             // Phase 4: Expanded eBPF commands for different probe types
             Box::new(BpfKprobe),
             Box::new(BpfTracepoint),
+            // Phase 5: Event streaming
+            Box::new(BpfStream),
         ]
     }
 } 

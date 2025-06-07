@@ -24,7 +24,7 @@ echo "✅ All prerequisites found"
 echo ""
 
 # Navigate to project directory
-cd ~/proj/nushell
+cd /Users/tomlubenow/proj/nushell
 
 # Build the eBPF plugin
 echo "🔨 Building nu_plugin_ebpf..."

@@ -139,18 +139,21 @@ fn test_parse_whitespace_handling() {
 // ============================================================================
 
 #[test]
-fn test_parse_if_statement_not_implemented() {
-    // Currently, if statements are parsed as function calls
-    // This test documents current behavior
+fn test_parse_if_statement() {
+    // Test that if statements are parsed correctly
     let mut parser = EbpfParser::new("{ || if $pid > 1000 { print \"high\" } }".to_string(), 0);
     let result = parser.parse();
     
-    // Parser currently treats 'if' as an identifier, not a keyword
+    // Parser should successfully parse if statements
+    assert!(result.is_ok());
+    
+    // Test with else clause
+    let mut parser = EbpfParser::new("{ || if $pid > 1000 { print \"high\" } else { print \"low\" } }".to_string(), 0);
+    let result = parser.parse();
     assert!(result.is_ok());
 }
 
 #[test]
-#[ignore = "Arithmetic operators not yet implemented in parser"]
 fn test_parse_arithmetic_operators() {
     let operators = vec![
         ("$pid + 1", "addition"),
@@ -169,7 +172,6 @@ fn test_parse_arithmetic_operators() {
 }
 
 #[test]
-#[ignore = "Comparison operators not yet implemented in parser"]
 fn test_parse_comparison_operators() {
     let operators = vec![
         ("$pid == 1000", "equals"),
@@ -189,7 +191,6 @@ fn test_parse_comparison_operators() {
 }
 
 #[test]
-#[ignore = "Boolean operators not yet implemented in parser"]
 fn test_parse_boolean_operators() {
     let operators = vec![
         ("$pid > 1000 && $uid == 0", "logical and"),

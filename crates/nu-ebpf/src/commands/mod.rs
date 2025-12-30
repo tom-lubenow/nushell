@@ -8,6 +8,7 @@ mod counters;
 mod detach;
 mod events;
 mod helpers;
+mod histogram;
 mod list;
 mod trace;
 
@@ -15,9 +16,11 @@ pub use attach::EbpfAttach;
 pub use counters::EbpfCounters;
 pub use detach::EbpfDetach;
 pub use events::EbpfEvents;
+pub use histogram::EbpfHistogram;
 pub use helpers::{
-    BpfArg, BpfComm, BpfCount, BpfEmit, BpfEmitComm, BpfFilterComm, BpfFilterPid, BpfKtime,
-    BpfPid, BpfReadStr, BpfReadUserStr, BpfRetval, BpfTgid, BpfUid,
+    BpfArg, BpfComm, BpfCount, BpfEmit, BpfEmitComm, BpfFilterComm, BpfFilterPid, BpfHistogram,
+    BpfKtime, BpfPid, BpfReadStr, BpfReadUserStr, BpfRetval, BpfStartTimer, BpfStopTimer, BpfTgid,
+    BpfUid,
 };
 pub use list::EbpfList;
 pub use trace::EbpfTrace;
@@ -31,6 +34,7 @@ pub fn commands() -> Vec<Box<dyn Command>> {
         Box::new(EbpfCounters),
         Box::new(EbpfDetach),
         Box::new(EbpfEvents),
+        Box::new(EbpfHistogram),
         Box::new(EbpfList),
         Box::new(EbpfTrace),
         // BPF helper commands (usable in closures)
@@ -48,5 +52,8 @@ pub fn commands() -> Vec<Box<dyn Command>> {
         Box::new(BpfEmitComm),
         Box::new(BpfFilterPid),
         Box::new(BpfFilterComm),
+        Box::new(BpfStartTimer),
+        Box::new(BpfStopTimer),
+        Box::new(BpfHistogram),
     ]
 }

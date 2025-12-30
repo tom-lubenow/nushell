@@ -68,6 +68,8 @@ pub struct ActiveProbe {
     has_perf_map: bool,
     /// Whether this probe has a counter hash map
     has_counter_map: bool,
+    /// Whether this probe has a histogram hash map
+    has_histogram_map: bool,
     /// Perf buffers for each CPU (only if has_perf_map)
     perf_buffers: Vec<CpuPerfBuffer>,
     /// Optional schema for structured events
@@ -82,6 +84,7 @@ impl std::fmt::Debug for ActiveProbe {
             .field("attached_at", &self.attached_at)
             .field("has_perf_map", &self.has_perf_map)
             .field("has_counter_map", &self.has_counter_map)
+            .field("has_histogram_map", &self.has_histogram_map)
             .field("event_schema", &self.event_schema.is_some())
             .finish()
     }
@@ -124,6 +127,15 @@ pub struct CounterEntry {
     /// The key (e.g., PID or comm as i64)
     pub key: i64,
     /// The count value
+    pub count: i64,
+}
+
+/// Histogram bucket entry
+#[derive(Debug, Clone)]
+pub struct HistogramEntry {
+    /// The bucket index (log2 of value range)
+    pub bucket: i64,
+    /// The count of values in this bucket
     pub count: i64,
 }
 
@@ -238,6 +250,7 @@ impl EbpfState {
         // Check for maps
         let has_perf_map = ebpf.map("events").is_some();
         let has_counter_map = ebpf.map("counters").is_some();
+        let has_histogram_map = ebpf.map("histogram").is_some();
         let mut perf_buffers = Vec::new();
 
         // Set up perf buffers if the program uses bpf-emit
@@ -274,6 +287,7 @@ impl EbpfState {
             ebpf,
             has_perf_map,
             has_counter_map,
+            has_histogram_map,
             perf_buffers,
             event_schema: program.event_schema.clone(),
         };
@@ -419,6 +433,41 @@ impl EbpfState {
                 }
             }
         }
+
+        Ok(entries)
+    }
+
+    /// Read all histogram entries from a probe's histogram map
+    ///
+    /// Returns all bucket-count pairs from the bpf-histogram hash map,
+    /// sorted by bucket number.
+    pub fn get_histogram(&self, id: u32) -> Result<Vec<HistogramEntry>, LoadError> {
+        let mut probes = self.probes.lock().unwrap();
+        let probe = probes
+            .get_mut(&id)
+            .ok_or(LoadError::ProbeNotFound(id))?;
+
+        if !probe.has_histogram_map {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = Vec::new();
+
+        // Get the histogram map
+        if let Some(map) = probe.ebpf.map_mut("histogram") {
+            let histogram_map: AyaHashMap<_, i64, i64> = AyaHashMap::try_from(map)
+                .map_err(|e| LoadError::MapNotFound(format!("Failed to convert histogram map: {e}")))?;
+
+            // Iterate over all entries
+            for item in histogram_map.iter() {
+                if let Ok((bucket, count)) = item {
+                    entries.push(HistogramEntry { bucket, count });
+                }
+            }
+        }
+
+        // Sort by bucket for display
+        entries.sort_by_key(|e| e.bucket);
 
         Ok(entries)
     }

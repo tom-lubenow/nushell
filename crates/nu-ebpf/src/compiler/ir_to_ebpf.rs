@@ -31,6 +31,12 @@ const PERF_MAP_NAME: &str = "events";
 /// Name of the counter hash map for bpf-count
 const COUNTER_MAP_NAME: &str = "counters";
 
+/// Name of the timestamp hash map for bpf-start-timer/bpf-stop-timer
+const TIMESTAMP_MAP_NAME: &str = "timestamps";
+
+/// Name of the histogram hash map for bpf-histogram
+const HISTOGRAM_MAP_NAME: &str = "histogram";
+
 /// Architecture-specific pt_regs offsets for function arguments
 ///
 /// These are the byte offsets into struct pt_regs where each function
@@ -201,6 +207,10 @@ pub struct IrToEbpfCompiler<'a> {
     needs_perf_map: bool,
     /// Whether the program needs a counter hash map
     needs_counter_map: bool,
+    /// Whether the program needs a timestamp hash map for latency tracking
+    needs_timestamp_map: bool,
+    /// Whether the program needs a histogram hash map
+    needs_histogram_map: bool,
     /// Relocations for map references
     relocations: Vec<MapRelocation>,
     /// Current stack offset for temporary storage (grows negative from R10)
@@ -256,6 +266,8 @@ impl<'a> IrToEbpfCompiler<'a> {
             pending_jumps: Vec::new(),
             needs_perf_map: false,
             needs_counter_map: false,
+            needs_timestamp_map: false,
+            needs_histogram_map: false,
             relocations: Vec::new(),
             stack_offset: -8, // Start at -8 from R10
             ctx_saved: false,
@@ -304,6 +316,18 @@ impl<'a> IrToEbpfCompiler<'a> {
             maps.push(EbpfMap {
                 name: COUNTER_MAP_NAME.to_string(),
                 def: BpfMapDef::counter_hash(),
+            });
+        }
+        if compiler.needs_timestamp_map {
+            maps.push(EbpfMap {
+                name: TIMESTAMP_MAP_NAME.to_string(),
+                def: BpfMapDef::timestamp_hash(),
+            });
+        }
+        if compiler.needs_histogram_map {
+            maps.push(EbpfMap {
+                name: HISTOGRAM_MAP_NAME.to_string(),
+                def: BpfMapDef::histogram_hash(),
             });
         }
 
@@ -793,6 +817,15 @@ impl<'a> IrToEbpfCompiler<'a> {
             "bpf-read-user-str" | "bpf read-user-str" => {
                 self.compile_bpf_read_str(src_dst, true)
             }
+            "bpf-start-timer" | "bpf start-timer" => {
+                self.compile_bpf_start_timer(src_dst)
+            }
+            "bpf-stop-timer" | "bpf stop-timer" => {
+                self.compile_bpf_stop_timer(src_dst)
+            }
+            "bpf-histogram" | "bpf histogram" => {
+                self.compile_bpf_histogram(src_dst)
+            }
             _ => Err(CompileError::UnsupportedInstruction(
                 format!("Call to unsupported command: {}", cmd_name)
             )),
@@ -1249,6 +1282,314 @@ impl<'a> IrToEbpfCompiler<'a> {
         let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
         self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
 
+        Ok(())
+    }
+
+    /// Compile bpf-start-timer: store current ktime keyed by TID
+    ///
+    /// Stores the current kernel timestamp in a hash map keyed by the thread ID.
+    /// Used for latency measurement - call bpf-stop-timer to get elapsed time.
+    fn compile_bpf_start_timer(&mut self, src_dst: RegId) -> Result<(), CompileError> {
+        self.needs_timestamp_map = true;
+
+        // Allocate stack space for key (TID) and value (timestamp)
+        let key_stack_offset = self.stack_offset - 8;
+        let value_stack_offset = self.stack_offset - 16;
+        self.stack_offset -= 16;
+
+        // Get current TGID (thread group ID) as the key
+        // Using TGID instead of TID allows matching entry/return across threads
+        // Note: For per-thread tracking, use the lower 32 bits (PID/TID)
+        self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
+        // Store the full pid_tgid as key (allows unique per-thread tracking)
+        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, key_stack_offset, EbpfReg::R0));
+
+        // Get current kernel time
+        self.builder.push(EbpfInsn::call(BpfHelper::KtimeGetNs));
+        // Store as value
+        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, value_stack_offset, EbpfReg::R0));
+
+        // Call bpf_map_update_elem(map, &key, &value, BPF_ANY)
+        // R1 = map fd (will be relocated)
+        let reloc_offset = self.builder.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
+        self.builder.push(insn1);
+        self.builder.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: reloc_offset,
+            map_name: TIMESTAMP_MAP_NAME.to_string(),
+        });
+
+        // R2 = pointer to key
+        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
+
+        // R3 = pointer to value
+        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R3, EbpfReg::R10));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R3, value_stack_offset as i32));
+
+        // R4 = flags (BPF_ANY = 0)
+        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R4, 0));
+
+        // Call bpf_map_update_elem
+        self.builder.push(EbpfInsn::call(BpfHelper::MapUpdateElem));
+
+        // Set destination to 0 (void return)
+        let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+        self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
+
+        Ok(())
+    }
+
+    /// Compile bpf-stop-timer: look up start time, compute delta, delete entry
+    ///
+    /// Looks up the start timestamp for the current TID, computes the elapsed
+    /// time, deletes the map entry, and returns the delta in nanoseconds.
+    /// Returns 0 if no matching start timer was found.
+    fn compile_bpf_stop_timer(&mut self, src_dst: RegId) -> Result<(), CompileError> {
+        self.needs_timestamp_map = true;
+
+        // Allocate stack space for key (TID)
+        let key_stack_offset = self.stack_offset - 8;
+        self.stack_offset -= 8;
+
+        // Get current pid_tgid as the key
+        self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
+        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, key_stack_offset, EbpfReg::R0));
+
+        // Look up the start timestamp
+        // bpf_map_lookup_elem(map, &key) -> *value or NULL
+        let lookup_reloc_offset = self.builder.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
+        self.builder.push(insn1);
+        self.builder.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: lookup_reloc_offset,
+            map_name: TIMESTAMP_MAP_NAME.to_string(),
+        });
+
+        // R2 = pointer to key
+        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
+
+        // Call bpf_map_lookup_elem
+        self.builder.push(EbpfInsn::call(BpfHelper::MapLookupElem));
+
+        // R0 = pointer to value or NULL
+        // If NULL, return 0 (no matching start timer)
+        // Check if R0 is NULL - skip to returning 0
+        // Jump over the computation if NULL (14 instructions to skip):
+        // ldxdw + call + sub64 + ld_map_fd(2) + mov + add + call + mov
+        self.builder.push(EbpfInsn::jeq_imm(EbpfReg::R0, 0, 11));
+
+        // Value exists - load the start timestamp
+        // R1 = start_time = *R0
+        self.builder.push(EbpfInsn::ldxdw(EbpfReg::R1, EbpfReg::R0, 0));
+
+        // Get current time
+        self.builder.push(EbpfInsn::call(BpfHelper::KtimeGetNs));
+        // R0 = current_time
+
+        // Compute delta = current_time - start_time
+        // R0 = R0 - R1
+        self.builder.push(EbpfInsn::sub64_reg(EbpfReg::R0, EbpfReg::R1));
+
+        // Save the delta temporarily
+        let delta_stack_offset = self.stack_offset - 8;
+        self.stack_offset -= 8;
+        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, delta_stack_offset, EbpfReg::R0));
+
+        // Delete the map entry
+        // bpf_map_delete_elem(map, &key)
+        let delete_reloc_offset = self.builder.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
+        self.builder.push(insn1);
+        self.builder.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: delete_reloc_offset,
+            map_name: TIMESTAMP_MAP_NAME.to_string(),
+        });
+
+        // R2 = pointer to key
+        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
+
+        // Call bpf_map_delete_elem
+        self.builder.push(EbpfInsn::call(BpfHelper::MapDeleteElem));
+
+        // Restore the delta to destination register
+        let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+        self.builder.push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R10, delta_stack_offset));
+
+        // Jump over the "return 0" path
+        self.builder.push(EbpfInsn::jump(1));
+
+        // No matching timer - return 0
+        self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
+
+        Ok(())
+    }
+
+    /// Compile bpf-histogram: compute log2 bucket and increment counter
+    ///
+    /// Computes the log2 bucket of the input value and atomically increments
+    /// the counter for that bucket in the histogram map.
+    fn compile_bpf_histogram(&mut self, src_dst: RegId) -> Result<(), CompileError> {
+        self.needs_histogram_map = true;
+
+        let ebpf_src = self.reg_alloc.get(src_dst)?;
+
+        // Allocate stack space for key (bucket) and value (count)
+        let key_stack_offset = self.stack_offset - 8;
+        let value_stack_offset = self.stack_offset - 16;
+        self.stack_offset -= 16;
+
+        // Compute log2 bucket
+        // bucket = 64 - clz(value) for value > 0, else bucket = 0
+        // eBPF doesn't have clz, so we need to use a different approach
+        // We'll use a simple loop-based approach that counts leading zeros
+
+        // First, handle value <= 0 (set bucket = 0)
+        // if value <= 0, jump to store bucket = 0
+        // Jump offset: 22 instructions to skip (mov + mov + 2*ld_dw + 6*3 jlt/add/rsh + 1 jlt/add + jump)
+        self.builder.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JSLE | opcode::BPF_K,
+            ebpf_src.as_u8(),
+            0,
+            22, // Skip to bucket = 0 case
+            0,
+        ));
+
+        // For positive values, compute log2 using binary search approach
+        // This is more efficient than a loop for eBPF
+        // bucket = 64 - leading_zeros(value)
+        // We'll approximate with: find highest set bit
+
+        // Copy value to R0 for manipulation
+        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R0, ebpf_src));
+        // Start with bucket = 0
+        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R1, 0));
+
+        // Check each bit position (simplified version checking powers of 2)
+        // if value >= 2^32, bucket += 32
+        self.emit_load_64bit_imm(EbpfReg::R2, 1i64 << 32);
+        self.builder.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_X,
+            EbpfReg::R0.as_u8(),
+            EbpfReg::R2.as_u8(),
+            2, // Skip add if less
+            0,
+        ));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 32));
+        self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 32));
+
+        // if remaining >= 2^16, bucket += 16
+        self.builder.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_K,
+            EbpfReg::R0.as_u8(),
+            0,
+            2,
+            1 << 16,
+        ));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 16));
+        self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 16));
+
+        // if remaining >= 2^8, bucket += 8
+        self.builder.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_K,
+            EbpfReg::R0.as_u8(),
+            0,
+            2,
+            1 << 8,
+        ));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 8));
+        self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 8));
+
+        // Remaining bits (0-7) - simple lookup or continued halving
+        // For simplicity, do final 4-2-1 checks
+        self.builder.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_K,
+            EbpfReg::R0.as_u8(),
+            0,
+            2,
+            1 << 4,
+        ));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 4));
+        self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 4));
+
+        self.builder.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_K,
+            EbpfReg::R0.as_u8(),
+            0,
+            2,
+            1 << 2,
+        ));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 2));
+        self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 2));
+
+        self.builder.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_K,
+            EbpfReg::R0.as_u8(),
+            0,
+            1,
+            1 << 1,
+        ));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 1));
+
+        // Jump to store bucket
+        self.builder.push(EbpfInsn::jump(1));
+
+        // bucket = 0 case
+        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R1, 0));
+
+        // Store bucket as key
+        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, key_stack_offset, EbpfReg::R1));
+
+        // Look up current count
+        let lookup_reloc_offset = self.builder.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
+        self.builder.push(insn1);
+        self.builder.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: lookup_reloc_offset,
+            map_name: HISTOGRAM_MAP_NAME.to_string(),
+        });
+
+        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
+
+        self.builder.push(EbpfInsn::call(BpfHelper::MapLookupElem));
+
+        // If NULL, initialize to 1; otherwise increment
+        self.builder.push(EbpfInsn::jeq_imm(EbpfReg::R0, 0, 4));
+
+        // Exists - load, increment, store back
+        self.builder.push(EbpfInsn::ldxdw(EbpfReg::R1, EbpfReg::R0, 0));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 1));
+        self.builder.push(EbpfInsn::stxdw(EbpfReg::R0, 0, EbpfReg::R1));
+        self.builder.push(EbpfInsn::jump(10)); // Skip initialization
+
+        // Initialize to 1
+        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R1, 1));
+        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, value_stack_offset, EbpfReg::R1));
+
+        let update_reloc_offset = self.builder.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
+        self.builder.push(insn1);
+        self.builder.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: update_reloc_offset,
+            map_name: HISTOGRAM_MAP_NAME.to_string(),
+        });
+
+        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
+        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R3, EbpfReg::R10));
+        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R3, value_stack_offset as i32));
+        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R4, 0)); // BPF_ANY
+        self.builder.push(EbpfInsn::call(BpfHelper::MapUpdateElem));
+
+        // Return the original value (pass-through for chaining)
         Ok(())
     }
 

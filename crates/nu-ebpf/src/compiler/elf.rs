@@ -60,6 +60,28 @@ impl BpfMapDef {
         }
     }
 
+    /// Create a hash map for storing timestamps (key: i64 TID, value: i64 timestamp)
+    pub fn timestamp_hash() -> Self {
+        Self {
+            map_type: BpfMapType::Hash as u32,
+            key_size: 8,        // sizeof(i64) - thread ID
+            value_size: 8,      // sizeof(i64) - timestamp in nanoseconds
+            max_entries: 10240, // Maximum concurrent traced threads
+            map_flags: 0,
+        }
+    }
+
+    /// Create a hash map for histogram buckets (key: i64 bucket, value: i64 count)
+    pub fn histogram_hash() -> Self {
+        Self {
+            map_type: BpfMapType::Hash as u32,
+            key_size: 8,   // sizeof(i64) - bucket index (log2 of value)
+            value_size: 8, // sizeof(i64) - count
+            max_entries: 64, // 64 buckets covers 0 to 2^63
+            map_flags: 0,
+        }
+    }
+
     /// Serialize to bytes (little-endian)
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(20);

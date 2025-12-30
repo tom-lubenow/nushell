@@ -654,6 +654,184 @@ impl Command for BpfFilterComm {
     }
 }
 
+/// Start a timer for latency measurement (stores current ktime keyed by TID)
+///
+/// In eBPF, this stores the current kernel timestamp in a hash map keyed by
+/// the current thread ID. Call bpf-stop-timer to compute the elapsed time.
+#[derive(Clone)]
+pub struct BpfStartTimer;
+
+impl Command for BpfStartTimer {
+    fn name(&self) -> &str {
+        "bpf-start-timer"
+    }
+
+    fn description(&self) -> &str {
+        "Start a timer for latency measurement. In eBPF, stores ktime in a hash map."
+    }
+
+    fn extra_description(&self) -> &str {
+        r#"Stores the current kernel timestamp keyed by thread ID.
+Use in entry probes (kprobe:func) to mark the start time.
+Call bpf-stop-timer in the corresponding return probe (kretprobe:func)
+to compute the elapsed time."#
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("bpf-start-timer")
+            .input_output_types(vec![(Type::Nothing, Type::Nothing)])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                example: "bpf-start-timer",
+                description: "Start timer in entry probe",
+                result: None,
+            },
+        ]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        // At regular runtime, just log what would happen
+        eprintln!("[bpf-start-timer] Would store timestamp for TID");
+        Ok(Value::nothing(call.head).into_pipeline_data())
+    }
+}
+
+/// Stop a timer and return elapsed nanoseconds
+///
+/// In eBPF, this looks up the start timestamp for the current TID,
+/// computes the delta from current ktime, deletes the entry, and returns
+/// the elapsed time in nanoseconds.
+#[derive(Clone)]
+pub struct BpfStopTimer;
+
+impl Command for BpfStopTimer {
+    fn name(&self) -> &str {
+        "bpf-stop-timer"
+    }
+
+    fn description(&self) -> &str {
+        "Stop timer and return elapsed nanoseconds. Must pair with bpf-start-timer."
+    }
+
+    fn extra_description(&self) -> &str {
+        r#"Looks up the start timestamp for the current thread ID,
+computes the delta from the current kernel time, deletes the map entry,
+and returns the elapsed time in nanoseconds.
+
+Returns 0 if no matching start timer was found (e.g., probe started mid-call)."#
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("bpf-stop-timer")
+            .input_output_types(vec![(Type::Nothing, Type::Int)])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                example: "bpf-stop-timer | bpf-emit",
+                description: "Stop timer and emit the latency",
+                result: None,
+            },
+            Example {
+                example: "bpf-stop-timer | bpf-histogram",
+                description: "Stop timer and add latency to histogram",
+                result: None,
+            },
+        ]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        // At regular runtime, return 0 (no timer to stop)
+        eprintln!("[bpf-stop-timer] Would compute elapsed time for TID");
+        Ok(Value::int(0, call.head).into_pipeline_data())
+    }
+}
+
+/// Add a value to a log2 histogram
+///
+/// In eBPF, this computes the log2 bucket of the input value and
+/// increments the counter for that bucket in a histogram map.
+#[derive(Clone)]
+pub struct BpfHistogram;
+
+impl Command for BpfHistogram {
+    fn name(&self) -> &str {
+        "bpf-histogram"
+    }
+
+    fn description(&self) -> &str {
+        "Add a value to a log2 histogram. In eBPF, updates a bucket counter."
+    }
+
+    fn extra_description(&self) -> &str {
+        r#"Computes the log2 bucket for the input value and increments
+the counter for that bucket. Values are grouped into power-of-2 ranges:
+  bucket 0: 0
+  bucket 1: 1
+  bucket 2: 2-3
+  bucket 3: 4-7
+  bucket 4: 8-15
+  ...
+
+Use 'ebpf histogram' to display the histogram after detaching."#
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("bpf-histogram")
+            .input_output_types(vec![(Type::Int, Type::Int)])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                example: "bpf-stop-timer | bpf-histogram",
+                description: "Add latency to histogram",
+                result: None,
+            },
+            Example {
+                example: "bpf-arg 2 | bpf-histogram",
+                description: "Histogram of size argument values",
+                result: None,
+            },
+        ]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        // At regular runtime, compute the bucket and log it
+        let value = input.into_value(call.head)?;
+        if let Ok(v) = value.as_int() {
+            let bucket = if v <= 0 { 0 } else { 64 - (v as u64).leading_zeros() };
+            eprintln!("[bpf-histogram] Value {} -> bucket {}", v, bucket);
+        }
+        Ok(value.into_pipeline_data())
+    }
+}
+
 /// Count occurrences by key (maps to hash map lookup+update in eBPF)
 ///
 /// This command increments a counter for the input value as key.

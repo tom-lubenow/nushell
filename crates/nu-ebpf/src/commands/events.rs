@@ -85,6 +85,7 @@ fn run_events(
     use crate::loader::{get_state, BpfEventData, BpfFieldValue};
 
     let probe_id: i64 = call.req(engine_state, stack, 0)?;
+    let probe_id = super::validate_probe_id(probe_id, call.head)?;
     let timeout: Option<i64> = call.get_flag(engine_state, stack, "timeout")?;
     let span = call.head;
 
@@ -93,7 +94,7 @@ fn run_events(
         .unwrap_or(Duration::from_secs(1));
 
     let state = get_state();
-    let events = state.poll_events(probe_id as u32, timeout_duration).map_err(|e| {
+    let events = state.poll_events(probe_id, timeout_duration).map_err(|e| {
         ShellError::GenericError {
             error: "Failed to poll events".into(),
             msg: e.to_string(),

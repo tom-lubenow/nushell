@@ -20,8 +20,9 @@ impl Command for EbpfAttach {
 it to the specified kernel probe point. The closure runs in the kernel
 whenever the probe point is hit.
 
-Note: Currently only a minimal "hello world" program is generated.
-The closure argument is accepted but not yet compiled.
+The closure can use special BPF commands like bpf-pid, bpf-emit, bpf-count,
+bpf-comm, bpf-filter-pid, bpf-filter-comm, bpf-start-timer, bpf-stop-timer,
+and bpf-histogram. See the individual command help for details.
 
 Probe specification format:
   kprobe:function_name     - Attach to function entry
@@ -47,7 +48,7 @@ Requirements:
             .required(
                 "closure",
                 SyntaxShape::Closure(None),
-                "The closure to compile to eBPF (currently ignored - generates hello world).",
+                "The closure to compile and run as eBPF bytecode in the kernel.",
             )
             .switch(
                 "dry-run",
@@ -127,40 +128,24 @@ fn run_attach(
     // Get the block for this closure
     let block = engine_state.get_block(closure.block_id);
 
-    // Try to compile the closure's IR to eBPF
-    let compile_result = if let Some(ir_block) = &block.ir_block {
-        match IrToEbpfCompiler::compile_full(ir_block, engine_state) {
-            Ok(result) => result,
-            Err(e) => {
-                // Fall back to hello world if compilation fails
-                eprintln!("Warning: IR compilation failed ({e}), using fallback");
-                use crate::compiler::{CompileResult, EbpfInsn, EbpfReg};
-                let mut builder = crate::compiler::instruction::EbpfBuilder::new();
-                builder
-                    .push(EbpfInsn::mov64_imm(EbpfReg::R0, 0))
-                    .push(EbpfInsn::exit());
-                CompileResult {
-                    bytecode: builder.build(),
-                    maps: Vec::new(),
-                    relocations: Vec::new(),
-                    event_schema: None,
-                }
-            }
+    // Compile the closure's IR to eBPF
+    let ir_block = block.ir_block.as_ref().ok_or_else(|| ShellError::GenericError {
+        error: "No IR available for closure".into(),
+        msg: "The closure could not be compiled to IR".into(),
+        span: Some(call.head),
+        help: Some("Ensure the closure is a simple expression that can be compiled".into()),
+        inner: vec![],
+    })?;
+
+    let compile_result = IrToEbpfCompiler::compile_full(ir_block, engine_state).map_err(|e| {
+        ShellError::GenericError {
+            error: "eBPF compilation failed".into(),
+            msg: e.to_string(),
+            span: Some(call.head),
+            help: Some("Check that the closure uses only supported BPF commands".into()),
+            inner: vec![],
         }
-    } else {
-        // No IR available, use fallback
-        use crate::compiler::{CompileResult, EbpfInsn, EbpfReg};
-        let mut builder = crate::compiler::instruction::EbpfBuilder::new();
-        builder
-            .push(EbpfInsn::mov64_imm(EbpfReg::R0, 0))
-            .push(EbpfInsn::exit());
-        CompileResult {
-            bytecode: builder.build(),
-            maps: Vec::new(),
-            relocations: Vec::new(),
-            event_schema: None,
-        }
-    };
+    })?;
 
     let program = EbpfProgram::with_maps(
         prog_type,

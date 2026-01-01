@@ -12,6 +12,21 @@ mod histogram;
 mod list;
 mod trace;
 
+use nu_protocol::{ShellError, Span};
+
+/// Validate and convert a probe ID from i64 to u32
+///
+/// Returns an error if the ID is negative or exceeds u32::MAX
+pub(crate) fn validate_probe_id(id: i64, span: Span) -> Result<u32, ShellError> {
+    u32::try_from(id).map_err(|_| ShellError::GenericError {
+        error: "Invalid probe ID".into(),
+        msg: format!("Probe ID must be between 0 and {}, got {}", u32::MAX, id),
+        span: Some(span),
+        help: Some("Use 'ebpf list' to see valid probe IDs".into()),
+        inner: vec![],
+    })
+}
+
 pub use attach::EbpfAttach;
 pub use counters::EbpfCounters;
 pub use detach::EbpfDetach;

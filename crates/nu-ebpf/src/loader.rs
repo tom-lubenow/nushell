@@ -32,9 +32,6 @@ pub enum LoadError {
     #[error("Probe not found: {0}")]
     ProbeNotFound(u32),
 
-    #[error("Unsupported program type: {0:?}")]
-    UnsupportedProgramType(EbpfProgramType),
-
     #[error("Permission denied: eBPF requires CAP_BPF or root")]
     PermissionDenied,
 
@@ -244,7 +241,6 @@ impl EbpfState {
                     .attach(&program.target)
                     .map_err(|e| LoadError::Attach(format!("Failed to attach raw_tracepoint: {e}")))?;
             }
-            other => return Err(LoadError::UnsupportedProgramType(other)),
         }
 
         // Check for maps
@@ -375,6 +371,11 @@ impl EbpfState {
         let mut fields = Vec::with_capacity(schema.fields.len());
 
         for field in &schema.fields {
+            // Bounds check: ensure field.offset is within buffer
+            if field.offset >= buf.len() {
+                // Field offset out of bounds, skip this field
+                continue;
+            }
             let field_buf = &buf[field.offset..];
             let value = match field.field_type {
                 BpfFieldType::Int => {

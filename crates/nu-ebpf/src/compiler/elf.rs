@@ -16,9 +16,10 @@ use super::btf::BtfBuilder;
 use super::instruction::EbpfBuilder;
 use super::CompileError;
 
-/// BPF map types
+/// BPF map types (subset of types we might use)
 #[derive(Debug, Clone, Copy)]
 #[repr(u32)]
+#[allow(dead_code)]
 pub enum BpfMapType {
     Hash = 1,
     Array = 2,
@@ -475,6 +476,7 @@ impl EbpfProgram {
     ///
     /// For BTF-defined maps, the .maps section contains the struct with
     /// pointer-sized fields (all zeros since values are in BTF type metadata).
+    #[allow(dead_code)]
     fn generate_btf_map_data(&self) -> Vec<u8> {
         let mut data = Vec::new();
 

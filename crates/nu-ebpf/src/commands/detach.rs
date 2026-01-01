@@ -64,7 +64,7 @@ fn run_detach(
     use crate::loader::{get_state, LoadError};
 
     let id: i64 = call.req(engine_state, stack, 0)?;
-    let id = id as u32;
+    let id = super::validate_probe_id(id, call.head)?;
 
     let state = get_state();
     state.detach(id).map_err(|e| {

@@ -13,9 +13,10 @@ const BTF_MAGIC: u16 = 0xEB9F;
 /// BTF version
 const BTF_VERSION: u8 = 1;
 
-/// BTF type kinds
+/// BTF type kinds (complete list per BTF specification)
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
+#[allow(dead_code)]
 pub enum BtfKind {
     Unknown = 0,
     Int = 1,
@@ -39,9 +40,10 @@ pub enum BtfKind {
     Enum64 = 19,
 }
 
-/// BTF variable linkage
+/// BTF variable linkage (complete list per BTF specification)
 #[derive(Debug, Clone, Copy)]
 #[repr(u32)]
+#[allow(dead_code)]
 pub enum BtfVarLinkage {
     Static = 0,
     GlobalAlloc = 1,
@@ -156,6 +158,7 @@ impl BtfBuilder {
     /// Add a struct type, return its type ID
     ///
     /// Members are: (name, type_id, size_in_bytes)
+    #[allow(dead_code)]
     pub fn add_struct(&mut self, name: &str, members: &[(&str, u32, u32)]) -> u32 {
         let name_off = self.add_string(name);
         let type_id = self.next_type_id;
@@ -282,6 +285,7 @@ impl BtfBuilder {
 }
 
 /// Generate BTF for a perf event array map
+#[allow(dead_code)]
 pub fn generate_perf_map_btf(map_name: &str) -> Vec<u8> {
     let mut btf = BtfBuilder::new();
 

@@ -8,7 +8,7 @@
 //! Some instructions (like 64-bit immediate loads) use two 64-bit slots.
 
 /// eBPF register identifiers (r0-r10)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum EbpfReg {
     /// Return value from functions, exit value for eBPF program

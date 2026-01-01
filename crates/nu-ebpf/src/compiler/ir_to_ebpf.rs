@@ -84,86 +84,227 @@ mod pt_regs_offsets {
     pub const RETVAL_OFFSET: i16 = 0;
 }
 
-/// Maps Nushell register IDs to eBPF registers or stack locations
+/// Where a value is currently stored
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueLocation {
+    /// Value is in an eBPF register
+    Register(EbpfReg),
+    /// Value is spilled to stack at this offset (relative to R10)
+    Spilled(i16),
+}
+
+/// Identifier for a value (either a Nushell register or variable)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+enum ValueKey {
+    Reg(u32),
+    Var(usize),
+}
+
+/// Action needed when accessing a register
+#[derive(Debug)]
+#[allow(dead_code)]
+enum RegAction {
+    /// Value is already in this register, no action needed
+    Ready(EbpfReg),
+    /// Value needs to be reloaded from stack into this register
+    Reload { reg: EbpfReg, stack_offset: i16 },
+}
+
+/// Action needed when allocating a register for writing
+#[derive(Debug)]
+#[allow(dead_code)]
+enum AllocAction {
+    /// Register is free, just use it
+    Free(EbpfReg),
+    /// Need to spill this value first, then use the register
+    Spill {
+        reg: EbpfReg,
+        victim_key: ValueKey,
+        /// Caller must provide a stack offset for the spill
+        needs_stack_slot: bool,
+    },
+}
+
+/// Maps Nushell register IDs to eBPF registers with spilling support
 pub struct RegisterAllocator {
-    /// Maps Nu RegId -> eBPF register
-    reg_mapping: HashMap<u32, EbpfReg>,
-    /// Maps Nu VarId -> eBPF register (for variables)
-    var_mapping: HashMap<usize, EbpfReg>,
-    /// Next available callee-saved register (r6-r9)
-    next_saved: u8,
+    /// Where each value currently lives
+    locations: HashMap<ValueKey, ValueLocation>,
+    /// Which eBPF register holds which value (reverse mapping)
+    register_contents: HashMap<EbpfReg, ValueKey>,
+    /// LRU order of registers (front = least recently used)
+    lru_order: Vec<EbpfReg>,
+    /// Available callee-saved registers
+    available_regs: Vec<EbpfReg>,
 }
 
 impl RegisterAllocator {
     pub fn new() -> Self {
+        // R6, R7, R8 are available (R9 reserved for context, R0-R5 for calls)
+        let available_regs = vec![EbpfReg::R6, EbpfReg::R7, EbpfReg::R8];
         Self {
-            reg_mapping: HashMap::new(),
-            var_mapping: HashMap::new(),
-            next_saved: 6, // Start at r6 (callee-saved)
+            locations: HashMap::new(),
+            register_contents: HashMap::new(),
+            lru_order: Vec::new(),
+            available_regs,
         }
     }
 
-    /// Allocate a new eBPF register
-    /// Note: R9 is reserved for saving the context pointer (R1)
-    fn alloc_register(&mut self) -> Result<EbpfReg, CompileError> {
-        if self.next_saved <= 8 {
-            let ebpf_reg = match self.next_saved {
-                6 => EbpfReg::R6,
-                7 => EbpfReg::R7,
-                8 => EbpfReg::R8,
-                _ => unreachable!(),
-            };
-            self.next_saved += 1;
-            Ok(ebpf_reg)
-        } else {
-            Err(CompileError::RegisterExhaustion)
+    /// Mark a register as most recently used
+    fn touch(&mut self, reg: EbpfReg) {
+        self.lru_order.retain(|&r| r != reg);
+        self.lru_order.push(reg);
+    }
+
+    /// Get a free register, or None if all are in use
+    fn get_free_register(&self) -> Option<EbpfReg> {
+        for reg in &self.available_regs {
+            if !self.register_contents.contains_key(reg) {
+                return Some(*reg);
+            }
+        }
+        None
+    }
+
+    /// Get the least recently used register and its current owner
+    fn get_lru(&self) -> Option<(EbpfReg, ValueKey)> {
+        for &reg in &self.lru_order {
+            if let Some(&key) = self.register_contents.get(&reg) {
+                return Some((reg, key));
+            }
+        }
+        // Fallback: just pick the first occupied register
+        self.register_contents.iter().next().map(|(&r, &k)| (r, k))
+    }
+
+    /// Get a register for reading a value (may need reload from stack)
+    pub fn get(&mut self, reg: RegId) -> Result<RegAction, CompileError> {
+        let key = ValueKey::Reg(reg.get());
+        self.get_value(key, || format!("Register %{} not allocated", reg.get()))
+    }
+
+    /// Get a register for reading a variable (may need reload from stack)
+    pub fn get_var(&mut self, var_id: VarId) -> Result<RegAction, CompileError> {
+        let key = ValueKey::Var(var_id.get());
+        self.get_value(key, || format!("Variable ${} not allocated", var_id.get()))
+    }
+
+    fn get_value(&mut self, key: ValueKey, err_msg: impl FnOnce() -> String) -> Result<RegAction, CompileError> {
+        match self.locations.get(&key).copied() {
+            Some(ValueLocation::Register(reg)) => {
+                self.touch(reg);
+                Ok(RegAction::Ready(reg))
+            }
+            Some(ValueLocation::Spilled(offset)) => {
+                // Need to reload - but we might need to spill something first
+                // For now, return the reload action; caller handles getting a register
+                // We'll allocate the register in the get_or_alloc path
+                Err(CompileError::UnsupportedInstruction(
+                    format!("Value at stack offset {} needs reload (internal)", offset)
+                ))
+            }
+            None => Err(CompileError::UnsupportedInstruction(err_msg())),
         }
     }
 
-    /// Get or allocate an eBPF register for the given Nushell register
-    pub fn get_or_alloc(&mut self, reg: RegId) -> Result<EbpfReg, CompileError> {
-        let reg_id = reg.get();
+    /// Check if a value is spilled and needs reload
+    pub fn needs_reload(&self, reg: RegId) -> Option<i16> {
+        let key = ValueKey::Reg(reg.get());
+        match self.locations.get(&key) {
+            Some(ValueLocation::Spilled(offset)) => Some(*offset),
+            _ => None,
+        }
+    }
 
-        if let Some(&ebpf_reg) = self.reg_mapping.get(&reg_id) {
-            return Ok(ebpf_reg);
+    /// Check if a variable is spilled and needs reload
+    pub fn var_needs_reload(&self, var_id: VarId) -> Option<i16> {
+        let key = ValueKey::Var(var_id.get());
+        match self.locations.get(&key) {
+            Some(ValueLocation::Spilled(offset)) => Some(*offset),
+            _ => None,
+        }
+    }
+
+    /// Allocate a register for writing to a Nushell register
+    pub fn get_or_alloc(&mut self, reg: RegId) -> Result<AllocAction, CompileError> {
+        let key = ValueKey::Reg(reg.get());
+        self.alloc_for_write(key)
+    }
+
+    /// Allocate a register for writing to a Nushell variable
+    pub fn get_or_alloc_var(&mut self, var_id: VarId) -> Result<AllocAction, CompileError> {
+        let key = ValueKey::Var(var_id.get());
+        self.alloc_for_write(key)
+    }
+
+    fn alloc_for_write(&mut self, key: ValueKey) -> Result<AllocAction, CompileError> {
+        // If this value already has a register, reuse it
+        if let Some(ValueLocation::Register(reg)) = self.locations.get(&key).copied() {
+            self.touch(reg);
+            return Ok(AllocAction::Free(reg));
         }
 
-        let ebpf_reg = self.alloc_register()?;
-        self.reg_mapping.insert(reg_id, ebpf_reg);
-        Ok(ebpf_reg)
-    }
+        // Try to get a free register
+        if let Some(reg) = self.get_free_register() {
+            // If value was spilled, it's being overwritten - remove spill location
+            self.locations.remove(&key);
 
-    /// Get the eBPF register for a Nushell register (must already be allocated)
-    pub fn get(&self, reg: RegId) -> Result<EbpfReg, CompileError> {
-        self.reg_mapping
-            .get(&reg.get())
-            .copied()
-            .ok_or_else(|| CompileError::UnsupportedInstruction(
-                format!("Register %{} not allocated", reg.get())
-            ))
-    }
-
-    /// Get or allocate an eBPF register for a Nushell variable
-    pub fn get_or_alloc_var(&mut self, var_id: VarId) -> Result<EbpfReg, CompileError> {
-        let var_num = var_id.get();
-
-        if let Some(&ebpf_reg) = self.var_mapping.get(&var_num) {
-            return Ok(ebpf_reg);
+            self.locations.insert(key, ValueLocation::Register(reg));
+            self.register_contents.insert(reg, key);
+            self.touch(reg);
+            return Ok(AllocAction::Free(reg));
         }
 
-        let ebpf_reg = self.alloc_register()?;
-        self.var_mapping.insert(var_num, ebpf_reg);
-        Ok(ebpf_reg)
+        // No free register - need to spill
+        let (victim_reg, victim_key) = self.get_lru()
+            .ok_or(CompileError::RegisterExhaustion)?;
+
+        // Update victim to show it will be spilled (caller provides offset)
+        // For now we just mark that spilling is needed
+        Ok(AllocAction::Spill {
+            reg: victim_reg,
+            victim_key,
+            needs_stack_slot: true,
+        })
     }
 
-    /// Get the eBPF register for a Nushell variable (must already be allocated)
-    pub fn get_var(&self, var_id: VarId) -> Result<EbpfReg, CompileError> {
-        self.var_mapping
-            .get(&var_id.get())
-            .copied()
-            .ok_or_else(|| CompileError::UnsupportedInstruction(
-                format!("Variable ${} not allocated", var_id.get())
-            ))
+    /// Complete a spill operation after the caller has allocated a stack slot
+    pub fn complete_spill(&mut self, victim_key: ValueKey, victim_reg: EbpfReg, stack_offset: i16, new_key: ValueKey) {
+        // Move victim to stack
+        self.locations.insert(victim_key, ValueLocation::Spilled(stack_offset));
+        self.register_contents.remove(&victim_reg);
+
+        // Assign register to new key
+        self.locations.insert(new_key, ValueLocation::Register(victim_reg));
+        self.register_contents.insert(victim_reg, new_key);
+        self.touch(victim_reg);
+    }
+
+    /// Complete a reload operation
+    pub fn complete_reload(&mut self, key: ValueKey, reg: EbpfReg) {
+        self.locations.insert(key, ValueLocation::Register(reg));
+        self.register_contents.insert(reg, key);
+        self.touch(reg);
+    }
+
+    /// Get the current register for a value, if it's in a register
+    #[allow(dead_code)]
+    pub fn current_register(&self, reg: RegId) -> Option<EbpfReg> {
+        let key = ValueKey::Reg(reg.get());
+        match self.locations.get(&key) {
+            Some(ValueLocation::Register(r)) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// Get the current register for a variable, if it's in a register
+    #[allow(dead_code)]
+    pub fn current_var_register(&self, var_id: VarId) -> Option<EbpfReg> {
+        let key = ValueKey::Var(var_id.get());
+        match self.locations.get(&key) {
+            Some(ValueLocation::Register(r)) => Some(*r),
+            _ => None,
+        }
     }
 }
 
@@ -476,6 +617,80 @@ impl<'a> IrToEbpfCompiler<'a> {
         Ok(())
     }
 
+    // ==================== Register Allocation Helpers ====================
+    //
+    // These methods handle spilling registers to stack when we run out,
+    // and reloading spilled values when they're needed again.
+
+    /// Ensure a Nushell register's value is in an eBPF register (reload if spilled)
+    fn ensure_reg(&mut self, reg: RegId) -> Result<EbpfReg, CompileError> {
+        // Check if the value is spilled and needs reload
+        if let Some(stack_offset) = self.reg_alloc.needs_reload(reg) {
+            // Need to reload - first get a register (may cause another spill)
+            let target_reg = self.alloc_reg_for_write_internal(ValueKey::Reg(reg.get()))?;
+            // Emit the load instruction
+            self.builder.push(EbpfInsn::ldxdw(target_reg, EbpfReg::R10, stack_offset));
+            self.reg_alloc.complete_reload(ValueKey::Reg(reg.get()), target_reg);
+            return Ok(target_reg);
+        }
+
+        // Value is already in a register
+        match self.reg_alloc.get(reg)? {
+            RegAction::Ready(r) => Ok(r),
+            RegAction::Reload { .. } => unreachable!("Already handled above"),
+        }
+    }
+
+    /// Ensure a Nushell variable's value is in an eBPF register (reload if spilled)
+    fn ensure_var(&mut self, var_id: VarId) -> Result<EbpfReg, CompileError> {
+        // Check if the value is spilled and needs reload
+        if let Some(stack_offset) = self.reg_alloc.var_needs_reload(var_id) {
+            // Need to reload - first get a register (may cause another spill)
+            let target_reg = self.alloc_reg_for_write_internal(ValueKey::Var(var_id.get()))?;
+            // Emit the load instruction
+            self.builder.push(EbpfInsn::ldxdw(target_reg, EbpfReg::R10, stack_offset));
+            self.reg_alloc.complete_reload(ValueKey::Var(var_id.get()), target_reg);
+            return Ok(target_reg);
+        }
+
+        // Value is already in a register
+        match self.reg_alloc.get_var(var_id)? {
+            RegAction::Ready(r) => Ok(r),
+            RegAction::Reload { .. } => unreachable!("Already handled above"),
+        }
+    }
+
+    /// Get a register for writing to a Nushell register (may spill another value)
+    fn alloc_reg(&mut self, reg: RegId) -> Result<EbpfReg, CompileError> {
+        self.alloc_reg_for_write_internal(ValueKey::Reg(reg.get()))
+    }
+
+    /// Get a register for writing to a Nushell variable (may spill another value)
+    fn alloc_var(&mut self, var_id: VarId) -> Result<EbpfReg, CompileError> {
+        self.alloc_reg_for_write_internal(ValueKey::Var(var_id.get()))
+    }
+
+    /// Internal helper to allocate a register for writing, handling spills
+    fn alloc_reg_for_write_internal(&mut self, key: ValueKey) -> Result<EbpfReg, CompileError> {
+        let action = match key {
+            ValueKey::Reg(id) => self.reg_alloc.get_or_alloc(RegId::new(id))?,
+            ValueKey::Var(id) => self.reg_alloc.get_or_alloc_var(VarId::new(id))?,
+        };
+
+        match action {
+            AllocAction::Free(reg) => Ok(reg),
+            AllocAction::Spill { reg, victim_key, .. } => {
+                // Need to spill the victim to stack
+                let spill_offset = self.alloc_stack(8)?;
+                // Emit the store instruction
+                self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, spill_offset, reg));
+                // Complete the spill in the allocator
+                self.reg_alloc.complete_spill(victim_key, reg, spill_offset, key);
+                Ok(reg)
+            }
+        }
+    }
+
     fn compile_instruction(&mut self, instr: &Instruction, _idx: usize) -> Result<(), CompileError> {
         match instr {
             Instruction::LoadLiteral { dst, lit } => {
@@ -538,7 +753,7 @@ impl<'a> IrToEbpfCompiler<'a> {
     }
 
     fn compile_load_literal(&mut self, dst: RegId, lit: &Literal) -> Result<(), CompileError> {
-        let ebpf_dst = self.reg_alloc.get_or_alloc(dst)?;
+        let ebpf_dst = self.alloc_reg(dst)?;
 
         match lit {
             Literal::Int(val) => {
@@ -601,8 +816,8 @@ impl<'a> IrToEbpfCompiler<'a> {
     }
 
     fn compile_move(&mut self, dst: RegId, src: RegId) -> Result<(), CompileError> {
-        let ebpf_src = self.reg_alloc.get(src)?;
-        let ebpf_dst = self.reg_alloc.get_or_alloc(dst)?;
+        let ebpf_src = self.ensure_reg(src)?;
+        let ebpf_dst = self.alloc_reg(dst)?;
 
         if ebpf_src.as_u8() != ebpf_dst.as_u8() {
             self.builder.push(EbpfInsn::mov64_reg(ebpf_dst, ebpf_src));
@@ -611,8 +826,8 @@ impl<'a> IrToEbpfCompiler<'a> {
     }
 
     fn compile_binary_op(&mut self, lhs_dst: RegId, op: &Operator, rhs: RegId) -> Result<(), CompileError> {
-        let ebpf_lhs = self.reg_alloc.get(lhs_dst)?;
-        let ebpf_rhs = self.reg_alloc.get(rhs)?;
+        let ebpf_lhs = self.ensure_reg(lhs_dst)?;
+        let ebpf_rhs = self.ensure_reg(rhs)?;
 
         match op {
             // Math operations
@@ -727,7 +942,7 @@ impl<'a> IrToEbpfCompiler<'a> {
     }
 
     fn compile_return(&mut self, src: RegId) -> Result<(), CompileError> {
-        let ebpf_src = self.reg_alloc.get(src)?;
+        let ebpf_src = self.ensure_reg(src)?;
 
         // Move result to R0 (return register) if not already there
         if ebpf_src.as_u8() != EbpfReg::R0.as_u8() {
@@ -739,8 +954,8 @@ impl<'a> IrToEbpfCompiler<'a> {
     }
 
     fn compile_store_variable(&mut self, var_id: VarId, src: RegId) -> Result<(), CompileError> {
-        let ebpf_src = self.reg_alloc.get(src)?;
-        let ebpf_var = self.reg_alloc.get_or_alloc_var(var_id)?;
+        let ebpf_src = self.ensure_reg(src)?;
+        let ebpf_var = self.alloc_var(var_id)?;
 
         // Copy the value to the variable's register
         if ebpf_src.as_u8() != ebpf_var.as_u8() {
@@ -750,8 +965,8 @@ impl<'a> IrToEbpfCompiler<'a> {
     }
 
     fn compile_load_variable(&mut self, dst: RegId, var_id: VarId) -> Result<(), CompileError> {
-        let ebpf_var = self.reg_alloc.get_var(var_id)?;
-        let ebpf_dst = self.reg_alloc.get_or_alloc(dst)?;
+        let ebpf_var = self.ensure_var(var_id)?;
+        let ebpf_dst = self.alloc_reg(dst)?;
 
         // Copy from variable's register to destination
         if ebpf_var.as_u8() != ebpf_dst.as_u8() {
@@ -787,7 +1002,7 @@ impl<'a> IrToEbpfCompiler<'a> {
 
     /// Compile logical NOT (flip boolean: 0 -> 1, non-zero -> 0)
     fn compile_not(&mut self, src_dst: RegId) -> Result<(), CompileError> {
-        let ebpf_reg = self.reg_alloc.get(src_dst)?;
+        let ebpf_reg = self.ensure_reg(src_dst)?;
 
         // In Nushell, NOT is logical (boolean), not bitwise
         // We want: if reg == 0 then 1 else 0
@@ -806,7 +1021,7 @@ impl<'a> IrToEbpfCompiler<'a> {
 
     /// Compile conditional branch (branch if cond is truthy)
     fn compile_branch_if(&mut self, cond: RegId, target_ir_idx: usize) -> Result<(), CompileError> {
-        let ebpf_cond = self.reg_alloc.get(cond)?;
+        let ebpf_cond = self.ensure_reg(cond)?;
 
         // Branch if cond != 0
         // We'll use JNE with imm=0, but eBPF JNE with imm requires BPF_K
@@ -863,7 +1078,7 @@ impl<'a> IrToEbpfCompiler<'a> {
                 // We'll return the full value and let user extract pid with bit ops
                 self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
                 // Result is in R0, move to destination register
-                let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+                let ebpf_dst = self.alloc_reg(src_dst)?;
                 if ebpf_dst.as_u8() != EbpfReg::R0.as_u8() {
                     self.builder.push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
                 }
@@ -876,7 +1091,7 @@ impl<'a> IrToEbpfCompiler<'a> {
                 // Right-shift by 32 to get the TGID
                 self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 32));
                 // Result is in R0, move to destination register
-                let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+                let ebpf_dst = self.alloc_reg(src_dst)?;
                 if ebpf_dst.as_u8() != EbpfReg::R0.as_u8() {
                     self.builder.push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
                 }
@@ -885,7 +1100,7 @@ impl<'a> IrToEbpfCompiler<'a> {
             "bpf-uid" | "bpf uid" => {
                 // bpf_get_current_uid_gid() returns (uid << 32) | gid
                 self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentUidGid));
-                let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+                let ebpf_dst = self.alloc_reg(src_dst)?;
                 if ebpf_dst.as_u8() != EbpfReg::R0.as_u8() {
                     self.builder.push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
                 }
@@ -894,7 +1109,7 @@ impl<'a> IrToEbpfCompiler<'a> {
             "bpf-ktime" | "bpf ktime" => {
                 // bpf_ktime_get_ns() returns kernel time in nanoseconds
                 self.builder.push(EbpfInsn::call(BpfHelper::KtimeGetNs));
-                let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+                let ebpf_dst = self.alloc_reg(src_dst)?;
                 if ebpf_dst.as_u8() != EbpfReg::R0.as_u8() {
                     self.builder.push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
                 }
@@ -951,7 +1166,7 @@ impl<'a> IrToEbpfCompiler<'a> {
     /// the full TASK_COMM_LEN string, not just 8 bytes.
     fn compile_bpf_emit_comm(&mut self, src_dst: RegId) -> Result<(), CompileError> {
         // Allocate the destination register (we'll store 0 as the "return value")
-        let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+        let ebpf_dst = self.alloc_reg(src_dst)?;
         // Mark that we need the perf event map
         self.needs_perf_map = true;
 
@@ -1010,7 +1225,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         // Mark that we need the counter map
         self.needs_counter_map = true;
 
-        let ebpf_src = self.reg_alloc.get(src_dst)?;
+        let ebpf_src = self.ensure_reg(src_dst)?;
 
         // Allocate stack space for key and value
         // Key: 8 bytes (i64)
@@ -1116,7 +1331,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentComm));
 
         // Load first 8 bytes from buffer into destination register
-        let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+        let ebpf_dst = self.alloc_reg(src_dst)?;
         self.builder.push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R10, comm_stack_offset));
 
         Ok(())
@@ -1136,7 +1351,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         // Mark that we need the perf event map
         self.needs_perf_map = true;
 
-        let ebpf_src = self.reg_alloc.get(src_dst)?;
+        let ebpf_src = self.ensure_reg(src_dst)?;
 
         // Allocate stack space for the event data (8 bytes for u64)
         self.check_stack_space(8)?;
@@ -1203,7 +1418,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         })?;
 
         // Get the target PID value (should already be loaded in a register)
-        let target_reg = self.reg_alloc.get(arg_reg)?;
+        let target_reg = self.ensure_reg(arg_reg)?;
 
         // Get current TGID
         self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
@@ -1235,7 +1450,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         })?;
 
         // Get the target comm value (should already be loaded in a register)
-        let target_reg = self.reg_alloc.get(arg_reg)?;
+        let target_reg = self.ensure_reg(arg_reg)?;
 
         // Get current comm (first 8 bytes)
         // Allocate 16 bytes on stack for TASK_COMM_LEN
@@ -1297,7 +1512,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         let offset = pt_regs_offsets::ARG_OFFSETS[index as usize];
 
         // Allocate destination register
-        let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+        let ebpf_dst = self.alloc_reg(src_dst)?;
 
         // ldxdw dst, [r9 + offset] - load 64-bit value from ctx
         self.builder.push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
@@ -1310,7 +1525,7 @@ impl<'a> IrToEbpfCompiler<'a> {
     /// Reads the return value register from the context pointer.
     fn compile_bpf_retval(&mut self, src_dst: RegId) -> Result<(), CompileError> {
         // Allocate destination register
-        let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+        let ebpf_dst = self.alloc_reg(src_dst)?;
 
         // Read the return value from context (R9 has the ctx pointer)
         // On x86_64, return value is in rax at offset 80
@@ -1334,7 +1549,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.needs_perf_map = true;
 
         // Get the source pointer from the input register
-        let src_ptr = self.reg_alloc.get(src_dst)?;
+        let src_ptr = self.ensure_reg(src_dst)?;
 
         // Allocate stack space for the string buffer (128 bytes max)
         const STR_BUF_SIZE: i16 = 128;
@@ -1396,7 +1611,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.builder.push(EbpfInsn::call(BpfHelper::PerfEventOutput));
 
         // Set result to 0 (success indicator)
-        let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+        let ebpf_dst = self.alloc_reg(src_dst)?;
         self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
 
         Ok(())
@@ -1453,7 +1668,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.builder.push(EbpfInsn::call(BpfHelper::MapUpdateElem));
 
         // Set destination to 0 (void return)
-        let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+        let ebpf_dst = self.alloc_reg(src_dst)?;
         self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
 
         Ok(())
@@ -1468,7 +1683,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.needs_timestamp_map = true;
 
         // Allocate destination register early so both paths can use it
-        let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+        let ebpf_dst = self.alloc_reg(src_dst)?;
 
         // Create labels for control flow
         let no_timer_label = self.create_label();
@@ -1564,7 +1779,7 @@ impl<'a> IrToEbpfCompiler<'a> {
     fn compile_bpf_histogram(&mut self, src_dst: RegId) -> Result<(), CompileError> {
         self.needs_histogram_map = true;
 
-        let ebpf_src = self.reg_alloc.get(src_dst)?;
+        let ebpf_src = self.ensure_reg(src_dst)?;
 
         // Allocate stack space for key (bucket) and value (count)
         self.check_stack_space(16)?;
@@ -1722,8 +1937,8 @@ impl<'a> IrToEbpfCompiler<'a> {
         let field_size = field_type.size() as i16;
 
         // Get the eBPF register containing the value
-        // Use get_or_alloc in case the value comes from a literal that wasn't separately allocated
-        let ebpf_val = self.reg_alloc.get_or_alloc(val)?;
+        // Use alloc_reg in case the value comes from a literal that wasn't separately allocated
+        let ebpf_val = self.alloc_reg(val)?;
 
         // Allocate stack space for this field and store immediately
         self.check_stack_space(field_size)?;
@@ -1783,7 +1998,7 @@ impl<'a> IrToEbpfCompiler<'a> {
 
         if record.fields.is_empty() {
             // Empty record - just emit nothing
-            let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+            let ebpf_dst = self.alloc_reg(src_dst)?;
             self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
             return Ok(());
         }
@@ -1851,7 +2066,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.builder.push(EbpfInsn::call(BpfHelper::PerfEventOutput));
 
         // Set destination to 0
-        let ebpf_dst = self.reg_alloc.get_or_alloc(src_dst)?;
+        let ebpf_dst = self.alloc_reg(src_dst)?;
         self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
 
         Ok(())

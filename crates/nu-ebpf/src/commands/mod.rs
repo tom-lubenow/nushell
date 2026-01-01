@@ -63,12 +63,12 @@ pub use attach::EbpfAttach;
 pub use counters::EbpfCounters;
 pub use detach::EbpfDetach;
 pub use events::EbpfEvents;
-pub use histogram::EbpfHistogram;
 pub use helpers::{
     BpfArg, BpfComm, BpfCount, BpfEmit, BpfEmitComm, BpfFilterComm, BpfFilterPid, BpfHistogram,
     BpfKtime, BpfPid, BpfReadStr, BpfReadUserStr, BpfRetval, BpfStartTimer, BpfStopTimer, BpfTgid,
     BpfUid,
 };
+pub use histogram::EbpfHistogram;
 pub use list::EbpfList;
 pub use trace::EbpfTrace;
 

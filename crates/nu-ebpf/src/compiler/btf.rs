@@ -98,7 +98,8 @@ impl BtfBuilder {
 
         // btf_type header
         self.types.extend_from_slice(&name_off.to_le_bytes());
-        self.types.extend_from_slice(&Self::encode_info(BtfKind::Int, 0, false).to_le_bytes());
+        self.types
+            .extend_from_slice(&Self::encode_info(BtfKind::Int, 0, false).to_le_bytes());
         self.types.extend_from_slice(&size.to_le_bytes()); // size in bytes
 
         // BTF_INT encoding: bits 0-7 = nr_bits, bits 16-23 = offset, bits 24-27 = encoding
@@ -118,7 +119,8 @@ impl BtfBuilder {
 
         // btf_type header (name_off = 0 for pointers)
         self.types.extend_from_slice(&0u32.to_le_bytes()); // name_off
-        self.types.extend_from_slice(&Self::encode_info(BtfKind::Ptr, 0, false).to_le_bytes());
+        self.types
+            .extend_from_slice(&Self::encode_info(BtfKind::Ptr, 0, false).to_le_bytes());
         self.types.extend_from_slice(&target_type_id.to_le_bytes()); // type
 
         type_id
@@ -133,7 +135,8 @@ impl BtfBuilder {
 
         // btf_type header (name_off = 0 for arrays, size = 0)
         self.types.extend_from_slice(&0u32.to_le_bytes()); // name_off
-        self.types.extend_from_slice(&Self::encode_info(BtfKind::Array, 0, false).to_le_bytes());
+        self.types
+            .extend_from_slice(&Self::encode_info(BtfKind::Array, 0, false).to_le_bytes());
         self.types.extend_from_slice(&0u32.to_le_bytes()); // size (unused for arrays)
 
         // btf_array data
@@ -169,7 +172,9 @@ impl BtfBuilder {
 
         // btf_type header
         self.types.extend_from_slice(&name_off.to_le_bytes());
-        self.types.extend_from_slice(&Self::encode_info(BtfKind::Struct, members.len() as u16, false).to_le_bytes());
+        self.types.extend_from_slice(
+            &Self::encode_info(BtfKind::Struct, members.len() as u16, false).to_le_bytes(),
+        );
         self.types.extend_from_slice(&size.to_le_bytes());
 
         // Member entries
@@ -198,7 +203,9 @@ impl BtfBuilder {
 
         // btf_type header (name_off = 0 for anonymous struct)
         self.types.extend_from_slice(&0u32.to_le_bytes()); // name_off = 0 (anonymous)
-        self.types.extend_from_slice(&Self::encode_info(BtfKind::Struct, members.len() as u16, false).to_le_bytes());
+        self.types.extend_from_slice(
+            &Self::encode_info(BtfKind::Struct, members.len() as u16, false).to_le_bytes(),
+        );
         self.types.extend_from_slice(&size.to_le_bytes());
 
         // Member entries (each pointer is 8 bytes)
@@ -221,11 +228,13 @@ impl BtfBuilder {
 
         // btf_type header
         self.types.extend_from_slice(&name_off.to_le_bytes());
-        self.types.extend_from_slice(&Self::encode_info(BtfKind::Var, 0, false).to_le_bytes());
+        self.types
+            .extend_from_slice(&Self::encode_info(BtfKind::Var, 0, false).to_le_bytes());
         self.types.extend_from_slice(&type_id.to_le_bytes());
 
         // btf_var
-        self.types.extend_from_slice(&(linkage as u32).to_le_bytes());
+        self.types
+            .extend_from_slice(&(linkage as u32).to_le_bytes());
 
         var_type_id
     }
@@ -241,7 +250,9 @@ impl BtfBuilder {
 
         // btf_type header
         self.types.extend_from_slice(&name_off.to_le_bytes());
-        self.types.extend_from_slice(&Self::encode_info(BtfKind::DataSec, vars.len() as u16, false).to_le_bytes());
+        self.types.extend_from_slice(
+            &Self::encode_info(BtfKind::DataSec, vars.len() as u16, false).to_le_bytes(),
+        );
         self.types.extend_from_slice(&size.to_le_bytes());
 
         // btf_var_secinfo entries
@@ -294,12 +305,15 @@ pub fn generate_perf_map_btf(map_name: &str) -> Vec<u8> {
 
     // For a perf event array, we define a struct with the map attributes
     // This matches what libbpf/Aya expects for BTF-defined maps
-    let map_struct = btf.add_struct(map_name, &[
-        ("type", u32_type, 4),
-        ("key_size", u32_type, 4),
-        ("value_size", u32_type, 4),
-        ("max_entries", u32_type, 4),
-    ]);
+    let map_struct = btf.add_struct(
+        map_name,
+        &[
+            ("type", u32_type, 4),
+            ("key_size", u32_type, 4),
+            ("value_size", u32_type, 4),
+            ("max_entries", u32_type, 4),
+        ],
+    );
 
     // Add a variable for the map
     let map_var = btf.add_var(map_name, map_struct, BtfVarLinkage::GlobalAlloc);

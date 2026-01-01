@@ -4,14 +4,18 @@
 
 use std::collections::HashMap;
 
-use nu_protocol::ast::{Math, Bits, Comparison, Operator};
+use nu_protocol::ast::{Bits, Comparison, Math, Operator};
 use nu_protocol::engine::EngineState;
 use nu_protocol::ir::{Instruction, IrBlock, Literal};
 use nu_protocol::{DeclId, RegId, VarId};
 
-use super::elf::{BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation, SchemaField};
-use super::instruction::{BpfHelper, EbpfBuilder, EbpfInsn, EbpfReg, opcode};
 use super::CompileError;
+use super::elf::{BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation};
+use super::helpers::{
+    AggregationHelpers, DataHelpers, FilterHelpers, OutputHelpers, TimingHelpers,
+};
+use super::instruction::{BpfHelper, EbpfBuilder, EbpfInsn, EbpfReg, opcode};
+use super::register_alloc::{AllocAction, RegAction, RegisterAllocator, ValueKey};
 
 /// Result of compiling IR to eBPF
 pub struct CompileResult {
@@ -26,16 +30,16 @@ pub struct CompileResult {
 }
 
 /// Name of the perf event array map for output
-const PERF_MAP_NAME: &str = "events";
+pub(crate) const PERF_MAP_NAME: &str = "events";
 
 /// Name of the counter hash map for bpf-count
-const COUNTER_MAP_NAME: &str = "counters";
+pub(crate) const COUNTER_MAP_NAME: &str = "counters";
 
 /// Name of the timestamp hash map for bpf-start-timer/bpf-stop-timer
-const TIMESTAMP_MAP_NAME: &str = "timestamps";
+pub(crate) const TIMESTAMP_MAP_NAME: &str = "timestamps";
 
 /// Name of the histogram hash map for bpf-histogram
-const HISTOGRAM_MAP_NAME: &str = "histogram";
+pub(crate) const HISTOGRAM_MAP_NAME: &str = "histogram";
 
 /// Maximum eBPF stack size in bytes (kernel limit)
 /// Stack grows downward from R10, so this is the most negative offset allowed
@@ -46,7 +50,7 @@ const BPF_STACK_LIMIT: i16 = -512;
 /// These are the byte offsets into struct pt_regs where each function
 /// argument register is stored.
 #[cfg(target_arch = "x86_64")]
-mod pt_regs_offsets {
+pub(crate) mod pt_regs_offsets {
     /// Offsets for arguments 0-5 (rdi, rsi, rdx, rcx, r8, r9)
     pub const ARG_OFFSETS: [i16; 6] = [
         112, // arg0: rdi
@@ -61,7 +65,7 @@ mod pt_regs_offsets {
 }
 
 #[cfg(target_arch = "aarch64")]
-mod pt_regs_offsets {
+pub(crate) mod pt_regs_offsets {
     /// Offsets for arguments 0-7 (x0-x7, each 8 bytes)
     pub const ARG_OFFSETS: [i16; 8] = [
         0,  // arg0: x0
@@ -79,234 +83,11 @@ mod pt_regs_offsets {
 
 // Fallback for unsupported architectures (compilation will fail at runtime)
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod pt_regs_offsets {
+pub(crate) mod pt_regs_offsets {
     pub const ARG_OFFSETS: [i16; 6] = [0; 6];
     pub const RETVAL_OFFSET: i16 = 0;
 }
 
-/// Where a value is currently stored
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValueLocation {
-    /// Value is in an eBPF register
-    Register(EbpfReg),
-    /// Value is spilled to stack at this offset (relative to R10)
-    Spilled(i16),
-}
-
-/// Identifier for a value (either a Nushell register or variable)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
-enum ValueKey {
-    Reg(u32),
-    Var(usize),
-}
-
-/// Action needed when accessing a register
-#[derive(Debug)]
-#[allow(dead_code)]
-enum RegAction {
-    /// Value is already in this register, no action needed
-    Ready(EbpfReg),
-    /// Value needs to be reloaded from stack into this register
-    Reload { reg: EbpfReg, stack_offset: i16 },
-}
-
-/// Action needed when allocating a register for writing
-#[derive(Debug)]
-#[allow(dead_code)]
-enum AllocAction {
-    /// Register is free, just use it
-    Free(EbpfReg),
-    /// Need to spill this value first, then use the register
-    Spill {
-        reg: EbpfReg,
-        victim_key: ValueKey,
-        /// Caller must provide a stack offset for the spill
-        needs_stack_slot: bool,
-    },
-}
-
-/// Maps Nushell register IDs to eBPF registers with spilling support
-pub struct RegisterAllocator {
-    /// Where each value currently lives
-    locations: HashMap<ValueKey, ValueLocation>,
-    /// Which eBPF register holds which value (reverse mapping)
-    register_contents: HashMap<EbpfReg, ValueKey>,
-    /// LRU order of registers (front = least recently used)
-    lru_order: Vec<EbpfReg>,
-    /// Available callee-saved registers
-    available_regs: Vec<EbpfReg>,
-}
-
-impl RegisterAllocator {
-    pub fn new() -> Self {
-        // R6, R7, R8 are available (R9 reserved for context, R0-R5 for calls)
-        let available_regs = vec![EbpfReg::R6, EbpfReg::R7, EbpfReg::R8];
-        Self {
-            locations: HashMap::new(),
-            register_contents: HashMap::new(),
-            lru_order: Vec::new(),
-            available_regs,
-        }
-    }
-
-    /// Mark a register as most recently used
-    fn touch(&mut self, reg: EbpfReg) {
-        self.lru_order.retain(|&r| r != reg);
-        self.lru_order.push(reg);
-    }
-
-    /// Get a free register, or None if all are in use
-    fn get_free_register(&self) -> Option<EbpfReg> {
-        for reg in &self.available_regs {
-            if !self.register_contents.contains_key(reg) {
-                return Some(*reg);
-            }
-        }
-        None
-    }
-
-    /// Get the least recently used register and its current owner
-    fn get_lru(&self) -> Option<(EbpfReg, ValueKey)> {
-        for &reg in &self.lru_order {
-            if let Some(&key) = self.register_contents.get(&reg) {
-                return Some((reg, key));
-            }
-        }
-        // Fallback: just pick the first occupied register
-        self.register_contents.iter().next().map(|(&r, &k)| (r, k))
-    }
-
-    /// Get a register for reading a value (may need reload from stack)
-    pub fn get(&mut self, reg: RegId) -> Result<RegAction, CompileError> {
-        let key = ValueKey::Reg(reg.get());
-        self.get_value(key, || format!("Register %{} not allocated", reg.get()))
-    }
-
-    /// Get a register for reading a variable (may need reload from stack)
-    pub fn get_var(&mut self, var_id: VarId) -> Result<RegAction, CompileError> {
-        let key = ValueKey::Var(var_id.get());
-        self.get_value(key, || format!("Variable ${} not allocated", var_id.get()))
-    }
-
-    fn get_value(&mut self, key: ValueKey, err_msg: impl FnOnce() -> String) -> Result<RegAction, CompileError> {
-        match self.locations.get(&key).copied() {
-            Some(ValueLocation::Register(reg)) => {
-                self.touch(reg);
-                Ok(RegAction::Ready(reg))
-            }
-            Some(ValueLocation::Spilled(offset)) => {
-                // Need to reload - but we might need to spill something first
-                // For now, return the reload action; caller handles getting a register
-                // We'll allocate the register in the get_or_alloc path
-                Err(CompileError::UnsupportedInstruction(
-                    format!("Value at stack offset {} needs reload (internal)", offset)
-                ))
-            }
-            None => Err(CompileError::UnsupportedInstruction(err_msg())),
-        }
-    }
-
-    /// Check if a value is spilled and needs reload
-    pub fn needs_reload(&self, reg: RegId) -> Option<i16> {
-        let key = ValueKey::Reg(reg.get());
-        match self.locations.get(&key) {
-            Some(ValueLocation::Spilled(offset)) => Some(*offset),
-            _ => None,
-        }
-    }
-
-    /// Check if a variable is spilled and needs reload
-    pub fn var_needs_reload(&self, var_id: VarId) -> Option<i16> {
-        let key = ValueKey::Var(var_id.get());
-        match self.locations.get(&key) {
-            Some(ValueLocation::Spilled(offset)) => Some(*offset),
-            _ => None,
-        }
-    }
-
-    /// Allocate a register for writing to a Nushell register
-    pub fn get_or_alloc(&mut self, reg: RegId) -> Result<AllocAction, CompileError> {
-        let key = ValueKey::Reg(reg.get());
-        self.alloc_for_write(key)
-    }
-
-    /// Allocate a register for writing to a Nushell variable
-    pub fn get_or_alloc_var(&mut self, var_id: VarId) -> Result<AllocAction, CompileError> {
-        let key = ValueKey::Var(var_id.get());
-        self.alloc_for_write(key)
-    }
-
-    fn alloc_for_write(&mut self, key: ValueKey) -> Result<AllocAction, CompileError> {
-        // If this value already has a register, reuse it
-        if let Some(ValueLocation::Register(reg)) = self.locations.get(&key).copied() {
-            self.touch(reg);
-            return Ok(AllocAction::Free(reg));
-        }
-
-        // Try to get a free register
-        if let Some(reg) = self.get_free_register() {
-            // If value was spilled, it's being overwritten - remove spill location
-            self.locations.remove(&key);
-
-            self.locations.insert(key, ValueLocation::Register(reg));
-            self.register_contents.insert(reg, key);
-            self.touch(reg);
-            return Ok(AllocAction::Free(reg));
-        }
-
-        // No free register - need to spill
-        let (victim_reg, victim_key) = self.get_lru()
-            .ok_or(CompileError::RegisterExhaustion)?;
-
-        // Update victim to show it will be spilled (caller provides offset)
-        // For now we just mark that spilling is needed
-        Ok(AllocAction::Spill {
-            reg: victim_reg,
-            victim_key,
-            needs_stack_slot: true,
-        })
-    }
-
-    /// Complete a spill operation after the caller has allocated a stack slot
-    pub fn complete_spill(&mut self, victim_key: ValueKey, victim_reg: EbpfReg, stack_offset: i16, new_key: ValueKey) {
-        // Move victim to stack
-        self.locations.insert(victim_key, ValueLocation::Spilled(stack_offset));
-        self.register_contents.remove(&victim_reg);
-
-        // Assign register to new key
-        self.locations.insert(new_key, ValueLocation::Register(victim_reg));
-        self.register_contents.insert(victim_reg, new_key);
-        self.touch(victim_reg);
-    }
-
-    /// Complete a reload operation
-    pub fn complete_reload(&mut self, key: ValueKey, reg: EbpfReg) {
-        self.locations.insert(key, ValueLocation::Register(reg));
-        self.register_contents.insert(reg, key);
-        self.touch(reg);
-    }
-
-    /// Get the current register for a value, if it's in a register
-    #[allow(dead_code)]
-    pub fn current_register(&self, reg: RegId) -> Option<EbpfReg> {
-        let key = ValueKey::Reg(reg.get());
-        match self.locations.get(&key) {
-            Some(ValueLocation::Register(r)) => Some(*r),
-            _ => None,
-        }
-    }
-
-    /// Get the current register for a variable, if it's in a register
-    #[allow(dead_code)]
-    pub fn current_var_register(&self, var_id: VarId) -> Option<EbpfReg> {
-        let key = ValueKey::Var(var_id.get());
-        match self.locations.get(&key) {
-            Some(ValueLocation::Register(r)) => Some(*r),
-            _ => None,
-        }
-    }
-}
 
 /// Pending jump that needs to be fixed up (for IR-level branches)
 struct PendingJump {
@@ -326,22 +107,22 @@ struct PendingInternalJump {
 
 /// Tracks a field being built in a record
 #[derive(Debug, Clone)]
-struct RecordFieldBuilder {
+pub(crate) struct RecordFieldBuilder {
     /// Field name
-    name: String,
+    pub name: String,
     /// Stack offset where the field value is stored (relative to R10)
-    stack_offset: i16,
+    pub stack_offset: i16,
     /// Type of the field (determined from how the value was computed)
-    field_type: BpfFieldType,
+    pub field_type: BpfFieldType,
 }
 
 /// Tracks a record being built
 #[derive(Debug, Clone, Default)]
-struct RecordBuilder {
+pub(crate) struct RecordBuilder {
     /// Fields in the order they were inserted
-    fields: Vec<RecordFieldBuilder>,
+    pub fields: Vec<RecordFieldBuilder>,
     /// Base stack offset for this record (relative to R10)
-    base_offset: i16,
+    pub base_offset: i16,
 }
 
 /// Compiles Nushell IR to eBPF bytecode
@@ -390,13 +171,19 @@ pub struct IrToEbpfCompiler<'a> {
 
 impl<'a> IrToEbpfCompiler<'a> {
     /// Compile an IrBlock to eBPF bytecode (simple version, ignores maps)
-    pub fn compile(ir_block: &'a IrBlock, engine_state: &'a EngineState) -> Result<Vec<u8>, CompileError> {
+    pub fn compile(
+        ir_block: &'a IrBlock,
+        engine_state: &'a EngineState,
+    ) -> Result<Vec<u8>, CompileError> {
         let result = Self::compile_full(ir_block, engine_state)?;
         Ok(result.bytecode)
     }
 
     /// Compile an IrBlock to eBPF bytecode with full result including maps
-    pub fn compile_full(ir_block: &'a IrBlock, engine_state: &'a EngineState) -> Result<CompileResult, CompileError> {
+    pub fn compile_full(
+        ir_block: &'a IrBlock,
+        engine_state: &'a EngineState,
+    ) -> Result<CompileResult, CompileError> {
         Self::compile_inner(ir_block, Some(engine_state))
     }
 
@@ -407,7 +194,10 @@ impl<'a> IrToEbpfCompiler<'a> {
         Ok(result.bytecode)
     }
 
-    fn compile_inner(ir_block: &'a IrBlock, engine_state: Option<&'a EngineState>) -> Result<CompileResult, CompileError> {
+    fn compile_inner(
+        ir_block: &'a IrBlock,
+        engine_state: Option<&'a EngineState>,
+    ) -> Result<CompileResult, CompileError> {
         // Create a dummy engine state for when we don't have one
         // This will only be accessed if there's a Call instruction
         static DUMMY: std::sync::OnceLock<EngineState> = std::sync::OnceLock::new();
@@ -442,7 +232,9 @@ impl<'a> IrToEbpfCompiler<'a> {
         // Save the context pointer (R1) to R9 at the start
         // This is needed for bpf_perf_event_output which requires the context
         // R1 gets clobbered by helper calls, so we save it in a callee-saved register
-        compiler.builder.push(EbpfInsn::mov64_reg(EbpfReg::R9, EbpfReg::R1));
+        compiler
+            .builder
+            .push(EbpfInsn::mov64_reg(EbpfReg::R9, EbpfReg::R1));
         compiler.ctx_saved = true;
 
         // Compile each instruction, tracking IR->eBPF index mapping
@@ -452,7 +244,9 @@ impl<'a> IrToEbpfCompiler<'a> {
             compiler.compile_instruction(instr, idx)?;
         }
         // Record end position for jumps targeting past the last instruction
-        compiler.ir_to_ebpf.insert(ir_block.instructions.len(), compiler.builder.len());
+        compiler
+            .ir_to_ebpf
+            .insert(ir_block.instructions.len(), compiler.builder.len());
 
         // Fix up pending jumps (IR-level and internal)
         compiler.fixup_jumps()?;
@@ -503,19 +297,22 @@ impl<'a> IrToEbpfCompiler<'a> {
     /// Fix up pending jump instructions with correct offsets
     fn fixup_jumps(&mut self) -> Result<(), CompileError> {
         for jump in &self.pending_jumps {
-            let target_ebpf_idx = self.ir_to_ebpf.get(&jump.target_ir_idx)
-                .ok_or_else(|| CompileError::UnsupportedInstruction(
-                    format!("Invalid jump target: IR instruction {}", jump.target_ir_idx)
-                ))?;
+            let target_ebpf_idx = self.ir_to_ebpf.get(&jump.target_ir_idx).ok_or_else(|| {
+                CompileError::UnsupportedInstruction(format!(
+                    "Invalid jump target: IR instruction {}",
+                    jump.target_ir_idx
+                ))
+            })?;
 
             // eBPF jump offset is relative to the NEXT instruction
             // offset = target - (current + 1)
             let offset = (*target_ebpf_idx as i32) - (jump.ebpf_insn_idx as i32) - 1;
 
             if offset < i16::MIN as i32 || offset > i16::MAX as i32 {
-                return Err(CompileError::UnsupportedInstruction(
-                    format!("Jump offset {} out of range", offset)
-                ));
+                return Err(CompileError::UnsupportedInstruction(format!(
+                    "Jump offset {} out of range",
+                    offset
+                )));
             }
 
             self.builder.set_offset(jump.ebpf_insn_idx, offset as i16);
@@ -523,91 +320,27 @@ impl<'a> IrToEbpfCompiler<'a> {
         Ok(())
     }
 
-    /// Allocate space on the eBPF stack with bounds checking
-    ///
-    /// Returns the base stack offset for the allocated space (lowest address).
-    /// For a single 8-byte value, store at `base + size - 8` or just use the convenience form.
-    /// Fails with StackOverflow if the allocation would exceed the 512-byte limit.
-    fn alloc_stack(&mut self, size: i16) -> Result<i16, CompileError> {
-        let new_offset = self.stack_offset - size;
-        if new_offset < BPF_STACK_LIMIT {
-            return Err(CompileError::StackOverflow);
-        }
-        self.stack_offset = new_offset;
-        Ok(new_offset)
-    }
-
-    /// Check that stack has enough space without allocating
-    fn check_stack_space(&self, needed: i16) -> Result<(), CompileError> {
-        if self.stack_offset - needed < BPF_STACK_LIMIT {
-            return Err(CompileError::StackOverflow);
-        }
-        Ok(())
-    }
-
-    /// Create a new label and return its ID
-    fn create_label(&mut self) -> usize {
-        let label = self.next_label;
-        self.next_label += 1;
-        label
-    }
-
-    /// Mark the current position as the target of a label
-    fn bind_label(&mut self, label: usize) {
-        self.label_positions.insert(label, self.builder.len());
-    }
-
-    /// Emit a conditional jump to a label (offset will be fixed up later)
-    fn emit_jump_if_zero_to_label(&mut self, reg: EbpfReg, label: usize) {
-        let insn_idx = self.builder.len();
-        self.builder.push(EbpfInsn::jeq_imm(reg, 0, 0)); // placeholder offset
-        self.pending_internal_jumps.push(PendingInternalJump {
-            ebpf_insn_idx: insn_idx,
-            target_label: label,
-        });
-    }
-
-    /// Emit a conditional jump if value <= 0 (signed) to a label
-    fn emit_jump_if_le_zero_to_label(&mut self, reg: EbpfReg, label: usize) {
-        let insn_idx = self.builder.len();
-        self.builder.push(EbpfInsn::new(
-            opcode::BPF_JMP | opcode::BPF_JSLE | opcode::BPF_K,
-            reg.as_u8(),
-            0,
-            0, // placeholder offset
-            0,
-        ));
-        self.pending_internal_jumps.push(PendingInternalJump {
-            ebpf_insn_idx: insn_idx,
-            target_label: label,
-        });
-    }
-
-    /// Emit an unconditional jump to a label
-    fn emit_jump_to_label(&mut self, label: usize) {
-        let insn_idx = self.builder.len();
-        self.builder.push(EbpfInsn::jump(0)); // placeholder offset
-        self.pending_internal_jumps.push(PendingInternalJump {
-            ebpf_insn_idx: insn_idx,
-            target_label: label,
-        });
-    }
-
     /// Fix up all pending internal jumps
     fn fixup_internal_jumps(&mut self) -> Result<(), CompileError> {
         for jump in &self.pending_internal_jumps {
-            let target_idx = self.label_positions.get(&jump.target_label)
-                .ok_or_else(|| CompileError::UnsupportedInstruction(
-                    format!("Unresolved label {}", jump.target_label)
-                ))?;
+            let target_idx = self
+                .label_positions
+                .get(&jump.target_label)
+                .ok_or_else(|| {
+                    CompileError::UnsupportedInstruction(format!(
+                        "Unresolved label {}",
+                        jump.target_label
+                    ))
+                })?;
 
             // eBPF jump offset is relative to the NEXT instruction
             let offset = (*target_idx as i32) - (jump.ebpf_insn_idx as i32) - 1;
 
             if offset < i16::MIN as i32 || offset > i16::MAX as i32 {
-                return Err(CompileError::UnsupportedInstruction(
-                    format!("Internal jump offset {} out of range", offset)
-                ));
+                return Err(CompileError::UnsupportedInstruction(format!(
+                    "Internal jump offset {} out of range",
+                    offset
+                )));
             }
 
             self.builder.set_offset(jump.ebpf_insn_idx, offset as i16);
@@ -622,25 +355,6 @@ impl<'a> IrToEbpfCompiler<'a> {
     // These methods handle spilling registers to stack when we run out,
     // and reloading spilled values when they're needed again.
 
-    /// Ensure a Nushell register's value is in an eBPF register (reload if spilled)
-    fn ensure_reg(&mut self, reg: RegId) -> Result<EbpfReg, CompileError> {
-        // Check if the value is spilled and needs reload
-        if let Some(stack_offset) = self.reg_alloc.needs_reload(reg) {
-            // Need to reload - first get a register (may cause another spill)
-            let target_reg = self.alloc_reg_for_write_internal(ValueKey::Reg(reg.get()))?;
-            // Emit the load instruction
-            self.builder.push(EbpfInsn::ldxdw(target_reg, EbpfReg::R10, stack_offset));
-            self.reg_alloc.complete_reload(ValueKey::Reg(reg.get()), target_reg);
-            return Ok(target_reg);
-        }
-
-        // Value is already in a register
-        match self.reg_alloc.get(reg)? {
-            RegAction::Ready(r) => Ok(r),
-            RegAction::Reload { .. } => unreachable!("Already handled above"),
-        }
-    }
-
     /// Ensure a Nushell variable's value is in an eBPF register (reload if spilled)
     fn ensure_var(&mut self, var_id: VarId) -> Result<EbpfReg, CompileError> {
         // Check if the value is spilled and needs reload
@@ -648,8 +362,10 @@ impl<'a> IrToEbpfCompiler<'a> {
             // Need to reload - first get a register (may cause another spill)
             let target_reg = self.alloc_reg_for_write_internal(ValueKey::Var(var_id.get()))?;
             // Emit the load instruction
-            self.builder.push(EbpfInsn::ldxdw(target_reg, EbpfReg::R10, stack_offset));
-            self.reg_alloc.complete_reload(ValueKey::Var(var_id.get()), target_reg);
+            self.builder
+                .push(EbpfInsn::ldxdw(target_reg, EbpfReg::R10, stack_offset));
+            self.reg_alloc
+                .complete_reload(ValueKey::Var(var_id.get()), target_reg);
             return Ok(target_reg);
         }
 
@@ -658,11 +374,6 @@ impl<'a> IrToEbpfCompiler<'a> {
             RegAction::Ready(r) => Ok(r),
             RegAction::Reload { .. } => unreachable!("Already handled above"),
         }
-    }
-
-    /// Get a register for writing to a Nushell register (may spill another value)
-    fn alloc_reg(&mut self, reg: RegId) -> Result<EbpfReg, CompileError> {
-        self.alloc_reg_for_write_internal(ValueKey::Reg(reg.get()))
     }
 
     /// Get a register for writing to a Nushell variable (may spill another value)
@@ -679,26 +390,216 @@ impl<'a> IrToEbpfCompiler<'a> {
 
         match action {
             AllocAction::Free(reg) => Ok(reg),
-            AllocAction::Spill { reg, victim_key, .. } => {
+            AllocAction::Spill {
+                reg, victim_key, ..
+            } => {
                 // Need to spill the victim to stack
-                let spill_offset = self.alloc_stack(8)?;
+                let spill_offset = self.alloc_stack_internal(8)?;
                 // Emit the store instruction
-                self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, spill_offset, reg));
+                self.builder
+                    .push(EbpfInsn::stxdw(EbpfReg::R10, spill_offset, reg));
                 // Complete the spill in the allocator
-                self.reg_alloc.complete_spill(victim_key, reg, spill_offset, key);
+                self.reg_alloc
+                    .complete_spill(victim_key, reg, spill_offset, key);
                 Ok(reg)
             }
         }
     }
 
-    fn compile_instruction(&mut self, instr: &Instruction, _idx: usize) -> Result<(), CompileError> {
+    // ==================== Accessor Methods for Helper Modules ====================
+    //
+    // These methods expose internal state to the helper modules while keeping
+    // the fields private. This allows helpers to be in separate files.
+
+    /// Get mutable access to the instruction builder
+    pub(crate) fn builder(&mut self) -> &mut EbpfBuilder {
+        &mut self.builder
+    }
+
+    /// Set that the program needs a perf event map
+    pub(crate) fn set_needs_perf_map(&mut self, value: bool) {
+        self.needs_perf_map = value;
+    }
+
+    /// Set that the program needs a counter map
+    pub(crate) fn set_needs_counter_map(&mut self, value: bool) {
+        self.needs_counter_map = value;
+    }
+
+    /// Set that the program needs a timestamp map
+    pub(crate) fn set_needs_timestamp_map(&mut self, value: bool) {
+        self.needs_timestamp_map = value;
+    }
+
+    /// Set that the program needs a histogram map
+    pub(crate) fn set_needs_histogram_map(&mut self, value: bool) {
+        self.needs_histogram_map = value;
+    }
+
+    /// Add a map relocation
+    pub(crate) fn add_relocation(&mut self, relocation: MapRelocation) {
+        self.relocations.push(relocation);
+    }
+
+    /// Get the current stack offset
+    pub(crate) fn current_stack_offset(&self) -> i16 {
+        self.stack_offset
+    }
+
+    /// Advance the stack offset (for manual allocation)
+    pub(crate) fn advance_stack_offset(&mut self, amount: i16) {
+        self.stack_offset -= amount;
+    }
+
+    /// Pop a pushed argument
+    pub(crate) fn pop_pushed_arg(&mut self) -> Option<RegId> {
+        self.pushed_args.pop()
+    }
+
+    /// Get a literal value for a register
+    pub(crate) fn get_literal_value(&self, reg: RegId) -> Option<i64> {
+        self.literal_values.get(&reg.get()).copied()
+    }
+
+    /// Set the type of a register
+    pub(crate) fn set_register_type(&mut self, reg: RegId, field_type: BpfFieldType) {
+        self.register_types.insert(reg.get(), field_type);
+    }
+
+    /// Take the record builder for a register (removes it)
+    pub(crate) fn take_record_builder(&mut self, reg: RegId) -> Option<RecordBuilder> {
+        self.record_builders.remove(&reg.get())
+    }
+
+    /// Set the event schema
+    pub(crate) fn set_event_schema(&mut self, schema: Option<EventSchema>) {
+        self.event_schema = schema;
+    }
+
+    /// Emit a 64-bit immediate load (uses two instruction slots) - exposed for helpers
+    pub(crate) fn emit_load_64bit_imm(&mut self, dst: EbpfReg, val: i64) {
+        // LD_DW_IMM uses two 8-byte slots
+        // First slot: opcode + lower 32 bits in imm
+        // Second slot: upper 32 bits in imm
+        let lower = val as i32;
+        let upper = (val >> 32) as i32;
+
+        self.builder
+            .push(EbpfInsn::new(opcode::LD_DW_IMM, dst.as_u8(), 0, 0, lower));
+        // Second instruction slot (pseudo-instruction)
+        self.builder.push(EbpfInsn::new(0, 0, 0, 0, upper));
+    }
+
+    /// Create a new label and return its ID - exposed for helpers
+    pub(crate) fn create_label(&mut self) -> usize {
+        let label = self.next_label;
+        self.next_label += 1;
+        label
+    }
+
+    /// Mark the current position as the target of a label - exposed for helpers
+    pub(crate) fn bind_label(&mut self, label: usize) {
+        self.label_positions.insert(label, self.builder.len());
+    }
+
+    /// Emit a conditional jump to a label (offset will be fixed up later) - exposed for helpers
+    pub(crate) fn emit_jump_if_zero_to_label(&mut self, reg: EbpfReg, label: usize) {
+        let insn_idx = self.builder.len();
+        self.builder.push(EbpfInsn::jeq_imm(reg, 0, 0)); // placeholder offset
+        self.pending_internal_jumps.push(PendingInternalJump {
+            ebpf_insn_idx: insn_idx,
+            target_label: label,
+        });
+    }
+
+    /// Emit a conditional jump if value <= 0 (signed) to a label - exposed for helpers
+    pub(crate) fn emit_jump_if_le_zero_to_label(&mut self, reg: EbpfReg, label: usize) {
+        let insn_idx = self.builder.len();
+        self.builder.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JSLE | opcode::BPF_K,
+            reg.as_u8(),
+            0,
+            0, // placeholder offset
+            0,
+        ));
+        self.pending_internal_jumps.push(PendingInternalJump {
+            ebpf_insn_idx: insn_idx,
+            target_label: label,
+        });
+    }
+
+    /// Emit an unconditional jump to a label - exposed for helpers
+    pub(crate) fn emit_jump_to_label(&mut self, label: usize) {
+        let insn_idx = self.builder.len();
+        self.builder.push(EbpfInsn::jump(0)); // placeholder offset
+        self.pending_internal_jumps.push(PendingInternalJump {
+            ebpf_insn_idx: insn_idx,
+            target_label: label,
+        });
+    }
+
+    // Make register allocation methods pub(crate) for helpers
+    pub(crate) fn ensure_reg(&mut self, reg: RegId) -> Result<EbpfReg, CompileError> {
+        self.ensure_reg_internal(reg)
+    }
+
+    pub(crate) fn alloc_reg(&mut self, reg: RegId) -> Result<EbpfReg, CompileError> {
+        self.alloc_reg_for_write_internal(ValueKey::Reg(reg.get()))
+    }
+
+    pub(crate) fn alloc_stack(&mut self, size: i16) -> Result<i16, CompileError> {
+        self.alloc_stack_internal(size)
+    }
+
+    pub(crate) fn check_stack_space(&self, needed: i16) -> Result<(), CompileError> {
+        self.check_stack_space_internal(needed)
+    }
+
+    // Renamed internal methods to avoid conflicts
+    fn ensure_reg_internal(&mut self, reg: RegId) -> Result<EbpfReg, CompileError> {
+        // Check if the value is spilled and needs reload
+        if let Some(stack_offset) = self.reg_alloc.needs_reload(reg) {
+            // Need to reload - first get a register (may cause another spill)
+            let target_reg = self.alloc_reg_for_write_internal(ValueKey::Reg(reg.get()))?;
+            // Emit the load instruction
+            self.builder
+                .push(EbpfInsn::ldxdw(target_reg, EbpfReg::R10, stack_offset));
+            self.reg_alloc
+                .complete_reload(ValueKey::Reg(reg.get()), target_reg);
+            return Ok(target_reg);
+        }
+
+        // Value is already in a register
+        match self.reg_alloc.get(reg)? {
+            RegAction::Ready(r) => Ok(r),
+            RegAction::Reload { .. } => unreachable!("Already handled above"),
+        }
+    }
+
+    fn alloc_stack_internal(&mut self, size: i16) -> Result<i16, CompileError> {
+        let new_offset = self.stack_offset - size;
+        if new_offset < BPF_STACK_LIMIT {
+            return Err(CompileError::StackOverflow);
+        }
+        self.stack_offset = new_offset;
+        Ok(new_offset)
+    }
+
+    fn check_stack_space_internal(&self, needed: i16) -> Result<(), CompileError> {
+        if self.stack_offset - needed < BPF_STACK_LIMIT {
+            return Err(CompileError::StackOverflow);
+        }
+        Ok(())
+    }
+
+    fn compile_instruction(
+        &mut self,
+        instr: &Instruction,
+        _idx: usize,
+    ) -> Result<(), CompileError> {
         match instr {
-            Instruction::LoadLiteral { dst, lit } => {
-                self.compile_load_literal(*dst, lit)
-            }
-            Instruction::Move { dst, src } => {
-                self.compile_move(*dst, *src)
-            }
+            Instruction::LoadLiteral { dst, lit } => self.compile_load_literal(*dst, lit),
+            Instruction::Move { dst, src } => self.compile_move(*dst, *src),
             Instruction::Clone { dst, src } => {
                 // Clone is same as Move for our purposes (we don't track lifetimes)
                 self.compile_move(*dst, *src)
@@ -706,12 +607,8 @@ impl<'a> IrToEbpfCompiler<'a> {
             Instruction::BinaryOp { lhs_dst, op, rhs } => {
                 self.compile_binary_op(*lhs_dst, op, *rhs)
             }
-            Instruction::Return { src } => {
-                self.compile_return(*src)
-            }
-            Instruction::LoadVariable { dst, var_id } => {
-                self.compile_load_variable(*dst, *var_id)
-            }
+            Instruction::Return { src } => self.compile_return(*src),
+            Instruction::LoadVariable { dst, var_id } => self.compile_load_variable(*dst, *var_id),
             Instruction::StoreVariable { var_id, src } => {
                 self.compile_store_variable(*var_id, *src)
             }
@@ -719,18 +616,10 @@ impl<'a> IrToEbpfCompiler<'a> {
                 // No-op in eBPF - we don't need to clean up
                 Ok(())
             }
-            Instruction::Not { src_dst } => {
-                self.compile_not(*src_dst)
-            }
-            Instruction::BranchIf { cond, index } => {
-                self.compile_branch_if(*cond, *index as usize)
-            }
-            Instruction::Jump { index } => {
-                self.compile_jump(*index as usize)
-            }
-            Instruction::Call { decl_id, src_dst } => {
-                self.compile_call(*decl_id, *src_dst)
-            }
+            Instruction::Not { src_dst } => self.compile_not(*src_dst),
+            Instruction::BranchIf { cond, index } => self.compile_branch_if(*cond, *index as usize),
+            Instruction::Jump { index } => self.compile_jump(*index as usize),
+            Instruction::Call { decl_id, src_dst } => self.compile_call(*decl_id, *src_dst),
             // Instructions we can safely ignore for simple closures
             Instruction::Span { .. } => Ok(()),
             Instruction::PushPositional { src } => {
@@ -762,7 +651,8 @@ impl<'a> IrToEbpfCompiler<'a> {
 
                 // Check if value fits in i32 immediate
                 if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
-                    self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, *val as i32));
+                    self.builder
+                        .push(EbpfInsn::mov64_imm(ebpf_dst, *val as i32));
                 } else {
                     // For 64-bit values, we need LD_DW_IMM (two instruction slots)
                     self.emit_load_64bit_imm(ebpf_dst, *val);
@@ -770,7 +660,8 @@ impl<'a> IrToEbpfCompiler<'a> {
                 Ok(())
             }
             Literal::Bool(b) => {
-                self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, if *b { 1 } else { 0 }));
+                self.builder
+                    .push(EbpfInsn::mov64_imm(ebpf_dst, if *b { 1 } else { 0 }));
                 Ok(())
             }
             Literal::Nothing => {
@@ -825,67 +716,79 @@ impl<'a> IrToEbpfCompiler<'a> {
         Ok(())
     }
 
-    fn compile_binary_op(&mut self, lhs_dst: RegId, op: &Operator, rhs: RegId) -> Result<(), CompileError> {
+    fn compile_binary_op(
+        &mut self,
+        lhs_dst: RegId,
+        op: &Operator,
+        rhs: RegId,
+    ) -> Result<(), CompileError> {
         let ebpf_lhs = self.ensure_reg(lhs_dst)?;
         let ebpf_rhs = self.ensure_reg(rhs)?;
 
         match op {
             // Math operations
-            Operator::Math(math) => {
-                match math {
-                    Math::Add => {
-                        self.builder.push(EbpfInsn::add64_reg(ebpf_lhs, ebpf_rhs));
-                    }
-                    Math::Subtract => {
-                        self.builder.push(EbpfInsn::sub64_reg(ebpf_lhs, ebpf_rhs));
-                    }
-                    Math::Multiply => {
-                        self.builder.push(EbpfInsn::mul64_reg(ebpf_lhs, ebpf_rhs));
-                    }
-                    Math::Divide | Math::FloorDivide => {
-                        self.builder.push(EbpfInsn::div64_reg(ebpf_lhs, ebpf_rhs));
-                    }
-                    Math::Modulo => {
-                        self.builder.push(EbpfInsn::mod64_reg(ebpf_lhs, ebpf_rhs));
-                    }
-                    _ => return Err(CompileError::UnsupportedInstruction(
-                        format!("Math operator {:?}", math)
-                    )),
+            Operator::Math(math) => match math {
+                Math::Add => {
+                    self.builder.push(EbpfInsn::add64_reg(ebpf_lhs, ebpf_rhs));
                 }
-            }
+                Math::Subtract => {
+                    self.builder.push(EbpfInsn::sub64_reg(ebpf_lhs, ebpf_rhs));
+                }
+                Math::Multiply => {
+                    self.builder.push(EbpfInsn::mul64_reg(ebpf_lhs, ebpf_rhs));
+                }
+                Math::Divide | Math::FloorDivide => {
+                    self.builder.push(EbpfInsn::div64_reg(ebpf_lhs, ebpf_rhs));
+                }
+                Math::Modulo => {
+                    self.builder.push(EbpfInsn::mod64_reg(ebpf_lhs, ebpf_rhs));
+                }
+                _ => {
+                    return Err(CompileError::UnsupportedInstruction(format!(
+                        "Math operator {:?}",
+                        math
+                    )));
+                }
+            },
             // Bitwise operations
-            Operator::Bits(bits) => {
-                match bits {
-                    Bits::BitOr => {
-                        self.builder.push(EbpfInsn::or64_reg(ebpf_lhs, ebpf_rhs));
-                    }
-                    Bits::BitAnd => {
-                        self.builder.push(EbpfInsn::and64_reg(ebpf_lhs, ebpf_rhs));
-                    }
-                    Bits::BitXor => {
-                        self.builder.push(EbpfInsn::xor64_reg(ebpf_lhs, ebpf_rhs));
-                    }
-                    Bits::ShiftLeft => {
-                        self.builder.push(EbpfInsn::lsh64_reg(ebpf_lhs, ebpf_rhs));
-                    }
-                    Bits::ShiftRight => {
-                        self.builder.push(EbpfInsn::rsh64_reg(ebpf_lhs, ebpf_rhs));
-                    }
+            Operator::Bits(bits) => match bits {
+                Bits::BitOr => {
+                    self.builder.push(EbpfInsn::or64_reg(ebpf_lhs, ebpf_rhs));
                 }
-            }
+                Bits::BitAnd => {
+                    self.builder.push(EbpfInsn::and64_reg(ebpf_lhs, ebpf_rhs));
+                }
+                Bits::BitXor => {
+                    self.builder.push(EbpfInsn::xor64_reg(ebpf_lhs, ebpf_rhs));
+                }
+                Bits::ShiftLeft => {
+                    self.builder.push(EbpfInsn::lsh64_reg(ebpf_lhs, ebpf_rhs));
+                }
+                Bits::ShiftRight => {
+                    self.builder.push(EbpfInsn::rsh64_reg(ebpf_lhs, ebpf_rhs));
+                }
+            },
             // Comparison operations - result is 0 or 1
             Operator::Comparison(cmp) => {
                 self.compile_comparison(ebpf_lhs, cmp, ebpf_rhs)?;
             }
-            _ => return Err(CompileError::UnsupportedInstruction(
-                format!("Operator {:?}", op)
-            )),
+            _ => {
+                return Err(CompileError::UnsupportedInstruction(format!(
+                    "Operator {:?}",
+                    op
+                )));
+            }
         }
 
         Ok(())
     }
 
-    fn compile_comparison(&mut self, lhs: EbpfReg, cmp: &Comparison, rhs: EbpfReg) -> Result<(), CompileError> {
+    fn compile_comparison(
+        &mut self,
+        lhs: EbpfReg,
+        cmp: &Comparison,
+        rhs: EbpfReg,
+    ) -> Result<(), CompileError> {
         // Comparison in eBPF is done via conditional jumps
         // We emit: if (lhs cmp rhs) goto +1; r0 = 0; goto +1; r0 = 1
         // But we need to put result back in lhs register
@@ -911,9 +814,12 @@ impl<'a> IrToEbpfCompiler<'a> {
             Comparison::LessThanOrEqual => opcode::BPF_JMP | opcode::BPF_JLE | opcode::BPF_X,
             Comparison::GreaterThan => opcode::BPF_JMP | opcode::BPF_JGT | opcode::BPF_X,
             Comparison::GreaterThanOrEqual => opcode::BPF_JMP | opcode::BPF_JGE | opcode::BPF_X,
-            _ => return Err(CompileError::UnsupportedInstruction(
-                format!("Comparison {:?}", cmp)
-            )),
+            _ => {
+                return Err(CompileError::UnsupportedInstruction(format!(
+                    "Comparison {:?}",
+                    cmp
+                )));
+            }
         };
 
         // Jump over the "goto skip" if condition is true
@@ -946,7 +852,8 @@ impl<'a> IrToEbpfCompiler<'a> {
 
         // Move result to R0 (return register) if not already there
         if ebpf_src.as_u8() != EbpfReg::R0.as_u8() {
-            self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R0, ebpf_src));
+            self.builder
+                .push(EbpfInsn::mov64_reg(EbpfReg::R0, ebpf_src));
         }
 
         self.builder.push(EbpfInsn::exit());
@@ -973,31 +880,6 @@ impl<'a> IrToEbpfCompiler<'a> {
             self.builder.push(EbpfInsn::mov64_reg(ebpf_dst, ebpf_var));
         }
         Ok(())
-    }
-
-    /// Emit a 64-bit immediate load (uses two instruction slots)
-    fn emit_load_64bit_imm(&mut self, dst: EbpfReg, val: i64) {
-        // LD_DW_IMM uses two 8-byte slots
-        // First slot: opcode + lower 32 bits in imm
-        // Second slot: upper 32 bits in imm
-        let lower = val as i32;
-        let upper = (val >> 32) as i32;
-
-        self.builder.push(EbpfInsn::new(
-            opcode::LD_DW_IMM,
-            dst.as_u8(),
-            0,
-            0,
-            lower,
-        ));
-        // Second instruction slot (pseudo-instruction)
-        self.builder.push(EbpfInsn::new(
-            0,
-            0,
-            0,
-            0,
-            upper,
-        ));
     }
 
     /// Compile logical NOT (flip boolean: 0 -> 1, non-zero -> 0)
@@ -1066,874 +948,85 @@ impl<'a> IrToEbpfCompiler<'a> {
     }
 
     /// Compile a command call - maps known commands to BPF helpers
+    ///
+    /// This dispatches to the appropriate helper trait method based on command name.
     fn compile_call(&mut self, decl_id: DeclId, src_dst: RegId) -> Result<(), CompileError> {
         // Look up the command name
         let decl = self.engine_state.get_decl(decl_id);
         let cmd_name = decl.name();
 
-        // Map known commands to BPF helpers
+        // Map known commands to BPF helpers (via extension traits)
         match cmd_name {
-            "bpf-pid" | "bpf pid" => {
-                // bpf_get_current_pid_tgid() returns (tgid << 32) | pid
-                // We'll return the full value and let user extract pid with bit ops
-                self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
-                // Result is in R0, move to destination register
-                let ebpf_dst = self.alloc_reg(src_dst)?;
-                if ebpf_dst.as_u8() != EbpfReg::R0.as_u8() {
-                    self.builder.push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
-                }
-                Ok(())
-            }
-            "bpf-tgid" | "bpf tgid" => {
-                // bpf_get_current_pid_tgid() returns (tgid << 32) | pid
-                // TGID is in the upper 32 bits - this is the "process ID" users expect
-                self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
-                // Right-shift by 32 to get the TGID
-                self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 32));
-                // Result is in R0, move to destination register
-                let ebpf_dst = self.alloc_reg(src_dst)?;
-                if ebpf_dst.as_u8() != EbpfReg::R0.as_u8() {
-                    self.builder.push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
-                }
-                Ok(())
-            }
-            "bpf-uid" | "bpf uid" => {
-                // bpf_get_current_uid_gid() returns (uid << 32) | gid
-                self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentUidGid));
-                let ebpf_dst = self.alloc_reg(src_dst)?;
-                if ebpf_dst.as_u8() != EbpfReg::R0.as_u8() {
-                    self.builder.push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
-                }
-                Ok(())
-            }
-            "bpf-ktime" | "bpf ktime" => {
-                // bpf_ktime_get_ns() returns kernel time in nanoseconds
-                self.builder.push(EbpfInsn::call(BpfHelper::KtimeGetNs));
-                let ebpf_dst = self.alloc_reg(src_dst)?;
-                if ebpf_dst.as_u8() != EbpfReg::R0.as_u8() {
-                    self.builder.push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
-                }
-                Ok(())
-            }
-            "bpf-emit" | "bpf emit" => {
-                self.compile_bpf_emit(src_dst)
-            }
-            "bpf-emit-comm" | "bpf emit-comm" => {
-                self.compile_bpf_emit_comm(src_dst)
-            }
-            "bpf-comm" | "bpf comm" => {
-                self.compile_bpf_comm(src_dst)
-            }
-            "bpf-count" | "bpf count" => {
-                self.compile_bpf_count(src_dst)
-            }
-            "bpf-filter-pid" | "bpf filter-pid" => {
-                self.compile_bpf_filter_pid()
-            }
-            "bpf-filter-comm" | "bpf filter-comm" => {
-                self.compile_bpf_filter_comm()
-            }
-            "bpf-arg" | "bpf arg" => {
-                self.compile_bpf_arg(src_dst)
-            }
-            "bpf-retval" | "bpf retval" => {
-                self.compile_bpf_retval(src_dst)
-            }
+            // Data helpers (DataHelpers trait)
+            "bpf-pid" | "bpf pid" => DataHelpers::compile_bpf_pid(self, src_dst),
+            "bpf-tgid" | "bpf tgid" => DataHelpers::compile_bpf_tgid(self, src_dst),
+            "bpf-uid" | "bpf uid" => DataHelpers::compile_bpf_uid(self, src_dst),
+            "bpf-ktime" | "bpf ktime" => DataHelpers::compile_bpf_ktime(self, src_dst),
+            "bpf-comm" | "bpf comm" => DataHelpers::compile_bpf_comm(self, src_dst),
+            "bpf-arg" | "bpf arg" => DataHelpers::compile_bpf_arg(self, src_dst),
+            "bpf-retval" | "bpf retval" => DataHelpers::compile_bpf_retval(self, src_dst),
+
+            // Output helpers (OutputHelpers trait)
+            "bpf-emit" | "bpf emit" => OutputHelpers::compile_bpf_emit(self, src_dst),
+            "bpf-emit-comm" | "bpf emit-comm" => OutputHelpers::compile_bpf_emit_comm(self, src_dst),
             "bpf-read-str" | "bpf read-str" => {
-                self.compile_bpf_read_str(src_dst, false)
+                OutputHelpers::compile_bpf_read_str(self, src_dst, false)
             }
             "bpf-read-user-str" | "bpf read-user-str" => {
-                self.compile_bpf_read_str(src_dst, true)
+                OutputHelpers::compile_bpf_read_str(self, src_dst, true)
             }
+
+            // Aggregation helpers (AggregationHelpers trait)
+            "bpf-count" | "bpf count" => AggregationHelpers::compile_bpf_count(self, src_dst),
+            "bpf-histogram" | "bpf histogram" => {
+                AggregationHelpers::compile_bpf_histogram(self, src_dst)
+            }
+
+            // Timing helpers (TimingHelpers trait)
             "bpf-start-timer" | "bpf start-timer" => {
-                self.compile_bpf_start_timer(src_dst)
+                TimingHelpers::compile_bpf_start_timer(self, src_dst)
             }
             "bpf-stop-timer" | "bpf stop-timer" => {
-                self.compile_bpf_stop_timer(src_dst)
+                TimingHelpers::compile_bpf_stop_timer(self, src_dst)
             }
-            "bpf-histogram" | "bpf histogram" => {
-                self.compile_bpf_histogram(src_dst)
-            }
-            _ => Err(CompileError::UnsupportedInstruction(
-                format!("Call to unsupported command: {}", cmd_name)
-            )),
+
+            // Filter helpers (FilterHelpers trait)
+            "bpf-filter-pid" | "bpf filter-pid" => FilterHelpers::compile_bpf_filter_pid(self),
+            "bpf-filter-comm" | "bpf filter-comm" => FilterHelpers::compile_bpf_filter_comm(self),
+
+            _ => Err(CompileError::UnsupportedInstruction(format!(
+                "Call to unsupported command: {}",
+                cmd_name
+            ))),
         }
-    }
-
-    /// Compile bpf-emit-comm: emit the full process name (16 bytes) to perf buffer
-    ///
-    /// This combines bpf_get_current_comm + bpf_perf_event_output to emit
-    /// the full TASK_COMM_LEN string, not just 8 bytes.
-    fn compile_bpf_emit_comm(&mut self, src_dst: RegId) -> Result<(), CompileError> {
-        // Allocate the destination register (we'll store 0 as the "return value")
-        let ebpf_dst = self.alloc_reg(src_dst)?;
-        // Mark that we need the perf event map
-        self.needs_perf_map = true;
-
-        // Allocate 16 bytes on stack for TASK_COMM_LEN
-        let comm_stack_offset = self.alloc_stack(16)?;
-
-        // Call bpf_get_current_comm(buf, 16)
-        // R1 = pointer to buffer on stack
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, comm_stack_offset as i32));
-        // R2 = size (16 = TASK_COMM_LEN)
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R2, 16));
-        // Call bpf_get_current_comm
-        self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentComm));
-
-        // Now emit the 16-byte comm to perf buffer
-        // bpf_perf_event_output(ctx, map, flags, data, size)
-
-        // R2 = map fd (load with relocation)
-        let reloc_offset = self.builder.len() * 8;
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R2);
-        self.builder.push(insn1);
-        self.builder.push(insn2);
-        self.relocations.push(MapRelocation {
-            insn_offset: reloc_offset,
-            map_name: PERF_MAP_NAME.to_string(),
-        });
-
-        // R3 = flags (BPF_F_CURRENT_CPU = 0xFFFFFFFF)
-        self.builder.push(EbpfInsn::mov32_imm(EbpfReg::R3, -1));
-
-        // R4 = pointer to comm data on stack
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R4, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R4, comm_stack_offset as i32));
-
-        // R5 = size (16 bytes)
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R5, 16));
-
-        // R1 = ctx (restore from R9 where we saved it at program start)
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R9));
-
-        // Call bpf_perf_event_output
-        self.builder.push(EbpfInsn::call(BpfHelper::PerfEventOutput));
-
-        // Set destination register to 0 (success indicator)
-        self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
-
-        Ok(())
-    }
-
-    /// Compile bpf-count: increment a counter for the input key
-    ///
-    /// Uses a hash map to count occurrences by key. The input value is used
-    /// as the key, and the counter is atomically incremented.
-    fn compile_bpf_count(&mut self, src_dst: RegId) -> Result<(), CompileError> {
-        // Mark that we need the counter map
-        self.needs_counter_map = true;
-
-        let ebpf_src = self.ensure_reg(src_dst)?;
-
-        // Allocate stack space for key and value
-        // Key: 8 bytes (i64)
-        // Value: 8 bytes (i64)
-        let base_offset = self.alloc_stack(16)?;
-        let key_stack_offset = base_offset + 8; // key at higher address
-        let value_stack_offset = base_offset;   // value at lower address
-
-        // Store the key to stack
-        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, key_stack_offset, ebpf_src));
-
-        // Create labels for control flow
-        let init_label = self.create_label();
-        let done_label = self.create_label();
-
-        // Step 1: Try to look up existing value
-        // R1 = map (will be relocated)
-        let lookup_reloc_offset = self.builder.len() * 8;
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
-        self.builder.push(insn1);
-        self.builder.push(insn2);
-        self.relocations.push(MapRelocation {
-            insn_offset: lookup_reloc_offset,
-            map_name: COUNTER_MAP_NAME.to_string(),
-        });
-
-        // R2 = pointer to key
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
-
-        // Call bpf_map_lookup_elem
-        self.builder.push(EbpfInsn::call(BpfHelper::MapLookupElem));
-
-        // R0 = pointer to value or NULL
-        // If NULL, jump to init path
-        self.emit_jump_if_zero_to_label(EbpfReg::R0, init_label);
-
-        // Value exists - load it, increment, store back
-        // Load current value: r1 = *r0
-        self.builder.push(EbpfInsn::ldxdw(EbpfReg::R1, EbpfReg::R0, 0));
-        // Increment: r1 += 1
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 1));
-        // Store back: *r0 = r1
-        self.builder.push(EbpfInsn::stxdw(EbpfReg::R0, 0, EbpfReg::R1));
-        // Jump to end
-        self.emit_jump_to_label(done_label);
-
-        // Value doesn't exist - initialize to 1 and insert
-        self.bind_label(init_label);
-        // Store 1 to value slot on stack
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R1, 1));
-        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, value_stack_offset, EbpfReg::R1));
-
-        // R1 = map (reload for update)
-        let update_reloc_offset = self.builder.len() * 8;
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
-        self.builder.push(insn1);
-        self.builder.push(insn2);
-        self.relocations.push(MapRelocation {
-            insn_offset: update_reloc_offset,
-            map_name: COUNTER_MAP_NAME.to_string(),
-        });
-
-        // R2 = pointer to key
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
-
-        // R3 = pointer to value
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R3, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R3, value_stack_offset as i32));
-
-        // R4 = flags (0 = BPF_ANY)
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R4, 0));
-
-        // Call bpf_map_update_elem
-        self.builder.push(EbpfInsn::call(BpfHelper::MapUpdateElem));
-
-        // End: bpf-count passes through the input value unchanged
-        self.bind_label(done_label);
-
-        Ok(())
-    }
-
-    /// Compile bpf-comm: get current process name
-    ///
-    /// Calls bpf_get_current_comm to get the process name, then returns
-    /// the first 8 bytes as an i64 for easy comparison/emission.
-    fn compile_bpf_comm(&mut self, src_dst: RegId) -> Result<(), CompileError> {
-        // Track that this register contains a comm value
-        self.register_types.insert(src_dst.get(), BpfFieldType::Comm);
-
-        // Allocate 16 bytes on stack for TASK_COMM_LEN
-        let comm_stack_offset = self.alloc_stack(16)?;
-
-        // R1 = pointer to buffer on stack
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, comm_stack_offset as i32));
-
-        // R2 = size (16 = TASK_COMM_LEN)
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R2, 16));
-
-        // Call bpf_get_current_comm
-        self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentComm));
-
-        // Load first 8 bytes from buffer into destination register
-        let ebpf_dst = self.alloc_reg(src_dst)?;
-        self.builder.push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R10, comm_stack_offset));
-
-        Ok(())
-    }
-
-    /// Compile bpf-emit: output a value to the perf event buffer
-    ///
-    /// This uses bpf_perf_event_output to send a 64-bit value to userspace.
-    /// The event structure is simple: just the 64-bit value.
-    /// If the input is a record, emits all fields as a structured event.
-    fn compile_bpf_emit(&mut self, src_dst: RegId) -> Result<(), CompileError> {
-        // Check if the source is a record
-        if let Some(record) = self.record_builders.remove(&src_dst.get()) {
-            return self.compile_bpf_emit_record(src_dst, record);
-        }
-
-        // Mark that we need the perf event map
-        self.needs_perf_map = true;
-
-        let ebpf_src = self.ensure_reg(src_dst)?;
-
-        // Allocate stack space for the event data (8 bytes for u64)
-        self.check_stack_space(8)?;
-        let event_stack_offset = self.stack_offset;
-        self.stack_offset -= 8;
-
-        // Store the value to the stack for bpf_perf_event_output
-        self.builder.push(EbpfInsn::stxdw(
-            EbpfReg::R10,
-            event_stack_offset,
-            ebpf_src,
-        ));
-
-        // bpf_perf_event_output(ctx, map, flags, data, size)
-        // R1 = ctx (pt_regs pointer - should still be valid if called early)
-        // R2 = map (will be relocated by loader)
-        // R3 = flags (BPF_F_CURRENT_CPU = 0xFFFFFFFF)
-        // R4 = data pointer (stack address)
-        // R5 = data size (8 bytes)
-
-        // R2 = map fd (load with relocation)
-        let reloc_offset = self.builder.len() * 8; // Byte offset
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R2);
-        self.builder.push(insn1);
-        self.builder.push(insn2);
-
-        // Record relocation
-        self.relocations.push(MapRelocation {
-            insn_offset: reloc_offset,
-            map_name: PERF_MAP_NAME.to_string(),
-        });
-
-        // R3 = flags (BPF_F_CURRENT_CPU = 0xFFFFFFFF)
-        // Use mov32 which zeros the upper 32 bits and sets lower 32 bits
-        self.builder.push(EbpfInsn::mov32_imm(EbpfReg::R3, -1));  // R3 = 0x00000000FFFFFFFF
-
-        // R4 = pointer to data on stack
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R4, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R4, event_stack_offset as i32));
-
-        // R5 = size (8 bytes)
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R5, 8));
-
-        // R1 = ctx (restore from R9 where we saved it at program start)
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R9));
-
-        // Call bpf_perf_event_output
-        self.builder.push(EbpfInsn::call(BpfHelper::PerfEventOutput));
-
-        // bpf-emit returns the original value for chaining
-        // The value is still in ebpf_src register (we only copied it to stack)
-
-        Ok(())
-    }
-
-    /// Compile bpf-filter-pid: exit early if current TGID doesn't match
-    ///
-    /// Gets the first pushed positional argument (target PID) and compares
-    /// with the current TGID. If they don't match, exits the program early.
-    fn compile_bpf_filter_pid(&mut self) -> Result<(), CompileError> {
-        // Get the target PID from pushed arguments
-        let arg_reg = self.pushed_args.pop().ok_or_else(|| {
-            CompileError::UnsupportedInstruction("bpf-filter-pid requires a PID argument".into())
-        })?;
-
-        // Get the target PID value (should already be loaded in a register)
-        let target_reg = self.ensure_reg(arg_reg)?;
-
-        // Get current TGID
-        self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
-        // Right-shift by 32 to get the TGID
-        self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 32));
-
-        // Compare R0 (current TGID) with target
-        // If equal, continue; if not equal, exit with 0
-        // jne r0, target_reg, +2 (skip to exit)
-        self.builder.push(EbpfInsn::jeq_reg(EbpfReg::R0, target_reg, 2));
-
-        // Not matching - exit early
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
-        self.builder.push(EbpfInsn::exit());
-
-        // Matching - continue execution (fall through)
-        Ok(())
-    }
-
-    /// Compile bpf-filter-comm: exit early if current comm doesn't match
-    ///
-    /// Gets the first pushed positional argument (target comm as i64) and
-    /// compares with the first 8 bytes of current comm. If they don't match,
-    /// exits the program early.
-    fn compile_bpf_filter_comm(&mut self) -> Result<(), CompileError> {
-        // Get the target comm from pushed arguments
-        let arg_reg = self.pushed_args.pop().ok_or_else(|| {
-            CompileError::UnsupportedInstruction("bpf-filter-comm requires a comm argument".into())
-        })?;
-
-        // Get the target comm value (should already be loaded in a register)
-        let target_reg = self.ensure_reg(arg_reg)?;
-
-        // Get current comm (first 8 bytes)
-        // Allocate 16 bytes on stack for TASK_COMM_LEN
-        self.check_stack_space(16)?;
-        let comm_stack_offset = self.stack_offset - 16;
-        self.stack_offset -= 16;
-
-        // R1 = pointer to buffer on stack
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, comm_stack_offset as i32));
-
-        // R2 = size (16 = TASK_COMM_LEN)
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R2, 16));
-
-        // Call bpf_get_current_comm
-        self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentComm));
-
-        // Load first 8 bytes from buffer into R0
-        self.builder.push(EbpfInsn::ldxdw(EbpfReg::R0, EbpfReg::R10, comm_stack_offset));
-
-        // Compare R0 (current comm first 8 bytes) with target
-        // If equal, continue; if not equal, exit with 0
-        self.builder.push(EbpfInsn::jeq_reg(EbpfReg::R0, target_reg, 2));
-
-        // Not matching - exit early
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
-        self.builder.push(EbpfInsn::exit());
-
-        // Matching - continue execution (fall through)
-        Ok(())
-    }
-
-    /// Compile bpf-arg: read a function argument from pt_regs
-    ///
-    /// The argument index is passed as a positional argument.
-    /// Reads from the context pointer (saved in R9) at the appropriate offset.
-    fn compile_bpf_arg(&mut self, src_dst: RegId) -> Result<(), CompileError> {
-        // Get the argument index from pushed arguments
-        let arg_reg = self.pushed_args.pop().ok_or_else(|| {
-            CompileError::UnsupportedInstruction("bpf-arg requires an index argument".into())
-        })?;
-
-        // Look up the compile-time literal value for the index
-        let index = self.literal_values.get(&arg_reg.get()).copied().ok_or_else(|| {
-            CompileError::UnsupportedInstruction(
-                "bpf-arg index must be a compile-time constant (literal integer)".into()
-            )
-        })?;
-
-        // Validate the index
-        let max_args = pt_regs_offsets::ARG_OFFSETS.len();
-        if index < 0 || index as usize >= max_args {
-            return Err(CompileError::UnsupportedInstruction(
-                format!("bpf-arg index {} out of range (0-{})", index, max_args - 1)
-            ));
-        }
-
-        // Get the offset for this argument
-        let offset = pt_regs_offsets::ARG_OFFSETS[index as usize];
-
-        // Allocate destination register
-        let ebpf_dst = self.alloc_reg(src_dst)?;
-
-        // ldxdw dst, [r9 + offset] - load 64-bit value from ctx
-        self.builder.push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
-
-        Ok(())
-    }
-
-    /// Compile bpf-retval: read the return value from pt_regs (for kretprobe)
-    ///
-    /// Reads the return value register from the context pointer.
-    fn compile_bpf_retval(&mut self, src_dst: RegId) -> Result<(), CompileError> {
-        // Allocate destination register
-        let ebpf_dst = self.alloc_reg(src_dst)?;
-
-        // Read the return value from context (R9 has the ctx pointer)
-        // On x86_64, return value is in rax at offset 80
-        let offset = pt_regs_offsets::RETVAL_OFFSET;
-
-        // ldxdw dst, [r9 + offset] - load 64-bit value from ctx
-        self.builder.push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
-
-        Ok(())
-    }
-
-    /// Compile bpf-read-str / bpf-read-user-str: read a string and emit it
-    ///
-    /// Takes a pointer from the pipeline input, reads up to 128 bytes of
-    /// null-terminated string from memory, and emits to perf buffer.
-    ///
-    /// If `user_space` is true, reads from user-space memory (for syscall args).
-    /// If `user_space` is false, reads from kernel memory.
-    fn compile_bpf_read_str(&mut self, src_dst: RegId, user_space: bool) -> Result<(), CompileError> {
-        // Mark that we need the perf event map
-        self.needs_perf_map = true;
-
-        // Get the source pointer from the input register
-        let src_ptr = self.ensure_reg(src_dst)?;
-
-        // Allocate stack space for the string buffer (128 bytes max)
-        const STR_BUF_SIZE: i16 = 128;
-        self.check_stack_space(STR_BUF_SIZE)?;
-        let str_stack_offset = self.stack_offset - STR_BUF_SIZE;
-        self.stack_offset -= STR_BUF_SIZE;
-
-        // Call bpf_probe_read_{kernel,user}_str(dst, size, unsafe_ptr)
-        // R1 = dst (stack buffer)
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, str_stack_offset as i32));
-
-        // R2 = size
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R2, STR_BUF_SIZE as i32));
-
-        // R3 = src pointer (from input)
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R3, src_ptr));
-
-        // Call appropriate helper based on memory type
-        let helper = if user_space {
-            BpfHelper::ProbeReadUserStr
-        } else {
-            BpfHelper::ProbeReadKernelStr
-        };
-        self.builder.push(EbpfInsn::call(helper));
-
-        // R0 now contains the number of bytes read (including null terminator)
-        // or negative error code
-
-        // Now emit the string to perf buffer
-        // bpf_perf_event_output(ctx, map, flags, data, size)
-
-        // R2 = map (will be relocated)
-        let reloc_offset = self.builder.len() * 8;
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R2);
-        self.builder.push(insn1);
-        self.builder.push(insn2);
-        self.relocations.push(MapRelocation {
-            insn_offset: reloc_offset,
-            map_name: PERF_MAP_NAME.to_string(),
-        });
-
-        // R3 = flags (BPF_F_CURRENT_CPU)
-        self.builder.push(EbpfInsn::mov32_imm(EbpfReg::R3, -1));
-
-        // R4 = pointer to data on stack
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R4, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R4, str_stack_offset as i32));
-
-        // R5 = size (use the return value from probe_read_kernel_str if positive,
-        // otherwise use full buffer size)
-        // For simplicity, just use the full buffer size
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R5, STR_BUF_SIZE as i32));
-
-        // R1 = ctx (restore from R9)
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R9));
-
-        // Call bpf_perf_event_output
-        self.builder.push(EbpfInsn::call(BpfHelper::PerfEventOutput));
-
-        // Set result to 0 (success indicator)
-        let ebpf_dst = self.alloc_reg(src_dst)?;
-        self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
-
-        Ok(())
-    }
-
-    /// Compile bpf-start-timer: store current ktime keyed by TID
-    ///
-    /// Stores the current kernel timestamp in a hash map keyed by the thread ID.
-    /// Used for latency measurement - call bpf-stop-timer to get elapsed time.
-    fn compile_bpf_start_timer(&mut self, src_dst: RegId) -> Result<(), CompileError> {
-        self.needs_timestamp_map = true;
-
-        // Allocate stack space for key (TID) and value (timestamp)
-        self.check_stack_space(16)?;
-        let key_stack_offset = self.stack_offset - 8;
-        let value_stack_offset = self.stack_offset - 16;
-        self.stack_offset -= 16;
-
-        // Get current TGID (thread group ID) as the key
-        // Using TGID instead of TID allows matching entry/return across threads
-        // Note: For per-thread tracking, use the lower 32 bits (PID/TID)
-        self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
-        // Store the full pid_tgid as key (allows unique per-thread tracking)
-        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, key_stack_offset, EbpfReg::R0));
-
-        // Get current kernel time
-        self.builder.push(EbpfInsn::call(BpfHelper::KtimeGetNs));
-        // Store as value
-        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, value_stack_offset, EbpfReg::R0));
-
-        // Call bpf_map_update_elem(map, &key, &value, BPF_ANY)
-        // R1 = map fd (will be relocated)
-        let reloc_offset = self.builder.len() * 8;
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
-        self.builder.push(insn1);
-        self.builder.push(insn2);
-        self.relocations.push(MapRelocation {
-            insn_offset: reloc_offset,
-            map_name: TIMESTAMP_MAP_NAME.to_string(),
-        });
-
-        // R2 = pointer to key
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
-
-        // R3 = pointer to value
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R3, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R3, value_stack_offset as i32));
-
-        // R4 = flags (BPF_ANY = 0)
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R4, 0));
-
-        // Call bpf_map_update_elem
-        self.builder.push(EbpfInsn::call(BpfHelper::MapUpdateElem));
-
-        // Set destination to 0 (void return)
-        let ebpf_dst = self.alloc_reg(src_dst)?;
-        self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
-
-        Ok(())
-    }
-
-    /// Compile bpf-stop-timer: look up start time, compute delta, delete entry
-    ///
-    /// Looks up the start timestamp for the current TID, computes the elapsed
-    /// time, deletes the map entry, and returns the delta in nanoseconds.
-    /// Returns 0 if no matching start timer was found.
-    fn compile_bpf_stop_timer(&mut self, src_dst: RegId) -> Result<(), CompileError> {
-        self.needs_timestamp_map = true;
-
-        // Allocate destination register early so both paths can use it
-        let ebpf_dst = self.alloc_reg(src_dst)?;
-
-        // Create labels for control flow
-        let no_timer_label = self.create_label();
-        let done_label = self.create_label();
-
-        // Allocate stack space for key (TID)
-        self.check_stack_space(8)?;
-        let key_stack_offset = self.stack_offset - 8;
-        self.stack_offset -= 8;
-
-        // Get current pid_tgid as the key
-        self.builder.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
-        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, key_stack_offset, EbpfReg::R0));
-
-        // Look up the start timestamp
-        // bpf_map_lookup_elem(map, &key) -> *value or NULL
-        let lookup_reloc_offset = self.builder.len() * 8;
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
-        self.builder.push(insn1);
-        self.builder.push(insn2);
-        self.relocations.push(MapRelocation {
-            insn_offset: lookup_reloc_offset,
-            map_name: TIMESTAMP_MAP_NAME.to_string(),
-        });
-
-        // R2 = pointer to key
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
-
-        // Call bpf_map_lookup_elem
-        self.builder.push(EbpfInsn::call(BpfHelper::MapLookupElem));
-
-        // R0 = pointer to value or NULL
-        // If NULL, jump to no_timer path
-        self.emit_jump_if_zero_to_label(EbpfReg::R0, no_timer_label);
-
-        // Value exists - load the start timestamp
-        // R1 = start_time = *R0
-        self.builder.push(EbpfInsn::ldxdw(EbpfReg::R1, EbpfReg::R0, 0));
-
-        // Get current time
-        self.builder.push(EbpfInsn::call(BpfHelper::KtimeGetNs));
-        // R0 = current_time
-
-        // Compute delta = current_time - start_time
-        // R0 = R0 - R1
-        self.builder.push(EbpfInsn::sub64_reg(EbpfReg::R0, EbpfReg::R1));
-
-        // Save the delta temporarily
-        self.check_stack_space(8)?;
-        let delta_stack_offset = self.stack_offset - 8;
-        self.stack_offset -= 8;
-        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, delta_stack_offset, EbpfReg::R0));
-
-        // Delete the map entry
-        // bpf_map_delete_elem(map, &key)
-        let delete_reloc_offset = self.builder.len() * 8;
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
-        self.builder.push(insn1);
-        self.builder.push(insn2);
-        self.relocations.push(MapRelocation {
-            insn_offset: delete_reloc_offset,
-            map_name: TIMESTAMP_MAP_NAME.to_string(),
-        });
-
-        // R2 = pointer to key
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
-
-        // Call bpf_map_delete_elem
-        self.builder.push(EbpfInsn::call(BpfHelper::MapDeleteElem));
-
-        // Restore the delta to destination register
-        self.builder.push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R10, delta_stack_offset));
-
-        // Jump to done
-        self.emit_jump_to_label(done_label);
-
-        // No matching timer - return 0
-        self.bind_label(no_timer_label);
-        self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
-
-        // Done
-        self.bind_label(done_label);
-
-        Ok(())
-    }
-
-    /// Compile bpf-histogram: compute log2 bucket and increment counter
-    ///
-    /// Computes the log2 bucket of the input value and atomically increments
-    /// the counter for that bucket in the histogram map.
-    fn compile_bpf_histogram(&mut self, src_dst: RegId) -> Result<(), CompileError> {
-        self.needs_histogram_map = true;
-
-        let ebpf_src = self.ensure_reg(src_dst)?;
-
-        // Allocate stack space for key (bucket) and value (count)
-        self.check_stack_space(16)?;
-        let key_stack_offset = self.stack_offset - 8;
-        let value_stack_offset = self.stack_offset - 16;
-        self.stack_offset -= 16;
-
-        // Create labels for control flow
-        let bucket_zero_label = self.create_label();
-        let store_bucket_label = self.create_label();
-        let init_value_label = self.create_label();
-        let done_label = self.create_label();
-
-        // Compute log2 bucket
-        // bucket = 64 - clz(value) for value > 0, else bucket = 0
-        // eBPF doesn't have clz, so we use binary search
-
-        // if value <= 0, jump to bucket_zero
-        self.emit_jump_if_le_zero_to_label(ebpf_src, bucket_zero_label);
-
-        // For positive values, compute log2 using binary search
-        // Copy value to R0 for manipulation, bucket in R1
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R0, ebpf_src));
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R1, 0));
-
-        // Binary search for highest set bit
-        // Check each power of 2, accumulating the bucket value
-
-        // if value >= 2^32, bucket += 32
-        self.emit_load_64bit_imm(EbpfReg::R2, 1i64 << 32);
-        self.builder.push(EbpfInsn::new(
-            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_X,
-            EbpfReg::R0.as_u8(),
-            EbpfReg::R2.as_u8(),
-            2, // Skip next 2 instructions if less
-            0,
-        ));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 32));
-        self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 32));
-
-        // if remaining >= 2^16, bucket += 16
-        self.builder.push(EbpfInsn::new(
-            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_K,
-            EbpfReg::R0.as_u8(), 0, 2, 1 << 16,
-        ));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 16));
-        self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 16));
-
-        // if remaining >= 2^8, bucket += 8
-        self.builder.push(EbpfInsn::new(
-            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_K,
-            EbpfReg::R0.as_u8(), 0, 2, 1 << 8,
-        ));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 8));
-        self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 8));
-
-        // if remaining >= 2^4, bucket += 4
-        self.builder.push(EbpfInsn::new(
-            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_K,
-            EbpfReg::R0.as_u8(), 0, 2, 1 << 4,
-        ));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 4));
-        self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 4));
-
-        // if remaining >= 2^2, bucket += 2
-        self.builder.push(EbpfInsn::new(
-            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_K,
-            EbpfReg::R0.as_u8(), 0, 2, 1 << 2,
-        ));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 2));
-        self.builder.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 2));
-
-        // if remaining >= 2^1, bucket += 1
-        self.builder.push(EbpfInsn::new(
-            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_K,
-            EbpfReg::R0.as_u8(), 0, 1, 1 << 1,
-        ));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 1));
-
-        // Jump to store_bucket (bucket is in R1)
-        self.emit_jump_to_label(store_bucket_label);
-
-        // bucket_zero: set bucket = 0
-        self.bind_label(bucket_zero_label);
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R1, 0));
-
-        // store_bucket: common path - store bucket and update map
-        self.bind_label(store_bucket_label);
-        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, key_stack_offset, EbpfReg::R1));
-
-        // Look up current count
-        let lookup_reloc_offset = self.builder.len() * 8;
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
-        self.builder.push(insn1);
-        self.builder.push(insn2);
-        self.relocations.push(MapRelocation {
-            insn_offset: lookup_reloc_offset,
-            map_name: HISTOGRAM_MAP_NAME.to_string(),
-        });
-
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
-        self.builder.push(EbpfInsn::call(BpfHelper::MapLookupElem));
-
-        // If NULL, jump to init_value; otherwise increment in place
-        self.emit_jump_if_zero_to_label(EbpfReg::R0, init_value_label);
-
-        // Exists - load, increment, store back (in-place update)
-        self.builder.push(EbpfInsn::ldxdw(EbpfReg::R1, EbpfReg::R0, 0));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R1, 1));
-        self.builder.push(EbpfInsn::stxdw(EbpfReg::R0, 0, EbpfReg::R1));
-        self.emit_jump_to_label(done_label);
-
-        // init_value: key not found, insert with count = 1
-        self.bind_label(init_value_label);
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R1, 1));
-        self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, value_stack_offset, EbpfReg::R1));
-
-        let update_reloc_offset = self.builder.len() * 8;
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
-        self.builder.push(insn1);
-        self.builder.push(insn2);
-        self.relocations.push(MapRelocation {
-            insn_offset: update_reloc_offset,
-            map_name: HISTOGRAM_MAP_NAME.to_string(),
-        });
-
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R3, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R3, value_stack_offset as i32));
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R4, 0)); // BPF_ANY
-        self.builder.push(EbpfInsn::call(BpfHelper::MapUpdateElem));
-
-        // done: common exit
-        self.bind_label(done_label);
-
-        // Return the original value (pass-through for chaining)
-        Ok(())
     }
 
     /// Compile RecordInsert: add a field to a record being built
     ///
     /// This immediately stores the field value to the stack to preserve it.
-    fn compile_record_insert(&mut self, src_dst: RegId, key: RegId, val: RegId) -> Result<(), CompileError> {
+    fn compile_record_insert(
+        &mut self,
+        src_dst: RegId,
+        key: RegId,
+        val: RegId,
+    ) -> Result<(), CompileError> {
         // Get the field name from the key register's literal string
-        let field_name = self.literal_strings.get(&key.get()).cloned().ok_or_else(|| {
-            CompileError::UnsupportedInstruction(
-                "Record field name must be a literal string".into()
-            )
-        })?;
+        let field_name = self
+            .literal_strings
+            .get(&key.get())
+            .cloned()
+            .ok_or_else(|| {
+                CompileError::UnsupportedInstruction(
+                    "Record field name must be a literal string".into(),
+                )
+            })?;
 
         // Determine the field type from the value register
-        let field_type = self.register_types.get(&val.get()).copied().unwrap_or(BpfFieldType::Int);
+        let field_type = self
+            .register_types
+            .get(&val.get())
+            .copied()
+            .unwrap_or(BpfFieldType::Int);
         let field_size = field_type.size() as i16;
 
         // Get the eBPF register containing the value
@@ -1948,31 +1041,45 @@ impl<'a> IrToEbpfCompiler<'a> {
         // Store the value to the stack based on field type
         match field_type {
             BpfFieldType::Int => {
-                self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset, ebpf_val));
+                self.builder
+                    .push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset, ebpf_val));
             }
             BpfFieldType::Comm => {
                 // Store 8-byte value we have (first 8 bytes of comm)
-                self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset, ebpf_val));
+                self.builder
+                    .push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset, ebpf_val));
                 // Zero-fill remaining 8 bytes
                 self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
-                self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset + 8, EbpfReg::R0));
+                self.builder.push(EbpfInsn::stxdw(
+                    EbpfReg::R10,
+                    field_stack_offset + 8,
+                    EbpfReg::R0,
+                ));
             }
             BpfFieldType::String => {
                 // Store 8-byte value we have
-                self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset, ebpf_val));
+                self.builder
+                    .push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset, ebpf_val));
                 // Zero-fill remaining bytes (simplified)
                 self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
                 for i in 1..16 {
-                    self.builder.push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset + (i * 8), EbpfReg::R0));
+                    self.builder.push(EbpfInsn::stxdw(
+                        EbpfReg::R10,
+                        field_stack_offset + (i * 8),
+                        EbpfReg::R0,
+                    ));
                 }
             }
         }
 
         // Get or create the record builder for the destination register
-        let record = self.record_builders.entry(src_dst.get()).or_insert_with(|| RecordBuilder {
-            fields: Vec::new(),
-            base_offset: field_stack_offset, // First field determines base
-        });
+        let record = self
+            .record_builders
+            .entry(src_dst.get())
+            .or_insert_with(|| RecordBuilder {
+                fields: Vec::new(),
+                base_offset: field_stack_offset, // First field determines base
+            });
 
         // Update base_offset if this is the first field
         if record.fields.is_empty() {
@@ -1985,89 +1092,6 @@ impl<'a> IrToEbpfCompiler<'a> {
             stack_offset: field_stack_offset,
             field_type,
         });
-
-        Ok(())
-    }
-
-    /// Compile bpf-emit for a structured record
-    ///
-    /// The field values are already on the stack (stored during RecordInsert).
-    /// We just need to emit them to the perf buffer.
-    fn compile_bpf_emit_record(&mut self, src_dst: RegId, record: RecordBuilder) -> Result<(), CompileError> {
-        self.needs_perf_map = true;
-
-        if record.fields.is_empty() {
-            // Empty record - just emit nothing
-            let ebpf_dst = self.alloc_reg(src_dst)?;
-            self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
-            return Ok(());
-        }
-
-        // Build schema from fields
-        // Fields are stored in descending stack order (later fields have lower addresses)
-        // So when we emit the buffer starting from the lowest address, we get fields in reverse order
-        // We need to reverse the schema to match the actual memory layout
-        let mut fields_schema = Vec::new();
-        let mut offset = 0usize;
-
-        // Iterate in reverse to match memory layout (lowest address = last field inserted)
-        for field in record.fields.iter().rev() {
-            let size = field.field_type.size();
-            fields_schema.push(SchemaField {
-                name: field.name.clone(),
-                field_type: field.field_type,
-                offset,
-            });
-            offset += size;
-        }
-
-        let total_size = offset;
-
-        // Store the schema for the loader
-        self.event_schema = Some(EventSchema {
-            fields: fields_schema,
-            total_size,
-        });
-
-        // The first field's stack offset is the start of our data
-        // Fields are stored contiguously in reverse order on stack
-        // So we need to find the lowest stack offset (most recent allocation)
-        let record_start_offset = record.fields.last()
-            .map(|f| f.stack_offset)
-            .unwrap_or(record.base_offset);
-
-        // Emit the record to perf buffer
-        // bpf_perf_event_output(ctx, map, flags, data, size)
-
-        // R2 = map (will be relocated)
-        let reloc_offset = self.builder.len() * 8;
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R2);
-        self.builder.push(insn1);
-        self.builder.push(insn2);
-        self.relocations.push(MapRelocation {
-            insn_offset: reloc_offset,
-            map_name: PERF_MAP_NAME.to_string(),
-        });
-
-        // R3 = flags (BPF_F_CURRENT_CPU)
-        self.builder.push(EbpfInsn::mov32_imm(EbpfReg::R3, -1));
-
-        // R4 = pointer to record on stack (use the first field's offset as start)
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R4, EbpfReg::R10));
-        self.builder.push(EbpfInsn::add64_imm(EbpfReg::R4, record_start_offset as i32));
-
-        // R5 = total record size
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R5, total_size as i32));
-
-        // R1 = ctx (restore from R9)
-        self.builder.push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R9));
-
-        // Call bpf_perf_event_output
-        self.builder.push(EbpfInsn::call(BpfHelper::PerfEventOutput));
-
-        // Set destination to 0
-        let ebpf_dst = self.alloc_reg(src_dst)?;
-        self.builder.push(EbpfInsn::mov64_imm(ebpf_dst, 0));
 
         Ok(())
     }
@@ -2098,9 +1122,7 @@ mod tests {
                 dst: RegId::new(0),
                 lit: Literal::Int(0),
             },
-            Instruction::Return {
-                src: RegId::new(0),
-            },
+            Instruction::Return { src: RegId::new(0) },
         ]);
 
         let bytecode = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
@@ -2124,9 +1146,7 @@ mod tests {
                 op: Operator::Math(Math::Add),
                 rhs: RegId::new(1),
             },
-            Instruction::Return {
-                src: RegId::new(0),
-            },
+            Instruction::Return { src: RegId::new(0) },
         ]);
 
         let bytecode = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();

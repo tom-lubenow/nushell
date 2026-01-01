@@ -259,7 +259,7 @@ When given a record, all fields are emitted as a single structured event."#
         Signature::build("bpf-emit")
             .input_output_types(vec![
                 (Type::Int, Type::Int),
-                (Type::Any, Type::Any),  // Support records
+                (Type::Any, Type::Any), // Support records
             ])
             .category(Category::Experimental)
     }
@@ -289,7 +289,10 @@ When given a record, all fields are emitted as a single structured event."#
         // At regular runtime, just pass through the value and print it
         // (in eBPF, this would output to the perf buffer)
         let value = input.into_value(call.head)?;
-        eprintln!("[bpf-emit] {}", value.to_expanded_string(", ", &nu_protocol::Config::default()));
+        eprintln!(
+            "[bpf-emit] {}",
+            value.to_expanded_string(", ", &nu_protocol::Config::default())
+        );
         Ok(value.into_pipeline_data())
     }
 }
@@ -471,13 +474,11 @@ impl Command for BpfReadStr {
     }
 
     fn examples(&self) -> Vec<Example<'_>> {
-        vec![
-            Example {
-                example: "bpf-arg 1 | bpf-read-str",
-                description: "Read filename from second argument (e.g., in openat)",
-                result: None,
-            },
-        ]
+        vec![Example {
+            example: "bpf-arg 1 | bpf-read-str",
+            description: "Read filename from second argument (e.g., in openat)",
+            result: None,
+        }]
     }
 
     fn run(
@@ -510,13 +511,11 @@ impl Command for BpfReadUserStr {
     }
 
     fn examples(&self) -> Vec<Example<'_>> {
-        vec![
-            Example {
-                example: "bpf-arg 1 | bpf-read-user-str",
-                description: "Read filename from user-space pointer (e.g., in openat)",
-                result: None,
-            },
-        ]
+        vec![Example {
+            example: "bpf-arg 1 | bpf-read-user-str",
+            description: "Read filename from user-space pointer (e.g., in openat)",
+            result: None,
+        }]
     }
 
     fn run(
@@ -528,7 +527,10 @@ impl Command for BpfReadUserStr {
     ) -> Result<PipelineData, ShellError> {
         // At regular runtime, we can't read user memory
         let ptr = input.into_value(call.head)?;
-        eprintln!("[bpf-read-user-str] Would read string from pointer {:?}", ptr);
+        eprintln!(
+            "[bpf-read-user-str] Would read string from pointer {:?}",
+            ptr
+        );
         Ok(Value::string("<user string>", call.head).into_pipeline_data())
     }
 }
@@ -579,7 +581,10 @@ impl Command for BpfFilterPid {
             // so we just return an error to indicate filtering
             return Err(ShellError::GenericError {
                 error: "Filter not matched".into(),
-                msg: format!("Current PID {} does not match filter {}", current_pid, target_pid),
+                msg: format!(
+                    "Current PID {} does not match filter {}",
+                    current_pid, target_pid
+                ),
                 span: Some(call.head),
                 help: None,
                 inner: vec![],
@@ -607,7 +612,11 @@ impl Command for BpfFilterComm {
 
     fn signature(&self) -> Signature {
         Signature::build("bpf-filter-comm")
-            .required("comm", SyntaxShape::String, "Process name to match (first 8 chars)")
+            .required(
+                "comm",
+                SyntaxShape::String,
+                "Process name to match (first 8 chars)",
+            )
             .input_output_types(vec![(Type::Nothing, Type::Nothing)])
             .category(Category::Experimental)
     }
@@ -644,7 +653,10 @@ impl Command for BpfFilterComm {
         if current_prefix != target_prefix {
             return Err(ShellError::GenericError {
                 error: "Filter not matched".into(),
-                msg: format!("Current comm '{}' does not match filter '{}'", current_comm, target_comm),
+                msg: format!(
+                    "Current comm '{}' does not match filter '{}'",
+                    current_comm, target_comm
+                ),
                 span: Some(call.head),
                 help: None,
                 inner: vec![],
@@ -684,13 +696,11 @@ to compute the elapsed time."#
     }
 
     fn examples(&self) -> Vec<Example<'_>> {
-        vec![
-            Example {
-                example: "bpf-start-timer",
-                description: "Start timer in entry probe",
-                result: None,
-            },
-        ]
+        vec![Example {
+            example: "bpf-start-timer",
+            description: "Start timer in entry probe",
+            result: None,
+        }]
     }
 
     fn run(
@@ -825,7 +835,11 @@ Use 'ebpf histogram' to display the histogram after detaching."#
         // At regular runtime, compute the bucket and log it
         let value = input.into_value(call.head)?;
         if let Ok(v) = value.as_int() {
-            let bucket = if v <= 0 { 0 } else { 64 - (v as u64).leading_zeros() };
+            let bucket = if v <= 0 {
+                0
+            } else {
+                64 - (v as u64).leading_zeros()
+            };
             eprintln!("[bpf-histogram] Value {} -> bucket {}", v, bucket);
         }
         Ok(value.into_pipeline_data())

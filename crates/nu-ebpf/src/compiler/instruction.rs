@@ -333,17 +333,35 @@ impl EbpfInsn {
 
     /// JNE dst, src, offset - Jump if dst != src (unsigned)
     pub const fn jne_reg(dst: EbpfReg, src: EbpfReg, offset: i16) -> Self {
-        Self::new(opcode::BPF_JMP | opcode::BPF_JNE | opcode::BPF_X, dst.as_u8(), src.as_u8(), offset, 0)
+        Self::new(
+            opcode::BPF_JMP | opcode::BPF_JNE | opcode::BPF_X,
+            dst.as_u8(),
+            src.as_u8(),
+            offset,
+            0,
+        )
     }
 
     /// JEQ dst, imm, offset - Jump if dst == imm
     pub const fn jeq_imm(dst: EbpfReg, imm: i32, offset: i16) -> Self {
-        Self::new(opcode::BPF_JMP | opcode::BPF_JEQ | opcode::BPF_K, dst.as_u8(), 0, offset, imm)
+        Self::new(
+            opcode::BPF_JMP | opcode::BPF_JEQ | opcode::BPF_K,
+            dst.as_u8(),
+            0,
+            offset,
+            imm,
+        )
     }
 
     /// JEQ dst, src, offset - Jump if dst == src (register comparison)
     pub const fn jeq_reg(dst: EbpfReg, src: EbpfReg, offset: i16) -> Self {
-        Self::new(opcode::BPF_JMP | opcode::BPF_JEQ | opcode::BPF_X, dst.as_u8(), src.as_u8(), offset, 0)
+        Self::new(
+            opcode::BPF_JMP | opcode::BPF_JEQ | opcode::BPF_X,
+            dst.as_u8(),
+            src.as_u8(),
+            offset,
+            0,
+        )
     }
 
     /// NEG64 dst - Negate register (dst = -dst)

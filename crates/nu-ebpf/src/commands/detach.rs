@@ -46,7 +46,7 @@ fn run_detach(
     stack: &mut Stack,
     call: &Call,
 ) -> Result<PipelineData, ShellError> {
-    use crate::loader::{get_state, LoadError};
+    use crate::loader::{LoadError, get_state};
 
     let id: i64 = call.req(engine_state, stack, 0)?;
     let id = super::validate_probe_id(id, call.head)?;

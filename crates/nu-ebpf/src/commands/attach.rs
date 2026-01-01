@@ -95,32 +95,38 @@ fn run_attach(
     call: &Call,
 ) -> Result<PipelineData, ShellError> {
     use crate::compiler::{EbpfProgram, IrToEbpfCompiler};
-    use crate::loader::{get_state, parse_probe_spec, LoadError};
+    use crate::loader::{LoadError, get_state, parse_probe_spec};
 
     let probe_spec: String = call.req(engine_state, stack, 0)?;
     let closure: Closure = call.req(engine_state, stack, 1)?;
     let dry_run = call.has_flag(engine_state, stack, "dry-run")?;
 
     // Parse the probe specification
-    let (prog_type, target) = parse_probe_spec(&probe_spec).map_err(|e| ShellError::GenericError {
-        error: "Invalid probe specification".into(),
-        msg: e.to_string(),
-        span: Some(call.head),
-        help: Some("Use format like 'kprobe:sys_clone' or 'tracepoint:syscalls/sys_enter_read'".into()),
-        inner: vec![],
-    })?;
+    let (prog_type, target) =
+        parse_probe_spec(&probe_spec).map_err(|e| ShellError::GenericError {
+            error: "Invalid probe specification".into(),
+            msg: e.to_string(),
+            span: Some(call.head),
+            help: Some(
+                "Use format like 'kprobe:sys_clone' or 'tracepoint:syscalls/sys_enter_read'".into(),
+            ),
+            inner: vec![],
+        })?;
 
     // Get the block for this closure
     let block = engine_state.get_block(closure.block_id);
 
     // Compile the closure's IR to eBPF
-    let ir_block = block.ir_block.as_ref().ok_or_else(|| ShellError::GenericError {
-        error: "No IR available for closure".into(),
-        msg: "The closure could not be compiled to IR".into(),
-        span: Some(call.head),
-        help: Some("Ensure the closure is a simple expression that can be compiled".into()),
-        inner: vec![],
-    })?;
+    let ir_block = block
+        .ir_block
+        .as_ref()
+        .ok_or_else(|| ShellError::GenericError {
+            error: "No IR available for closure".into(),
+            msg: "The closure could not be compiled to IR".into(),
+            span: Some(call.head),
+            help: Some("Ensure the closure is a simple expression that can be compiled".into()),
+            inner: vec![],
+        })?;
 
     let compile_result = IrToEbpfCompiler::compile_full(ir_block, engine_state).map_err(|e| {
         ShellError::GenericError {

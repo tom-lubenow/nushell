@@ -81,13 +81,15 @@ fn run_histogram(
     let span = call.head;
 
     let state = get_state();
-    let entries = state.get_histogram(id).map_err(|e| ShellError::GenericError {
-        error: "Failed to get histogram".into(),
-        msg: e.to_string(),
-        span: Some(span),
-        help: None,
-        inner: vec![],
-    })?;
+    let entries = state
+        .get_histogram(id)
+        .map_err(|e| ShellError::GenericError {
+            error: "Failed to get histogram".into(),
+            msg: e.to_string(),
+            span: Some(span),
+            help: None,
+            inner: vec![],
+        })?;
 
     if entries.is_empty() {
         return Ok(Value::list(vec![], span).into_pipeline_data());

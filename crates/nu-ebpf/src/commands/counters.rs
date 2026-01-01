@@ -54,13 +54,15 @@ fn run_counters(
     let span = call.head;
 
     let state = get_state();
-    let entries = state.get_counters(id).map_err(|e| ShellError::GenericError {
-        error: "Failed to get counters".into(),
-        msg: e.to_string(),
-        span: Some(span),
-        help: None,
-        inner: vec![],
-    })?;
+    let entries = state
+        .get_counters(id)
+        .map_err(|e| ShellError::GenericError {
+            error: "Failed to get counters".into(),
+            msg: e.to_string(),
+            span: Some(span),
+            help: None,
+            inner: vec![],
+        })?;
 
     // Convert entries to a table
     let records: Vec<Value> = entries

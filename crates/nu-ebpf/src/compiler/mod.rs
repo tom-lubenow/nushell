@@ -2,13 +2,18 @@
 //!
 //! This module handles compilation from Nushell IR to eBPF bytecode.
 
-pub mod instruction;
 mod btf;
 mod elf;
+mod helpers;
+pub mod instruction;
 mod ir_to_ebpf;
+mod register_alloc;
 
-pub use instruction::{EbpfInsn, EbpfReg, BpfHelper};
-pub use elf::{BpfFieldType, BpfMapDef, EbpfMap, EbpfProgram, EbpfProgramType, EventSchema, MapRelocation, SchemaField};
+pub use elf::{
+    BpfFieldType, BpfMapDef, EbpfMap, EbpfProgram, EbpfProgramType, EventSchema, MapRelocation,
+    SchemaField,
+};
+pub use instruction::{BpfHelper, EbpfInsn, EbpfReg};
 pub use ir_to_ebpf::{CompileResult, IrToEbpfCompiler};
 
 use thiserror::Error;

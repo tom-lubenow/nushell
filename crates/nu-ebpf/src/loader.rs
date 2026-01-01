@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aya::Ebpf;
 use aya::maps::{HashMap as AyaHashMap, PerfEventArray};
 use aya::programs::{KProbe, RawTracePoint, TracePoint};
 use aya::util::online_cpus;
-use aya::Ebpf;
 use bytes::BytesMut;
 use thiserror::Error;
 
@@ -186,9 +186,9 @@ impl EbpfState {
         // Attach based on program type
         match program.prog_type {
             EbpfProgramType::Kprobe => {
-                let kprobe: &mut KProbe = prog.try_into().map_err(|e| {
-                    LoadError::Load(format!("Failed to convert to KProbe: {e}"))
-                })?;
+                let kprobe: &mut KProbe = prog
+                    .try_into()
+                    .map_err(|e| LoadError::Load(format!("Failed to convert to KProbe: {e}")))?;
                 kprobe
                     .load()
                     .map_err(|e| LoadError::Load(format!("Failed to load kprobe: {e}")))?;
@@ -198,9 +198,9 @@ impl EbpfState {
             }
             EbpfProgramType::Kretprobe => {
                 // Kretprobe uses the same KProbe type - Aya detects it from the section name
-                let kretprobe: &mut KProbe = prog.try_into().map_err(|e| {
-                    LoadError::Load(format!("Failed to convert to KRetProbe: {e}"))
-                })?;
+                let kretprobe: &mut KProbe = prog
+                    .try_into()
+                    .map_err(|e| LoadError::Load(format!("Failed to convert to KRetProbe: {e}")))?;
                 kretprobe
                     .load()
                     .map_err(|e| LoadError::Load(format!("Failed to load kretprobe: {e}")))?;
@@ -237,9 +237,9 @@ impl EbpfState {
                 raw_tp
                     .load()
                     .map_err(|e| LoadError::Load(format!("Failed to load raw_tracepoint: {e}")))?;
-                raw_tp
-                    .attach(&program.target)
-                    .map_err(|e| LoadError::Attach(format!("Failed to attach raw_tracepoint: {e}")))?;
+                raw_tp.attach(&program.target).map_err(|e| {
+                    LoadError::Attach(format!("Failed to attach raw_tracepoint: {e}"))
+                })?;
             }
         }
 
@@ -266,7 +266,9 @@ impl EbpfState {
                 let buf = perf_array
                     .open(cpu_id, Some(64)) // 64 pages per buffer
                     .map_err(|e| {
-                        LoadError::PerfBuffer(format!("Failed to open buffer for CPU {cpu_id}: {e}"))
+                        LoadError::PerfBuffer(format!(
+                            "Failed to open buffer for CPU {cpu_id}: {e}"
+                        ))
                     })?;
                 perf_buffers.push(CpuPerfBuffer { cpu_id, buf });
             }
@@ -299,9 +301,7 @@ impl EbpfState {
     /// The timeout specifies how long to wait for events.
     pub fn poll_events(&self, id: u32, _timeout: Duration) -> Result<Vec<BpfEvent>, LoadError> {
         let mut probes = self.probes.lock().unwrap();
-        let probe = probes
-            .get_mut(&id)
-            .ok_or(LoadError::ProbeNotFound(id))?;
+        let probe = probes.get_mut(&id).ok_or(LoadError::ProbeNotFound(id))?;
 
         if !probe.has_perf_map || probe.perf_buffers.is_empty() {
             // No perf map, return empty
@@ -329,7 +329,10 @@ impl EbpfState {
                     };
 
                     if let Some(data) = data {
-                        events.push(BpfEvent { data, cpu: cpu_buf.cpu_id });
+                        events.push(BpfEvent {
+                            data,
+                            cpu: cpu_buf.cpu_id,
+                        });
                     }
                 }
             }
@@ -389,14 +392,20 @@ impl EbpfState {
                 BpfFieldType::Comm => {
                     // 16-byte comm string
                     let max_len = field_buf.len().min(16);
-                    let null_pos = field_buf[..max_len].iter().position(|&b| b == 0).unwrap_or(max_len);
+                    let null_pos = field_buf[..max_len]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(max_len);
                     let s = String::from_utf8_lossy(&field_buf[..null_pos]).to_string();
                     BpfFieldValue::String(s)
                 }
                 BpfFieldType::String => {
                     // 128-byte string
                     let max_len = field_buf.len().min(128);
-                    let null_pos = field_buf[..max_len].iter().position(|&b| b == 0).unwrap_or(max_len);
+                    let null_pos = field_buf[..max_len]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(max_len);
                     let s = String::from_utf8_lossy(&field_buf[..null_pos]).to_string();
                     BpfFieldValue::String(s)
                 }
@@ -415,9 +424,7 @@ impl EbpfState {
         map_name: &str,
     ) -> Result<Vec<(i64, i64)>, LoadError> {
         let mut probes = self.probes.lock().unwrap();
-        let probe = probes
-            .get_mut(&id)
-            .ok_or(LoadError::ProbeNotFound(id))?;
+        let probe = probes.get_mut(&id).ok_or(LoadError::ProbeNotFound(id))?;
 
         if !has_map(probe) {
             return Ok(Vec::new());
@@ -426,8 +433,9 @@ impl EbpfState {
         let mut entries = Vec::new();
 
         if let Some(map) = probe.ebpf.map_mut(map_name) {
-            let hash_map: AyaHashMap<_, i64, i64> = AyaHashMap::try_from(map)
-                .map_err(|e| LoadError::MapNotFound(format!("Failed to convert {map_name} map: {e}")))?;
+            let hash_map: AyaHashMap<_, i64, i64> = AyaHashMap::try_from(map).map_err(|e| {
+                LoadError::MapNotFound(format!("Failed to convert {map_name} map: {e}"))
+            })?;
 
             for item in hash_map.iter() {
                 if let Ok((key, value)) = item {
@@ -527,7 +535,7 @@ pub fn parse_probe_spec(spec: &str) -> Result<(EbpfProgramType, String), LoadErr
         other => {
             return Err(LoadError::Load(format!(
                 "Unknown probe type: {other}. Supported: kprobe, kretprobe, tracepoint, raw_tracepoint"
-            )))
+            )));
         }
     };
 

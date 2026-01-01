@@ -12,9 +12,9 @@ use object::{
     SymbolFlags, SymbolKind, SymbolScope,
 };
 
+use super::CompileError;
 use super::btf::BtfBuilder;
 use super::instruction::EbpfBuilder;
-use super::CompileError;
 
 /// BPF map types (subset of types we might use)
 #[derive(Debug, Clone, Copy)]
@@ -43,8 +43,8 @@ impl BpfMapDef {
     pub fn perf_event_array() -> Self {
         Self {
             map_type: BpfMapType::PerfEventArray as u32,
-            key_size: 4,   // sizeof(u32) - CPU index
-            value_size: 4, // sizeof(u32) - perf event fd
+            key_size: 4,    // sizeof(u32) - CPU index
+            value_size: 4,  // sizeof(u32) - perf event fd
             max_entries: 0, // Will be set to num_cpus by loader
             map_flags: 0,
         }
@@ -54,8 +54,8 @@ impl BpfMapDef {
     pub fn counter_hash() -> Self {
         Self {
             map_type: BpfMapType::Hash as u32,
-            key_size: 8,       // sizeof(i64) - the key to count
-            value_size: 8,     // sizeof(i64) - the count
+            key_size: 8,        // sizeof(i64) - the key to count
+            value_size: 8,      // sizeof(i64) - the count
             max_entries: 10240, // Maximum number of unique keys
             map_flags: 0,
         }
@@ -76,8 +76,8 @@ impl BpfMapDef {
     pub fn histogram_hash() -> Self {
         Self {
             map_type: BpfMapType::Hash as u32,
-            key_size: 8,   // sizeof(i64) - bucket index (log2 of value)
-            value_size: 8, // sizeof(i64) - count
+            key_size: 8,     // sizeof(i64) - bucket index (log2 of value)
+            value_size: 8,   // sizeof(i64) - count
             max_entries: 64, // 64 buckets covers 0 to 2^63
             map_flags: 0,
         }
@@ -293,11 +293,7 @@ impl EbpfProgram {
 
         // Add maps section if we have any maps (using BTF-defined format)
         if !self.maps.is_empty() {
-            let maps_section_id = obj.add_section(
-                vec![],
-                b".maps".to_vec(),
-                SectionKind::Data,
-            );
+            let maps_section_id = obj.add_section(vec![], b".maps".to_vec(), SectionKind::Data);
 
             let maps_section = obj.section_mut(maps_section_id);
             maps_section.flags = SectionFlags::Elf {
@@ -318,7 +314,7 @@ impl EbpfProgram {
                     value: map_offset,
                     size: btf_map_size,
                     kind: SymbolKind::Data,
-                    scope: SymbolScope::Linkage,  // GLOBAL binding
+                    scope: SymbolScope::Linkage, // GLOBAL binding
                     weak: false,
                     section: SymbolSection::Section(maps_section_id),
                     flags: SymbolFlags::Elf {
@@ -331,11 +327,7 @@ impl EbpfProgram {
 
             // Generate BTF for BTF-defined maps
             let btf_data = self.generate_btf();
-            let btf_section_id = obj.add_section(
-                vec![],
-                b".BTF".to_vec(),
-                SectionKind::Metadata,
-            );
+            let btf_section_id = obj.add_section(vec![], b".BTF".to_vec(), SectionKind::Metadata);
             obj.append_section_data(btf_section_id, &btf_data, 1);
         }
 
@@ -362,7 +354,7 @@ impl EbpfProgram {
             value: offset,
             size: self.bytecode.len() as u64,
             kind: SymbolKind::Text,
-            scope: SymbolScope::Linkage,  // GLOBAL binding
+            scope: SymbolScope::Linkage, // GLOBAL binding
             weak: false,
             section: SymbolSection::Section(section_id),
             flags: SymbolFlags::Elf {
@@ -385,16 +377,13 @@ impl EbpfProgram {
                             r_type: 1, // R_BPF_64_64
                         },
                     },
-                ).map_err(|e| CompileError::ElfError(e.to_string()))?;
+                )
+                .map_err(|e| CompileError::ElfError(e.to_string()))?;
             }
         }
 
         // Add the license section
-        let license_section_id = obj.add_section(
-            vec![],
-            b"license".to_vec(),
-            SectionKind::Data,
-        );
+        let license_section_id = obj.add_section(vec![], b"license".to_vec(), SectionKind::Data);
 
         // License must be null-terminated
         let mut license_data = self.license.as_bytes().to_vec();

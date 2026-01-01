@@ -407,30 +407,31 @@ impl EbpfState {
         Some(BpfEventData::Record(fields))
     }
 
-    /// Read all counter entries from a probe's counter map
-    ///
-    /// Returns all key-value pairs from the bpf-count hash map.
-    pub fn get_counters(&self, id: u32) -> Result<Vec<CounterEntry>, LoadError> {
+    /// Helper to read all entries from an i64->i64 hash map
+    fn read_i64_hash_map(
+        &self,
+        id: u32,
+        has_map: impl Fn(&ActiveProbe) -> bool,
+        map_name: &str,
+    ) -> Result<Vec<(i64, i64)>, LoadError> {
         let mut probes = self.probes.lock().unwrap();
         let probe = probes
             .get_mut(&id)
             .ok_or(LoadError::ProbeNotFound(id))?;
 
-        if !probe.has_counter_map {
+        if !has_map(probe) {
             return Ok(Vec::new());
         }
 
         let mut entries = Vec::new();
 
-        // Get the counter map
-        if let Some(map) = probe.ebpf.map_mut("counters") {
-            let counter_map: AyaHashMap<_, i64, i64> = AyaHashMap::try_from(map)
-                .map_err(|e| LoadError::MapNotFound(format!("Failed to convert counters map: {e}")))?;
+        if let Some(map) = probe.ebpf.map_mut(map_name) {
+            let hash_map: AyaHashMap<_, i64, i64> = AyaHashMap::try_from(map)
+                .map_err(|e| LoadError::MapNotFound(format!("Failed to convert {map_name} map: {e}")))?;
 
-            // Iterate over all entries
-            for item in counter_map.iter() {
-                if let Ok((key, count)) = item {
-                    entries.push(CounterEntry { key, count });
+            for item in hash_map.iter() {
+                if let Ok((key, value)) = item {
+                    entries.push((key, value));
                 }
             }
         }
@@ -438,34 +439,27 @@ impl EbpfState {
         Ok(entries)
     }
 
+    /// Read all counter entries from a probe's counter map
+    ///
+    /// Returns all key-value pairs from the bpf-count hash map.
+    pub fn get_counters(&self, id: u32) -> Result<Vec<CounterEntry>, LoadError> {
+        let entries = self.read_i64_hash_map(id, |p| p.has_counter_map, "counters")?;
+        Ok(entries
+            .into_iter()
+            .map(|(key, count)| CounterEntry { key, count })
+            .collect())
+    }
+
     /// Read all histogram entries from a probe's histogram map
     ///
     /// Returns all bucket-count pairs from the bpf-histogram hash map,
     /// sorted by bucket number.
     pub fn get_histogram(&self, id: u32) -> Result<Vec<HistogramEntry>, LoadError> {
-        let mut probes = self.probes.lock().unwrap();
-        let probe = probes
-            .get_mut(&id)
-            .ok_or(LoadError::ProbeNotFound(id))?;
-
-        if !probe.has_histogram_map {
-            return Ok(Vec::new());
-        }
-
-        let mut entries = Vec::new();
-
-        // Get the histogram map
-        if let Some(map) = probe.ebpf.map_mut("histogram") {
-            let histogram_map: AyaHashMap<_, i64, i64> = AyaHashMap::try_from(map)
-                .map_err(|e| LoadError::MapNotFound(format!("Failed to convert histogram map: {e}")))?;
-
-            // Iterate over all entries
-            for item in histogram_map.iter() {
-                if let Ok((bucket, count)) = item {
-                    entries.push(HistogramEntry { bucket, count });
-                }
-            }
-        }
+        let mut entries: Vec<HistogramEntry> = self
+            .read_i64_hash_map(id, |p| p.has_histogram_map, "histogram")?
+            .into_iter()
+            .map(|(bucket, count)| HistogramEntry { bucket, count })
+            .collect();
 
         // Sort by bucket for display
         entries.sort_by_key(|e| e.bucket);

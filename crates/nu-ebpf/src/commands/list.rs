@@ -30,31 +30,21 @@ impl Command for EbpfList {
 
     fn run(
         &self,
-        _engine_state: &EngineState,
-        _stack: &mut Stack,
+        engine_state: &EngineState,
+        stack: &mut Stack,
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            return Err(ShellError::GenericError {
-                error: "eBPF is only supported on Linux".into(),
-                msg: "This command requires a Linux system with eBPF support".into(),
-                span: Some(call.head),
-                help: None,
-                inner: vec![],
-            });
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            run_list(call)
-        }
+        super::run_on_linux!(engine_state, stack, call, run_list)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn run_list(call: &Call) -> Result<PipelineData, ShellError> {
+fn run_list(
+    _engine_state: &EngineState,
+    _stack: &mut Stack,
+    call: &Call,
+) -> Result<PipelineData, ShellError> {
     use crate::loader::get_state;
 
     let state = get_state();

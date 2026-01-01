@@ -14,6 +14,38 @@ mod trace;
 
 use nu_protocol::{ShellError, Span};
 
+/// Create the "eBPF not supported" error for non-Linux platforms
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn linux_only_error(span: Span) -> ShellError {
+    ShellError::GenericError {
+        error: "eBPF is only supported on Linux".into(),
+        msg: "This command requires a Linux system with eBPF support".into(),
+        span: Some(span),
+        help: None,
+        inner: vec![],
+    }
+}
+
+/// Macro to handle platform-specific command dispatch
+///
+/// On Linux, calls the provided function. On other platforms, returns an error.
+macro_rules! run_on_linux {
+    ($engine_state:expr, $stack:expr, $call:expr, $func:expr) => {{
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = ($engine_state, $stack);
+            return Err(crate::commands::linux_only_error($call.head));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            $func($engine_state, $stack, $call)
+        }
+    }};
+}
+
+pub(crate) use run_on_linux;
+
 /// Validate and convert a probe ID from i64 to u32
 ///
 /// Returns an error if the ID is negative or exceeds u32::MAX

@@ -37,22 +37,7 @@ impl Command for EbpfCounters {
         call: &Call,
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (engine_state, stack, call);
-            return Err(ShellError::GenericError {
-                error: "eBPF is only supported on Linux".into(),
-                msg: "This command requires a Linux system with eBPF support".into(),
-                span: Some(call.head),
-                help: None,
-                inner: vec![],
-            });
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            run_counters(engine_state, stack, call)
-        }
+        super::run_on_linux!(engine_state, stack, call, run_counters)
     }
 }
 

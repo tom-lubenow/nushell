@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use aya::Ebpf;
 use aya::maps::{HashMap as AyaHashMap, PerfEventArray};
-use aya::programs::{KProbe, RawTracePoint, TracePoint};
+use aya::programs::{KProbe, RawTracePoint, TracePoint, UProbe};
 use aya::util::online_cpus;
 use bytes::BytesMut;
 use thiserror::Error;
@@ -43,6 +43,94 @@ pub enum LoadError {
 
     #[error("Perf buffer error: {0}")]
     PerfBuffer(String),
+}
+
+/// Parsed uprobe/uretprobe target information
+#[derive(Debug, Clone)]
+pub struct UprobeTarget {
+    /// Path to the binary or library
+    pub binary_path: String,
+    /// Function name (None if using offset-only)
+    pub function_name: Option<String>,
+    /// Offset within the function or binary (0 if attaching to function entry)
+    pub offset: u64,
+    /// Optional PID to filter (None means all processes)
+    pub pid: Option<i32>,
+}
+
+impl UprobeTarget {
+    /// Parse a uprobe target string
+    ///
+    /// Formats supported:
+    /// - `/path/to/binary:function_name` - attach to function entry
+    /// - `/path/to/binary:0x1234` - attach to offset (hex)
+    /// - `/path/to/binary:function_name+0x10` - attach to function + offset
+    /// - Any of the above with `@PID` suffix for PID filtering
+    pub fn parse(target: &str) -> Result<Self, LoadError> {
+        // Check for PID suffix (@1234)
+        let (target_part, pid) = if let Some(at_idx) = target.rfind('@') {
+            let pid_str = &target[at_idx + 1..];
+            match pid_str.parse::<i32>() {
+                Ok(pid) => (&target[..at_idx], Some(pid)),
+                Err(_) => (target, None), // Not a valid PID, treat @ as part of target
+            }
+        } else {
+            (target, None)
+        };
+
+        // Find the last colon that separates path from function/offset
+        // We need to find the colon that's not part of the path
+        // Path can't contain colon on Unix, so the last colon is our separator
+        let colon_idx = target_part.rfind(':').ok_or_else(|| {
+            LoadError::Load(format!(
+                "Invalid uprobe target: {target}. Expected format: /path/to/binary:function_name"
+            ))
+        })?;
+
+        let binary_path = target_part[..colon_idx].to_string();
+        let func_or_offset = &target_part[colon_idx + 1..];
+
+        if binary_path.is_empty() {
+            return Err(LoadError::Load(
+                "Uprobe binary path cannot be empty".to_string(),
+            ));
+        }
+
+        // Parse function name and/or offset
+        // Format: function_name, 0x1234, or function_name+0x10
+        let (function_name, offset) = if let Some(plus_idx) = func_or_offset.find('+') {
+            // function_name+offset
+            let name = &func_or_offset[..plus_idx];
+            let offset_str = &func_or_offset[plus_idx + 1..];
+            let offset = parse_offset(offset_str)?;
+            (Some(name.to_string()), offset)
+        } else if func_or_offset.starts_with("0x") || func_or_offset.starts_with("0X") {
+            // Pure offset
+            let offset = parse_offset(func_or_offset)?;
+            (None, offset)
+        } else {
+            // Pure function name
+            (Some(func_or_offset.to_string()), 0)
+        };
+
+        Ok(UprobeTarget {
+            binary_path,
+            function_name,
+            offset,
+            pid,
+        })
+    }
+}
+
+/// Parse a hex or decimal offset string
+fn parse_offset(s: &str) -> Result<u64, LoadError> {
+    if s.starts_with("0x") || s.starts_with("0X") {
+        u64::from_str_radix(&s[2..], 16)
+            .map_err(|_| LoadError::Load(format!("Invalid hex offset: {s}")))
+    } else {
+        s.parse::<u64>()
+            .map_err(|_| LoadError::Load(format!("Invalid offset: {s}")))
+    }
 }
 
 /// A perf buffer for one CPU
@@ -240,6 +328,42 @@ impl EbpfState {
                 raw_tp.attach(&program.target).map_err(|e| {
                     LoadError::Attach(format!("Failed to attach raw_tracepoint: {e}"))
                 })?;
+            }
+            EbpfProgramType::Uprobe => {
+                // Uprobe target format: /path/to/binary:function_name or /path/to/binary:0x1234
+                let target = UprobeTarget::parse(&program.target)?;
+                let uprobe: &mut UProbe = prog
+                    .try_into()
+                    .map_err(|e| LoadError::Load(format!("Failed to convert to UProbe: {e}")))?;
+                uprobe
+                    .load()
+                    .map_err(|e| LoadError::Load(format!("Failed to load uprobe: {e}")))?;
+                uprobe
+                    .attach(
+                        target.function_name.as_deref(),
+                        target.offset,
+                        &target.binary_path,
+                        target.pid,
+                    )
+                    .map_err(|e| LoadError::Attach(format!("Failed to attach uprobe: {e}")))?;
+            }
+            EbpfProgramType::Uretprobe => {
+                // Uretprobe uses the same UProbe type - Aya detects it from the section name
+                let target = UprobeTarget::parse(&program.target)?;
+                let uretprobe: &mut UProbe = prog
+                    .try_into()
+                    .map_err(|e| LoadError::Load(format!("Failed to convert to URetProbe: {e}")))?;
+                uretprobe
+                    .load()
+                    .map_err(|e| LoadError::Load(format!("Failed to load uretprobe: {e}")))?;
+                uretprobe
+                    .attach(
+                        target.function_name.as_deref(),
+                        target.offset,
+                        &target.binary_path,
+                        target.pid,
+                    )
+                    .map_err(|e| LoadError::Attach(format!("Failed to attach uretprobe: {e}")))?;
             }
         }
 
@@ -519,7 +643,30 @@ pub fn get_state() -> Arc<EbpfState> {
 }
 
 /// Parse a probe specification like "kprobe:sys_clone" or "tracepoint:syscalls/sys_enter_read"
+///
+/// Supported formats:
+/// - `kprobe:function_name`
+/// - `kretprobe:function_name`
+/// - `tracepoint:category/name`
+/// - `raw_tracepoint:name` or `raw_tp:name`
+/// - `uprobe:/path/to/binary:function_name`
+/// - `uretprobe:/path/to/binary:function_name`
+/// - `uprobe:/path/to/binary:0x1234` (offset-based)
+/// - `uprobe:/path/to/binary:function@PID` (PID-filtered)
 pub fn parse_probe_spec(spec: &str) -> Result<(EbpfProgramType, String), LoadError> {
+    // Handle uprobe/uretprobe specially since their targets contain colons
+    if let Some(target) = spec.strip_prefix("uprobe:") {
+        // Validate the uprobe target format
+        UprobeTarget::parse(target)?;
+        return Ok((EbpfProgramType::Uprobe, target.to_string()));
+    }
+    if let Some(target) = spec.strip_prefix("uretprobe:") {
+        // Validate the uprobe target format
+        UprobeTarget::parse(target)?;
+        return Ok((EbpfProgramType::Uretprobe, target.to_string()));
+    }
+
+    // For other probe types, use simple colon split
     let parts: Vec<&str> = spec.splitn(2, ':').collect();
     if parts.len() != 2 {
         return Err(LoadError::Load(format!(
@@ -534,10 +681,93 @@ pub fn parse_probe_spec(spec: &str) -> Result<(EbpfProgramType, String), LoadErr
         "raw_tracepoint" | "raw_tp" => EbpfProgramType::RawTracepoint,
         other => {
             return Err(LoadError::Load(format!(
-                "Unknown probe type: {other}. Supported: kprobe, kretprobe, tracepoint, raw_tracepoint"
+                "Unknown probe type: {other}. Supported: kprobe, kretprobe, tracepoint, raw_tracepoint, uprobe, uretprobe"
             )));
         }
     };
 
     Ok((prog_type, parts[1].to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_uprobe_target_basic() {
+        let target = UprobeTarget::parse("/usr/bin/python:Py_Initialize").unwrap();
+        assert_eq!(target.binary_path, "/usr/bin/python");
+        assert_eq!(target.function_name, Some("Py_Initialize".to_string()));
+        assert_eq!(target.offset, 0);
+        assert_eq!(target.pid, None);
+    }
+
+    #[test]
+    fn test_uprobe_target_offset_hex() {
+        let target = UprobeTarget::parse("/lib/libc.so.6:0x12345").unwrap();
+        assert_eq!(target.binary_path, "/lib/libc.so.6");
+        assert_eq!(target.function_name, None);
+        assert_eq!(target.offset, 0x12345);
+        assert_eq!(target.pid, None);
+    }
+
+    #[test]
+    fn test_uprobe_target_function_plus_offset() {
+        let target = UprobeTarget::parse("/usr/bin/app:main+0x10").unwrap();
+        assert_eq!(target.binary_path, "/usr/bin/app");
+        assert_eq!(target.function_name, Some("main".to_string()));
+        assert_eq!(target.offset, 0x10);
+        assert_eq!(target.pid, None);
+    }
+
+    #[test]
+    fn test_uprobe_target_with_pid() {
+        let target = UprobeTarget::parse("/usr/bin/python:Py_Initialize@1234").unwrap();
+        assert_eq!(target.binary_path, "/usr/bin/python");
+        assert_eq!(target.function_name, Some("Py_Initialize".to_string()));
+        assert_eq!(target.offset, 0);
+        assert_eq!(target.pid, Some(1234));
+    }
+
+    #[test]
+    fn test_uprobe_target_offset_with_pid() {
+        let target = UprobeTarget::parse("/lib/libc.so.6:malloc+0x20@5678").unwrap();
+        assert_eq!(target.binary_path, "/lib/libc.so.6");
+        assert_eq!(target.function_name, Some("malloc".to_string()));
+        assert_eq!(target.offset, 0x20);
+        assert_eq!(target.pid, Some(5678));
+    }
+
+    #[test]
+    fn test_uprobe_target_invalid_no_colon() {
+        let result = UprobeTarget::parse("/usr/bin/python");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_uprobe_target_invalid_empty_path() {
+        let result = UprobeTarget::parse(":function");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_probe_spec_uprobe() {
+        let (prog_type, target) = parse_probe_spec("uprobe:/usr/bin/app:main").unwrap();
+        assert!(matches!(prog_type, EbpfProgramType::Uprobe));
+        assert_eq!(target, "/usr/bin/app:main");
+    }
+
+    #[test]
+    fn test_parse_probe_spec_uretprobe() {
+        let (prog_type, target) = parse_probe_spec("uretprobe:/lib/libc.so.6:malloc").unwrap();
+        assert!(matches!(prog_type, EbpfProgramType::Uretprobe));
+        assert_eq!(target, "/lib/libc.so.6:malloc");
+    }
+
+    #[test]
+    fn test_parse_probe_spec_kprobe_unchanged() {
+        let (prog_type, target) = parse_probe_spec("kprobe:sys_clone").unwrap();
+        assert!(matches!(prog_type, EbpfProgramType::Kprobe));
+        assert_eq!(target, "sys_clone");
+    }
 }

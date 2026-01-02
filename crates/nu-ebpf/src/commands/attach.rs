@@ -12,22 +12,29 @@ impl Command for EbpfAttach {
     }
 
     fn description(&self) -> &str {
-        "Attach an eBPF probe to a kernel function or tracepoint."
+        "Attach an eBPF probe to a kernel function, tracepoint, or userspace function."
     }
 
     fn extra_description(&self) -> &str {
         r#"This command compiles a Nushell closure to eBPF bytecode and attaches
-it to the specified kernel probe point. The closure runs in the kernel
-whenever the probe point is hit.
+it to the specified probe point. The closure runs in the kernel whenever
+the probe point is hit.
 
 The closure can use special BPF commands like bpf-pid, bpf-emit, bpf-count,
 bpf-comm, bpf-filter-pid, bpf-filter-comm, bpf-start-timer, bpf-stop-timer,
 and bpf-histogram. See the individual command help for details.
 
-Probe specification format:
-  kprobe:function_name     - Attach to function entry
-  kretprobe:function_name  - Attach to function return
-  tracepoint:category/name - Attach to a tracepoint
+Kernel probe formats:
+  kprobe:function_name      - Attach to kernel function entry
+  kretprobe:function_name   - Attach to kernel function return
+  tracepoint:category/name  - Attach to a tracepoint
+
+Userspace probe formats:
+  uprobe:/path/to/bin:func  - Attach to userspace function entry
+  uretprobe:/path/to/bin:fn - Attach to userspace function return
+  uprobe:/path:0x1234       - Attach to offset in binary
+  uprobe:/path:func+0x10    - Attach to function + offset
+  uprobe:/path:func@1234    - Attach only to process with PID 1234
 
 Requirements:
   - Linux kernel 4.18+
@@ -59,7 +66,7 @@ Requirements:
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["bpf", "kernel", "trace", "probe", "kprobe", "tracepoint"]
+        vec!["bpf", "kernel", "trace", "probe", "kprobe", "tracepoint", "uprobe", "uretprobe", "userspace"]
     }
 
     fn examples(&self) -> Vec<Example<'_>> {
@@ -72,6 +79,16 @@ Requirements:
             Example {
                 example: "let id = ebpf attach 'kprobe:sys_read' {|| 0 }; ebpf detach $id",
                 description: "Attach and then detach a probe",
+                result: None,
+            },
+            Example {
+                example: "ebpf attach 'uprobe:/usr/bin/python3:Py_Initialize' {|| bpf-pid | bpf-emit }",
+                description: "Trace Python interpreter initialization",
+                result: None,
+            },
+            Example {
+                example: "ebpf attach 'uretprobe:/lib/x86_64-linux-gnu/libc.so.6:malloc' {|| bpf-pid | bpf-emit }",
+                description: "Trace malloc returns in libc",
                 result: None,
             },
         ]
@@ -108,7 +125,7 @@ fn run_attach(
             msg: e.to_string(),
             span: Some(call.head),
             help: Some(
-                "Use format like 'kprobe:sys_clone' or 'tracepoint:syscalls/sys_enter_read'".into(),
+                "Use format like 'kprobe:sys_clone', 'tracepoint:syscalls/sys_enter_read', or 'uprobe:/path/to/bin:function'".into(),
             ),
             inner: vec![],
         })?;

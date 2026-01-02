@@ -164,6 +164,10 @@ pub enum EbpfProgramType {
     Tracepoint,
     /// Raw tracepoint
     RawTracepoint,
+    /// User-space probe (uprobe)
+    Uprobe,
+    /// User-space return probe (uretprobe)
+    Uretprobe,
 }
 
 impl EbpfProgramType {
@@ -174,6 +178,8 @@ impl EbpfProgramType {
             EbpfProgramType::Kretprobe => "kretprobe",
             EbpfProgramType::Tracepoint => "tracepoint",
             EbpfProgramType::RawTracepoint => "raw_tracepoint",
+            EbpfProgramType::Uprobe => "uprobe",
+            EbpfProgramType::Uretprobe => "uretprobe",
         }
     }
 }

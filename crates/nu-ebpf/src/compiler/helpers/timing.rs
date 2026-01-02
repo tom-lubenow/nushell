@@ -6,10 +6,10 @@
 
 use nu_protocol::RegId;
 
+use crate::compiler::CompileError;
 use crate::compiler::elf::MapRelocation;
 use crate::compiler::instruction::{BpfHelper, EbpfInsn, EbpfReg};
 use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, TIMESTAMP_MAP_NAME};
-use crate::compiler::CompileError;
 
 /// Extension trait for timing helpers
 pub trait TimingHelpers {
@@ -76,7 +76,8 @@ impl TimingHelpers for IrToEbpfCompiler<'_> {
         self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R4, 0));
 
         // Call bpf_map_update_elem
-        self.builder().push(EbpfInsn::call(BpfHelper::MapUpdateElem));
+        self.builder()
+            .push(EbpfInsn::call(BpfHelper::MapUpdateElem));
 
         // Set destination to 0 (void return)
         let ebpf_dst = self.alloc_reg(src_dst)?;
@@ -129,7 +130,8 @@ impl TimingHelpers for IrToEbpfCompiler<'_> {
             .push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
 
         // Call bpf_map_lookup_elem
-        self.builder().push(EbpfInsn::call(BpfHelper::MapLookupElem));
+        self.builder()
+            .push(EbpfInsn::call(BpfHelper::MapLookupElem));
 
         // R0 = pointer to value or NULL
         // If NULL, jump to no_timer path
@@ -177,7 +179,8 @@ impl TimingHelpers for IrToEbpfCompiler<'_> {
             .push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
 
         // Call bpf_map_delete_elem
-        self.builder().push(EbpfInsn::call(BpfHelper::MapDeleteElem));
+        self.builder()
+            .push(EbpfInsn::call(BpfHelper::MapDeleteElem));
 
         // Restore the delta to destination register
         self.builder()

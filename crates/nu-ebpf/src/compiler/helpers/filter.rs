@@ -4,9 +4,9 @@
 //! - bpf-filter-pid
 //! - bpf-filter-comm
 
+use crate::compiler::CompileError;
 use crate::compiler::instruction::{BpfHelper, EbpfInsn, EbpfReg};
 use crate::compiler::ir_to_ebpf::IrToEbpfCompiler;
-use crate::compiler::CompileError;
 
 /// Extension trait for filter helpers
 pub trait FilterHelpers {
@@ -78,7 +78,8 @@ impl FilterHelpers for IrToEbpfCompiler<'_> {
         self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R2, 16));
 
         // Call bpf_get_current_comm
-        self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentComm));
+        self.builder()
+            .push(EbpfInsn::call(BpfHelper::GetCurrentComm));
 
         // Load first 8 bytes from buffer into R0
         self.builder().push(EbpfInsn::ldxdw(

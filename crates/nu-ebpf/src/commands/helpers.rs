@@ -40,10 +40,7 @@ Examples:
 
     fn signature(&self) -> Signature {
         Signature::build("emit")
-            .input_output_types(vec![
-                (Type::Int, Type::Int),
-                (Type::Any, Type::Any),
-            ])
+            .input_output_types(vec![(Type::Int, Type::Int), (Type::Any, Type::Any)])
             .category(Category::Experimental)
     }
 

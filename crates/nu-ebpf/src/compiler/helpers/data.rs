@@ -7,10 +7,10 @@
 
 use nu_protocol::RegId;
 
+use crate::compiler::CompileError;
 use crate::compiler::elf::BpfFieldType;
 use crate::compiler::instruction::{BpfHelper, EbpfInsn, EbpfReg};
-use crate::compiler::ir_to_ebpf::{pt_regs_offsets, IrToEbpfCompiler};
-use crate::compiler::CompileError;
+use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, pt_regs_offsets};
 
 /// Extension trait for data access helpers
 pub trait DataHelpers {
@@ -102,7 +102,8 @@ impl DataHelpers for IrToEbpfCompiler<'_> {
         self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R2, 16));
 
         // Call bpf_get_current_comm
-        self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentComm));
+        self.builder()
+            .push(EbpfInsn::call(BpfHelper::GetCurrentComm));
 
         // Load first 8 bytes from buffer into destination register
         let ebpf_dst = self.alloc_reg(src_dst)?;

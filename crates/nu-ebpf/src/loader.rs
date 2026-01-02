@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aya::{Ebpf, EbpfLoader};
 use aya::maps::{HashMap as AyaHashMap, PerfEventArray};
 use aya::programs::{KProbe, RawTracePoint, TracePoint, UProbe};
 use aya::util::online_cpus;
+use aya::{Ebpf, EbpfLoader};
 use bytes::BytesMut;
 use thiserror::Error;
 
@@ -285,13 +285,14 @@ impl EbpfState {
                 if e.kind() == std::io::ErrorKind::PermissionDenied {
                     LoadError::PermissionDenied
                 } else {
-                    LoadError::Load(format!("Failed to create pin directory {}: {}", pin_path, e))
+                    LoadError::Load(format!(
+                        "Failed to create pin directory {}: {}",
+                        pin_path, e
+                    ))
                 }
             })?;
             // Use EbpfLoader with map pinning to enable map sharing between programs
-            EbpfLoader::new()
-                .map_pin_path(&pin_path)
-                .load(&elf_bytes)
+            EbpfLoader::new().map_pin_path(&pin_path).load(&elf_bytes)
         } else {
             // No pinning - use simple Ebpf::load
             Ebpf::load(&elf_bytes)

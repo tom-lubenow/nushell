@@ -6,10 +6,10 @@
 
 use nu_protocol::RegId;
 
-use crate::compiler::elf::MapRelocation;
-use crate::compiler::instruction::{opcode, BpfHelper, EbpfInsn, EbpfReg};
-use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, COUNTER_MAP_NAME, HISTOGRAM_MAP_NAME};
 use crate::compiler::CompileError;
+use crate::compiler::elf::MapRelocation;
+use crate::compiler::instruction::{BpfHelper, EbpfInsn, EbpfReg, opcode};
+use crate::compiler::ir_to_ebpf::{COUNTER_MAP_NAME, HISTOGRAM_MAP_NAME, IrToEbpfCompiler};
 
 /// Extension trait for aggregation helpers
 pub trait AggregationHelpers {
@@ -61,7 +61,8 @@ impl AggregationHelpers for IrToEbpfCompiler<'_> {
             .push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
 
         // Call bpf_map_lookup_elem
-        self.builder().push(EbpfInsn::call(BpfHelper::MapLookupElem));
+        self.builder()
+            .push(EbpfInsn::call(BpfHelper::MapLookupElem));
 
         // R0 = pointer to value or NULL
         // If NULL, jump to init path
@@ -115,7 +116,8 @@ impl AggregationHelpers for IrToEbpfCompiler<'_> {
         self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R4, 0));
 
         // Call bpf_map_update_elem
-        self.builder().push(EbpfInsn::call(BpfHelper::MapUpdateElem));
+        self.builder()
+            .push(EbpfInsn::call(BpfHelper::MapUpdateElem));
 
         // End: bpf-count passes through the input value unchanged
         self.bind_label(done_label);
@@ -252,7 +254,8 @@ impl AggregationHelpers for IrToEbpfCompiler<'_> {
             .push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
         self.builder()
             .push(EbpfInsn::add64_imm(EbpfReg::R2, key_stack_offset as i32));
-        self.builder().push(EbpfInsn::call(BpfHelper::MapLookupElem));
+        self.builder()
+            .push(EbpfInsn::call(BpfHelper::MapLookupElem));
 
         // If NULL, jump to init_value; otherwise increment in place
         self.emit_jump_if_zero_to_label(EbpfReg::R0, init_value_label);
@@ -292,7 +295,8 @@ impl AggregationHelpers for IrToEbpfCompiler<'_> {
         self.builder()
             .push(EbpfInsn::add64_imm(EbpfReg::R3, value_stack_offset as i32));
         self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R4, 0)); // BPF_ANY
-        self.builder().push(EbpfInsn::call(BpfHelper::MapUpdateElem));
+        self.builder()
+            .push(EbpfInsn::call(BpfHelper::MapUpdateElem));
 
         // done: common exit
         self.bind_label(done_label);

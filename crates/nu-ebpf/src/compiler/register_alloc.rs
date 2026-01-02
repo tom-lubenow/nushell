@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use nu_protocol::{RegId, VarId};
 
-use super::instruction::EbpfReg;
 use super::CompileError;
+use super::instruction::EbpfReg;
 
 /// Where a value is currently stored
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

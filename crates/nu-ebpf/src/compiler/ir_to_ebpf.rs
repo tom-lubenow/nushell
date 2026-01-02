@@ -89,7 +89,6 @@ pub(crate) mod pt_regs_offsets {
     pub const RETVAL_OFFSET: i16 = 0;
 }
 
-
 /// Pending jump that needs to be fixed up (for IR-level branches)
 struct PendingJump {
     /// Index in builder where the jump instruction is
@@ -591,7 +590,10 @@ impl<'a> IrToEbpfCompiler<'a> {
 
     /// Check if a register contains the context variable
     pub(crate) fn is_context_register(&self, reg: RegId) -> bool {
-        self.context_registers.get(&reg.get()).copied().unwrap_or(false)
+        self.context_registers
+            .get(&reg.get())
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Get a slice of the IR block's data buffer
@@ -752,9 +754,11 @@ impl<'a> IrToEbpfCompiler<'a> {
             // Control flow (local methods)
             Instruction::BranchIf { cond, index } => self.compile_branch_if(*cond, *index as usize),
             Instruction::Jump { index } => self.compile_jump(*index as usize),
-            Instruction::Match { pattern, src, index } => {
-                self.compile_match(pattern, *src, *index as usize)
-            }
+            Instruction::Match {
+                pattern,
+                src,
+                index,
+            } => self.compile_match(pattern, *src, *index as usize),
 
             // Command calls (dispatches to helper traits)
             Instruction::Call { decl_id, src_dst } => self.compile_call(*decl_id, *src_dst),
@@ -1080,9 +1084,12 @@ impl<'a> IrToEbpfCompiler<'a> {
         }
 
         // Get the cell path to find the field name
-        let cell_path = self.get_literal_cell_path(path_reg).cloned().ok_or_else(|| {
-            CompileError::UnsupportedInstruction("Cell path literal not found".into())
-        })?;
+        let cell_path = self
+            .get_literal_cell_path(path_reg)
+            .cloned()
+            .ok_or_else(|| {
+                CompileError::UnsupportedInstruction("Cell path literal not found".into())
+            })?;
 
         // We only support single-level field access like $ctx.pid
         if cell_path.members.len() != 1 {
@@ -1111,30 +1118,40 @@ impl<'a> IrToEbpfCompiler<'a> {
             "pid" => {
                 // bpf_get_current_pid_tgid() returns (tgid << 32) | pid
                 // Lower 32 bits = thread ID (what Linux calls PID)
-                self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
+                self.builder()
+                    .push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
                 // Mask to get lower 32 bits
-                self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
-                self.builder().push(EbpfInsn::and64_imm(ebpf_dst, 0x7FFFFFFF));
+                self.builder()
+                    .push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
+                self.builder()
+                    .push(EbpfInsn::and64_imm(ebpf_dst, 0x7FFFFFFF));
                 self.set_register_type(src_dst, BpfFieldType::Int);
             }
             "tgid" => {
                 // Upper 32 bits = thread group ID (what userspace calls PID)
-                self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
+                self.builder()
+                    .push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
                 self.builder().push(EbpfInsn::rsh64_imm(EbpfReg::R0, 32));
-                self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
+                self.builder()
+                    .push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
                 self.set_register_type(src_dst, BpfFieldType::Int);
             }
             "uid" => {
                 // bpf_get_current_uid_gid() returns (gid << 32) | uid
-                self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentUidGid));
-                self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
-                self.builder().push(EbpfInsn::and64_imm(ebpf_dst, 0x7FFFFFFF));
+                self.builder()
+                    .push(EbpfInsn::call(BpfHelper::GetCurrentUidGid));
+                self.builder()
+                    .push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
+                self.builder()
+                    .push(EbpfInsn::and64_imm(ebpf_dst, 0x7FFFFFFF));
                 self.set_register_type(src_dst, BpfFieldType::Int);
             }
             "gid" => {
-                self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentUidGid));
+                self.builder()
+                    .push(EbpfInsn::call(BpfHelper::GetCurrentUidGid));
                 self.builder().push(EbpfInsn::rsh64_imm(EbpfReg::R0, 32));
-                self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
+                self.builder()
+                    .push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
                 self.set_register_type(src_dst, BpfFieldType::Int);
             }
             "comm" => {
@@ -1144,19 +1161,24 @@ impl<'a> IrToEbpfCompiler<'a> {
                 self.advance_stack_offset(16);
 
                 // bpf_get_current_comm(buf, size)
-                self.builder().push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
-                self.builder().push(EbpfInsn::add64_imm(EbpfReg::R1, stack_offset as i32));
+                self.builder()
+                    .push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
+                self.builder()
+                    .push(EbpfInsn::add64_imm(EbpfReg::R1, stack_offset as i32));
                 self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R2, 16));
-                self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentComm));
+                self.builder()
+                    .push(EbpfInsn::call(BpfHelper::GetCurrentComm));
 
                 // Load first 8 bytes as i64
-                self.builder().push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R10, stack_offset));
+                self.builder()
+                    .push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R10, stack_offset));
                 self.set_register_type(src_dst, BpfFieldType::Comm);
             }
             "ktime" => {
                 // bpf_ktime_get_ns() returns nanoseconds since boot
                 self.builder().push(EbpfInsn::call(BpfHelper::KtimeGetNs));
-                self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
+                self.builder()
+                    .push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
                 self.set_register_type(src_dst, BpfFieldType::Int);
             }
             // Function arguments (arg0-arg5 for x86_64, arg0-arg7 for aarch64)
@@ -1173,13 +1195,15 @@ impl<'a> IrToEbpfCompiler<'a> {
 
                 let offset = pt_regs_offsets::ARG_OFFSETS[arg_idx];
                 // R9 contains the saved context pointer (pt_regs)
-                self.builder().push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
+                self.builder()
+                    .push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
                 self.set_register_type(src_dst, BpfFieldType::Int);
             }
             "retval" => {
                 // Return value (for kretprobe/uretprobe)
                 let offset = pt_regs_offsets::RETVAL_OFFSET;
-                self.builder().push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
+                self.builder()
+                    .push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
                 self.set_register_type(src_dst, BpfFieldType::Int);
             }
             _ => {

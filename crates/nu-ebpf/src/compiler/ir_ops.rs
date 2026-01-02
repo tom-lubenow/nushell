@@ -11,10 +11,10 @@ use nu_protocol::ast::{Bits, Comparison, Math, Operator};
 use nu_protocol::ir::Literal;
 use nu_protocol::{RegId, VarId};
 
-use crate::compiler::elf::BpfFieldType;
-use crate::compiler::instruction::{opcode, EbpfInsn, EbpfReg};
-use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, RecordBuilder};
 use crate::compiler::CompileError;
+use crate::compiler::elf::BpfFieldType;
+use crate::compiler::instruction::{EbpfInsn, EbpfReg, opcode};
+use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, RecordBuilder};
 
 /// Extension trait for IR operation compilation
 pub trait IrOps {
@@ -70,7 +70,8 @@ impl IrOps for IrToEbpfCompiler<'_> {
             Literal::String(data_slice) => {
                 // Get the string data from the IrBlock's data buffer
                 // We need to copy the data to avoid borrow conflicts
-                let string_bytes = self.get_data_slice(data_slice.start as usize, data_slice.len as usize);
+                let string_bytes =
+                    self.get_data_slice(data_slice.start as usize, data_slice.len as usize);
                 let string_owned: Vec<u8> = string_bytes.to_vec();
 
                 // Track the string value for field names in records

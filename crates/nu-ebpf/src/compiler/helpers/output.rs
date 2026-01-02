@@ -6,17 +6,20 @@
 
 use nu_protocol::RegId;
 
+use crate::compiler::CompileError;
 use crate::compiler::elf::{BpfFieldType, EventSchema, MapRelocation, SchemaField};
 use crate::compiler::instruction::{BpfHelper, EbpfInsn, EbpfReg};
-use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, RecordBuilder, PERF_MAP_NAME};
-use crate::compiler::CompileError;
+use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, PERF_MAP_NAME, RecordBuilder};
 
 /// Extension trait for output helpers
 pub trait OutputHelpers {
     fn compile_bpf_emit(&mut self, src_dst: RegId) -> Result<(), CompileError>;
     fn compile_bpf_emit_comm(&mut self, src_dst: RegId) -> Result<(), CompileError>;
-    fn compile_bpf_read_str(&mut self, src_dst: RegId, user_space: bool)
-        -> Result<(), CompileError>;
+    fn compile_bpf_read_str(
+        &mut self,
+        src_dst: RegId,
+        user_space: bool,
+    ) -> Result<(), CompileError>;
     fn compile_bpf_emit_record(
         &mut self,
         src_dst: RegId,
@@ -118,7 +121,8 @@ impl OutputHelpers for IrToEbpfCompiler<'_> {
         // R2 = size (16 = TASK_COMM_LEN)
         self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R2, 16));
         // Call bpf_get_current_comm
-        self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentComm));
+        self.builder()
+            .push(EbpfInsn::call(BpfHelper::GetCurrentComm));
 
         // Now emit the 16-byte comm to perf buffer
         // bpf_perf_event_output(ctx, map, flags, data, size)
@@ -195,7 +199,8 @@ impl OutputHelpers for IrToEbpfCompiler<'_> {
             .push(EbpfInsn::mov64_imm(EbpfReg::R2, STR_BUF_SIZE as i32));
 
         // R3 = src pointer (from input)
-        self.builder().push(EbpfInsn::mov64_reg(EbpfReg::R3, src_ptr));
+        self.builder()
+            .push(EbpfInsn::mov64_reg(EbpfReg::R3, src_ptr));
 
         // Call appropriate helper based on memory type
         let helper = if user_space {

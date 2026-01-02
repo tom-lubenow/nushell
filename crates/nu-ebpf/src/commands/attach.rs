@@ -2,7 +2,7 @@
 
 use nu_engine::command_prelude::*;
 use nu_protocol::engine::Closure;
-use nu_protocol::{record, Record};
+use nu_protocol::{Record, record};
 
 #[derive(Clone)]
 pub struct EbpfAttach;
@@ -123,7 +123,17 @@ Requirements:
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["bpf", "kernel", "trace", "probe", "kprobe", "tracepoint", "uprobe", "uretprobe", "userspace"]
+        vec![
+            "bpf",
+            "kernel",
+            "trace",
+            "probe",
+            "kprobe",
+            "tracepoint",
+            "uprobe",
+            "uretprobe",
+            "userspace",
+        ]
     }
 
     fn examples(&self) -> Vec<Example<'_>> {
@@ -220,15 +230,14 @@ fn run_attach(
     let compile_result =
         IrToEbpfCompiler::compile_with_captures(ir_block, engine_state, block, &closure.captures)
             .map_err(|e| ShellError::GenericError {
-                error: "eBPF compilation failed".into(),
-                msg: e.to_string(),
-                span: Some(call.head),
-                help: Some(
-                    "Check that the closure uses only supported BPF commands or context fields"
-                        .into(),
-                ),
-                inner: vec![],
-            })?;
+            error: "eBPF compilation failed".into(),
+            msg: e.to_string(),
+            span: Some(call.head),
+            help: Some(
+                "Check that the closure uses only supported BPF commands or context fields".into(),
+            ),
+            inner: vec![],
+        })?;
 
     let mut program = EbpfProgram::with_maps(
         prog_type,
@@ -261,22 +270,24 @@ fn run_attach(
 
     // Load and attach the program
     let state = get_state();
-    let probe_id = state.attach_with_pin(&program, pin_group.as_deref()).map_err(|e| {
-        let (error, help) = match &e {
-            LoadError::PermissionDenied => (
-                "Permission denied".into(),
-                Some("Try running with sudo or grant CAP_BPF capability".into()),
-            ),
-            _ => (e.to_string(), None),
-        };
-        ShellError::GenericError {
-            error: "Failed to attach eBPF probe".into(),
-            msg: error,
-            span: Some(call.head),
-            help,
-            inner: vec![],
-        }
-    })?;
+    let probe_id = state
+        .attach_with_pin(&program, pin_group.as_deref())
+        .map_err(|e| {
+            let (error, help) = match &e {
+                LoadError::PermissionDenied => (
+                    "Permission denied".into(),
+                    Some("Try running with sudo or grant CAP_BPF capability".into()),
+                ),
+                _ => (e.to_string(), None),
+            };
+            ShellError::GenericError {
+                error: "Failed to attach eBPF probe".into(),
+                msg: error,
+                span: Some(call.head),
+                help,
+                inner: vec![],
+            }
+        })?;
 
     if stream {
         // Stream events directly - return a ListStream

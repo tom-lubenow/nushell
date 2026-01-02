@@ -1,8 +1,8 @@
 //! Output BPF helpers
 //!
 //! Helpers for emitting data to userspace:
-//! - bpf-emit, bpf-emit-comm
-//! - bpf-read-str, bpf-read-user-str
+//! - bpf-emit (integers, strings, records)
+//! - bpf-read-str, bpf-read-kernel-str
 
 use nu_protocol::RegId;
 
@@ -14,7 +14,6 @@ use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, PERF_MAP_NAME, RecordBuilder
 /// Extension trait for output helpers
 pub trait OutputHelpers {
     fn compile_bpf_emit(&mut self, src_dst: RegId) -> Result<(), CompileError>;
-    fn compile_bpf_emit_comm(&mut self, src_dst: RegId) -> Result<(), CompileError>;
     fn compile_bpf_read_str(
         &mut self,
         src_dst: RegId,
@@ -95,70 +94,6 @@ impl OutputHelpers for IrToEbpfCompiler<'_> {
 
         // bpf-emit returns the original value for chaining
         // The value is still in ebpf_src register (we only copied it to stack)
-
-        Ok(())
-    }
-
-    /// Compile bpf-emit-comm: emit the full process name (16 bytes) to perf buffer
-    ///
-    /// This combines bpf_get_current_comm + bpf_perf_event_output to emit
-    /// the full TASK_COMM_LEN string, not just 8 bytes.
-    fn compile_bpf_emit_comm(&mut self, src_dst: RegId) -> Result<(), CompileError> {
-        // Allocate the destination register (we'll store 0 as the "return value")
-        let ebpf_dst = self.alloc_reg(src_dst)?;
-        // Mark that we need the perf event map
-        self.set_needs_perf_map(true);
-
-        // Allocate 16 bytes on stack for TASK_COMM_LEN
-        let comm_stack_offset = self.alloc_stack(16)?;
-
-        // Call bpf_get_current_comm(buf, 16)
-        // R1 = pointer to buffer on stack
-        self.builder()
-            .push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
-        self.builder()
-            .push(EbpfInsn::add64_imm(EbpfReg::R1, comm_stack_offset as i32));
-        // R2 = size (16 = TASK_COMM_LEN)
-        self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R2, 16));
-        // Call bpf_get_current_comm
-        self.builder()
-            .push(EbpfInsn::call(BpfHelper::GetCurrentComm));
-
-        // Now emit the 16-byte comm to perf buffer
-        // bpf_perf_event_output(ctx, map, flags, data, size)
-
-        // R2 = map fd (load with relocation)
-        let reloc_offset = self.builder().len() * 8;
-        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R2);
-        self.builder().push(insn1);
-        self.builder().push(insn2);
-        self.add_relocation(MapRelocation {
-            insn_offset: reloc_offset,
-            map_name: PERF_MAP_NAME.to_string(),
-        });
-
-        // R3 = flags (BPF_F_CURRENT_CPU = 0xFFFFFFFF)
-        self.builder().push(EbpfInsn::mov32_imm(EbpfReg::R3, -1));
-
-        // R4 = pointer to comm data on stack
-        self.builder()
-            .push(EbpfInsn::mov64_reg(EbpfReg::R4, EbpfReg::R10));
-        self.builder()
-            .push(EbpfInsn::add64_imm(EbpfReg::R4, comm_stack_offset as i32));
-
-        // R5 = size (16 bytes)
-        self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R5, 16));
-
-        // R1 = ctx (restore from R9 where we saved it at program start)
-        self.builder()
-            .push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R9));
-
-        // Call bpf_perf_event_output
-        self.builder()
-            .push(EbpfInsn::call(BpfHelper::PerfEventOutput));
-
-        // Set destination register to 0 (success indicator)
-        self.builder().push(EbpfInsn::mov64_imm(ebpf_dst, 0));
 
         Ok(())
     }

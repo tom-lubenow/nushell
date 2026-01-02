@@ -2,12 +2,12 @@
 //!
 //! These commands are used inside eBPF closures to perform actions:
 //! - emit: Send a value to userspace via perf buffer
-//! - emit-comm: Send current process name to userspace
 //! - count: Increment a counter by key
 //! - histogram: Add value to log2 histogram
 //! - start-timer: Start latency measurement
 //! - stop-timer: Stop timer and return elapsed nanoseconds
-//! - read-str: Read string from kernel memory pointer
+//! - read-str: Read string from userspace memory pointer
+//! - read-kernel-str: Read string from kernel memory pointer
 //! - read-user-str: Read string from userspace memory pointer
 
 use nu_engine::command_prelude::*;
@@ -69,45 +69,6 @@ Examples:
         // Stub for non-eBPF execution (e.g., help display)
         let value = input.into_value(call.head)?;
         Ok(value.into_pipeline_data())
-    }
-}
-
-/// Emit the current process name
-#[derive(Clone)]
-pub struct EmitComm;
-
-impl Command for EmitComm {
-    fn name(&self) -> &str {
-        "emit-comm"
-    }
-
-    fn description(&self) -> &str {
-        "Emit the current process name to the perf buffer as a string."
-    }
-
-    fn signature(&self) -> Signature {
-        Signature::build("emit-comm")
-            .input_output_types(vec![(Type::Nothing, Type::String)])
-            .category(Category::Experimental)
-    }
-
-    fn examples(&self) -> Vec<Example<'_>> {
-        vec![Example {
-            example: "ebpf attach -s 'kprobe:sys_read' {|| emit-comm }",
-            description: "Emit the current process name",
-            result: None,
-        }]
-    }
-
-    fn run(
-        &self,
-        _engine_state: &EngineState,
-        _stack: &mut Stack,
-        call: &Call,
-        _input: PipelineData,
-    ) -> Result<PipelineData, ShellError> {
-        // Stub for non-eBPF execution
-        Ok(Value::string("unknown", call.head).into_pipeline_data())
     }
 }
 

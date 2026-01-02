@@ -61,7 +61,7 @@ pub(crate) fn validate_probe_id(id: i64, span: Span) -> Result<u32, ShellError> 
 pub use attach::EbpfAttach;
 pub use counters::EbpfCounters;
 pub use detach::EbpfDetach;
-pub use helpers::{Count, Emit, EmitComm, Histogram, ReadKernelStr, ReadStr, StartTimer, StopTimer};
+pub use helpers::{Count, Emit, Histogram, ReadKernelStr, ReadStr, StartTimer, StopTimer};
 pub use histogram::EbpfHistogram;
 pub use list::EbpfList;
 pub use trace::EbpfTrace;
@@ -80,7 +80,6 @@ pub fn commands() -> Vec<Box<dyn Command>> {
         Box::new(EbpfTrace),
         // Helper commands for use in eBPF closures
         Box::new(Emit),
-        Box::new(EmitComm),
         Box::new(Count),
         Box::new(Histogram),
         Box::new(StartTimer),

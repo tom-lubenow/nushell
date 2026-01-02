@@ -48,7 +48,6 @@ Context parameter syntax (recommended):
 
 Output commands:
   emit              - Send value to userspace via perf buffer
-  emit-comm         - Send process name as string
   read-str          - Read string from memory pointer (userspace)
   read-kernel-str   - Read string from kernel memory (rare)
 

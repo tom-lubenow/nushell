@@ -158,6 +158,9 @@ pub struct IrToEbpfCompiler<'a> {
     record_builders: HashMap<u32, RecordBuilder>,
     /// Track the type of value produced by each register (for schema inference)
     register_types: HashMap<u32, BpfFieldType>,
+    /// Track registers that point to stack-based strings (reg_id -> stack_offset)
+    /// For types like Comm that live on stack rather than in registers
+    stack_strings: HashMap<u32, i16>,
     /// The event schema if structured events are used
     event_schema: Option<EventSchema>,
     /// Pending internal jumps to fix up (for intra-function control flow)
@@ -294,6 +297,7 @@ impl<'a> IrToEbpfCompiler<'a> {
             literal_strings: HashMap::new(),
             record_builders: HashMap::new(),
             register_types: HashMap::new(),
+            stack_strings: HashMap::new(),
             event_schema: None,
             pending_internal_jumps: Vec::new(),
             label_positions: HashMap::new(),
@@ -925,7 +929,6 @@ impl<'a> IrToEbpfCompiler<'a> {
         match cmd_name {
             // Output helpers
             "emit" => OutputHelpers::compile_bpf_emit(self, src_dst),
-            "emit-comm" => OutputHelpers::compile_bpf_emit_comm(self, src_dst),
             "read-str" => OutputHelpers::compile_bpf_read_str(self, src_dst, true),
             "read-kernel-str" => OutputHelpers::compile_bpf_read_str(self, src_dst, false),
 
@@ -988,16 +991,32 @@ impl<'a> IrToEbpfCompiler<'a> {
                     .push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset, ebpf_val));
             }
             BpfFieldType::Comm => {
-                // Store 8-byte value we have (first 8 bytes of comm)
-                self.builder
-                    .push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset, ebpf_val));
-                // Zero-fill remaining 8 bytes
-                self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
-                self.builder.push(EbpfInsn::stxdw(
-                    EbpfReg::R10,
-                    field_stack_offset + 8,
-                    EbpfReg::R0,
-                ));
+                // Comm is a stack-based string - copy 16 bytes from source to destination
+                if let Some(&src_offset) = self.stack_strings.get(&val.get()) {
+                    // Copy first 8 bytes
+                    self.builder
+                        .push(EbpfInsn::ldxdw(EbpfReg::R0, EbpfReg::R10, src_offset));
+                    self.builder
+                        .push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset, EbpfReg::R0));
+                    // Copy second 8 bytes
+                    self.builder
+                        .push(EbpfInsn::ldxdw(EbpfReg::R0, EbpfReg::R10, src_offset + 8));
+                    self.builder.push(EbpfInsn::stxdw(
+                        EbpfReg::R10,
+                        field_stack_offset + 8,
+                        EbpfReg::R0,
+                    ));
+                } else {
+                    // Fallback: treat as 8-byte value (shouldn't happen with proper tracking)
+                    self.builder
+                        .push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset, ebpf_val));
+                    self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
+                    self.builder.push(EbpfInsn::stxdw(
+                        EbpfReg::R10,
+                        field_stack_offset + 8,
+                        EbpfReg::R0,
+                    ));
+                }
             }
             BpfFieldType::String => {
                 // Store 8-byte value we have
@@ -1267,12 +1286,12 @@ impl<'a> IrToEbpfCompiler<'a> {
                 self.set_register_type(src_dst, BpfFieldType::Int);
             }
             "comm" => {
-                // Get first 8 bytes of command name as i64 (for efficient comparison)
+                // Get full 16-byte command name as a stack-based string
                 self.check_stack_space(16)?;
                 let stack_offset = self.current_stack_offset() - 16;
                 self.advance_stack_offset(16);
 
-                // bpf_get_current_comm(buf, size)
+                // bpf_get_current_comm(buf, size) - fills 16 bytes on stack
                 self.builder()
                     .push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
                 self.builder()
@@ -1281,9 +1300,14 @@ impl<'a> IrToEbpfCompiler<'a> {
                 self.builder()
                     .push(EbpfInsn::call(BpfHelper::GetCurrentComm));
 
-                // Load first 8 bytes as i64
+                // Store stack pointer in register (for emit to use)
                 self.builder()
-                    .push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R10, stack_offset));
+                    .push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R10));
+                self.builder()
+                    .push(EbpfInsn::add64_imm(ebpf_dst, stack_offset as i32));
+
+                // Track that this register points to a stack string
+                self.stack_strings.insert(src_dst.get(), stack_offset);
                 self.set_register_type(src_dst, BpfFieldType::Comm);
             }
             "ktime" => {

@@ -204,7 +204,7 @@ pub enum BpfFieldValue {
 pub enum BpfEventData {
     /// An integer value (8 bytes from bpf-emit)
     Int(i64),
-    /// A string value (16 bytes from bpf-emit-comm, null-terminated)
+    /// A string value (16 bytes from $ctx.comm | emit, null-terminated)
     String(String),
     /// Raw bytes for unknown sizes
     Bytes(Vec<u8>),
@@ -212,7 +212,7 @@ pub enum BpfEventData {
     Record(Vec<(String, BpfFieldValue)>),
 }
 
-/// An event received from an eBPF program via bpf-emit or bpf-emit-comm
+/// An event received from an eBPF program via emit
 #[derive(Debug, Clone)]
 pub struct BpfEvent {
     /// The data emitted by the eBPF program
@@ -529,14 +529,14 @@ impl EbpfState {
     /// Deserialize a simple (non-structured) event based on size
     fn deserialize_simple_event(buf: &[u8]) -> Option<BpfEventData> {
         // Perf buffer may add padding, so we use size ranges
-        // - 8-15 bytes: integer from bpf-emit
-        // - 16+ bytes: string (bpf-emit-comm uses 16, bpf-read-str uses 128)
+        // - 8-15 bytes: integer from emit
+        // - 16+ bytes: string ($ctx.comm uses 16, read-str uses 128)
         if buf.len() >= 8 && buf.len() < 16 {
-            // 8-15 bytes = integer from bpf-emit (may have padding)
+            // 8-15 bytes = integer from emit (may have padding)
             let value = i64::from_le_bytes(buf[0..8].try_into().unwrap());
             Some(BpfEventData::Int(value))
         } else if buf.len() >= 16 {
-            // 16+ bytes = string (from bpf-emit-comm or bpf-read-str)
+            // 16+ bytes = string (from $ctx.comm | emit or read-str)
             // Find null terminator within the buffer
             let null_pos = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
             let s = String::from_utf8_lossy(&buf[..null_pos]).to_string();

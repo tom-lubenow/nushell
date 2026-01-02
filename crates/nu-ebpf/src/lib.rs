@@ -19,6 +19,8 @@ use nu_protocol::engine::{EngineState, StateWorkingSet};
 #[cfg(target_os = "linux")]
 pub mod compiler;
 #[cfg(target_os = "linux")]
+pub mod kernel_btf;
+#[cfg(target_os = "linux")]
 pub mod loader;
 
 pub mod commands;

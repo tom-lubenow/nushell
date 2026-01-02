@@ -26,23 +26,12 @@ pub enum ValueKey {
     Var(usize),
 }
 
-impl ValueKey {
-    pub fn from_reg(reg: RegId) -> Self {
-        ValueKey::Reg(reg.get())
-    }
-
-    pub fn from_var(var: VarId) -> Self {
-        ValueKey::Var(var.get())
-    }
-}
 
 /// Action needed when accessing a register
 #[derive(Debug)]
 pub enum RegAction {
     /// Value is already in this register, no action needed
     Ready(EbpfReg),
-    /// Value needs to be reloaded from stack into this register
-    Reload { reg: EbpfReg, stack_offset: i16 },
 }
 
 /// Action needed when allocating a register for writing
@@ -54,8 +43,6 @@ pub enum AllocAction {
     Spill {
         reg: EbpfReg,
         victim_key: ValueKey,
-        /// Caller must provide a stack offset for the spill
-        needs_stack_slot: bool,
     },
 }
 
@@ -204,11 +191,9 @@ impl RegisterAllocator {
         let (victim_reg, victim_key) = self.get_lru().ok_or(CompileError::RegisterExhaustion)?;
 
         // Update victim to show it will be spilled (caller provides offset)
-        // For now we just mark that spilling is needed
         Ok(AllocAction::Spill {
             reg: victim_reg,
             victim_key,
-            needs_stack_slot: true,
         })
     }
 

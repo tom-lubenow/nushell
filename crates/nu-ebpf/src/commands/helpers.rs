@@ -111,7 +111,7 @@ impl Command for EmitComm {
     }
 }
 
-/// Read a string from kernel memory
+/// Read a string from a memory pointer (userspace by default)
 #[derive(Clone)]
 pub struct ReadStr;
 
@@ -121,7 +121,20 @@ impl Command for ReadStr {
     }
 
     fn description(&self) -> &str {
-        "Read a string from kernel memory pointer and emit it (max 128 bytes)."
+        "Read a string from a memory pointer and emit it (max 128 bytes)."
+    }
+
+    fn extra_description(&self) -> &str {
+        r#"Reads a null-terminated string from the given pointer and emits it
+to the perf buffer.
+
+By default, reads from userspace memory which covers the most common
+use cases:
+- Syscall arguments (filenames, paths, buffers)
+- Uprobe function arguments
+
+For the rare case of reading from kernel memory (internal kernel
+data structures), use read-kernel-str instead."#
     }
 
     fn signature(&self) -> Signature {
@@ -131,9 +144,65 @@ impl Command for ReadStr {
     }
 
     fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                example: "ebpf attach -s 'kprobe:do_sys_openat2' {|ctx| $ctx.arg1 | read-str }",
+                description: "Read filename from syscall argument",
+                result: None,
+            },
+            Example {
+                example: "ebpf attach -s 'uprobe:/bin/app:process_file' {|ctx| $ctx.arg0 | read-str }",
+                description: "Read string argument from userspace function",
+                result: None,
+            },
+        ]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        // Stub for non-eBPF execution
+        let _ = input.into_value(call.head)?;
+        Ok(Value::string("<string>", call.head).into_pipeline_data())
+    }
+}
+
+/// Read a string from kernel memory (rare use case)
+#[derive(Clone)]
+pub struct ReadKernelStr;
+
+impl Command for ReadKernelStr {
+    fn name(&self) -> &str {
+        "read-kernel-str"
+    }
+
+    fn description(&self) -> &str {
+        "Read a string from kernel memory pointer and emit it (max 128 bytes)."
+    }
+
+    fn extra_description(&self) -> &str {
+        r#"Reads a null-terminated string from kernel memory. This is for
+advanced use cases where you need to read from internal kernel
+data structures.
+
+For most use cases (syscall arguments, uprobe arguments), use
+read-str instead which reads from userspace memory."#
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("read-kernel-str")
+            .input_output_types(vec![(Type::Int, Type::String)])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
         vec![Example {
-            example: "ebpf attach -s 'kprobe:sys_open' {|ctx| $ctx.arg1 | read-str }",
-            description: "Read filename from first argument pointer",
+            example: "ebpf attach -s 'kprobe:vfs_read' {|ctx| $ctx.arg0 | read-kernel-str }",
+            description: "Read from kernel buffer pointer",
             result: None,
         }]
     }
@@ -148,46 +217,6 @@ impl Command for ReadStr {
         // Stub for non-eBPF execution
         let _ = input.into_value(call.head)?;
         Ok(Value::string("<kernel string>", call.head).into_pipeline_data())
-    }
-}
-
-/// Read a string from user-space memory
-#[derive(Clone)]
-pub struct ReadUserStr;
-
-impl Command for ReadUserStr {
-    fn name(&self) -> &str {
-        "read-user-str"
-    }
-
-    fn description(&self) -> &str {
-        "Read a string from user-space memory pointer and emit it (max 128 bytes)."
-    }
-
-    fn signature(&self) -> Signature {
-        Signature::build("read-user-str")
-            .input_output_types(vec![(Type::Int, Type::String)])
-            .category(Category::Experimental)
-    }
-
-    fn examples(&self) -> Vec<Example<'_>> {
-        vec![Example {
-            example: "ebpf attach -s 'kprobe:do_sys_openat2' {|ctx| $ctx.arg1 | read-user-str }",
-            description: "Read filename from user-space pointer",
-            result: None,
-        }]
-    }
-
-    fn run(
-        &self,
-        _engine_state: &EngineState,
-        _stack: &mut Stack,
-        call: &Call,
-        input: PipelineData,
-    ) -> Result<PipelineData, ShellError> {
-        // Stub for non-eBPF execution
-        let _ = input.into_value(call.head)?;
-        Ok(Value::string("<user string>", call.head).into_pipeline_data())
     }
 }
 

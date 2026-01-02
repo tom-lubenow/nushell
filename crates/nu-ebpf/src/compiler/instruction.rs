@@ -391,6 +391,39 @@ impl EbpfInsn {
         )
     }
 
+    /// LDXB dst, [src+off] - Load 8-bit value from memory to register
+    pub const fn ldxb(dst: EbpfReg, src: EbpfReg, offset: i16) -> Self {
+        Self::new(
+            opcode::BPF_LDX | opcode::BPF_B | opcode::BPF_MEM,
+            dst.as_u8(),
+            src.as_u8(),
+            offset,
+            0,
+        )
+    }
+
+    /// LDXH dst, [src+off] - Load 16-bit value from memory to register
+    pub const fn ldxh(dst: EbpfReg, src: EbpfReg, offset: i16) -> Self {
+        Self::new(
+            opcode::BPF_LDX | opcode::BPF_H | opcode::BPF_MEM,
+            dst.as_u8(),
+            src.as_u8(),
+            offset,
+            0,
+        )
+    }
+
+    /// LDXW dst, [src+off] - Load 32-bit value from memory to register
+    pub const fn ldxw(dst: EbpfReg, src: EbpfReg, offset: i16) -> Self {
+        Self::new(
+            opcode::BPF_LDX | opcode::BPF_W | opcode::BPF_MEM,
+            dst.as_u8(),
+            src.as_u8(),
+            offset,
+            0,
+        )
+    }
+
     /// LDXDW dst, [src+off] - Load 64-bit value from memory to register
     pub const fn ldxdw(dst: EbpfReg, src: EbpfReg, offset: i16) -> Self {
         Self::new(

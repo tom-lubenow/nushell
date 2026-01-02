@@ -12,7 +12,6 @@ use nu_protocol::ir::Literal;
 use nu_protocol::{RegId, VarId};
 
 use crate::compiler::CompileError;
-use crate::compiler::elf::BpfFieldType;
 use crate::compiler::instruction::{EbpfInsn, EbpfReg, opcode};
 use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, RecordBuilder};
 

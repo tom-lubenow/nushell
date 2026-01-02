@@ -12,7 +12,7 @@ mod register_alloc;
 
 pub use elf::{
     BpfFieldType, BpfMapDef, EbpfMap, EbpfProgram, EbpfProgramType, EventSchema, MapRelocation,
-    SchemaField,
+    ProbeContext, SchemaField,
 };
 pub use instruction::{BpfHelper, EbpfInsn, EbpfReg};
 pub use ir_to_ebpf::{CompileResult, IrToEbpfCompiler};
@@ -39,4 +39,17 @@ pub enum CompileError {
 
     #[error("Invalid probe specification: {0}")]
     InvalidProbeSpec(String),
+
+    #[error("'retval' is only available on return probes (kretprobe, uretprobe)")]
+    RetvalOnNonReturnProbe,
+
+    #[error("Tracepoint field '{field}' not found. Available: {available}")]
+    TracepointFieldNotFound { field: String, available: String },
+
+    #[error("Could not load tracepoint context for '{category}/{name}': {reason}")]
+    TracepointContextError {
+        category: String,
+        name: String,
+        reason: String,
+    },
 }

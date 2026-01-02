@@ -7,7 +7,7 @@
 use nu_protocol::RegId;
 
 use crate::compiler::CompileError;
-use crate::compiler::elf::{BpfFieldType, EventSchema, MapRelocation, SchemaField};
+use crate::compiler::elf::{EventSchema, MapRelocation, SchemaField};
 use crate::compiler::instruction::{BpfHelper, EbpfInsn, EbpfReg};
 use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, PERF_MAP_NAME, RecordBuilder};
 

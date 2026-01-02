@@ -1,0 +1,16 @@
+//! Kernel BTF (BPF Type Format) parsing
+//!
+//! This module provides access to kernel type information from `/sys/kernel/btf/vmlinux`.
+//! It enables:
+//! - Tracepoint context layout lookup
+//! - Function signature queries
+//! - Type annotation detection (__user pointers)
+//! - Function existence validation
+
+mod service;
+mod tracepoint;
+mod types;
+
+pub use service::KernelBtf;
+pub use tracepoint::TracepointContext;
+pub use types::{FieldInfo, TypeInfo};

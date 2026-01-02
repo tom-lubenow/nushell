@@ -23,21 +23,34 @@ the probe point is hit.
 
 Context parameter syntax (recommended):
   The closure can take a context parameter to access probe information:
-    {|ctx| $ctx.pid }     - Get process ID
-    {|ctx| $ctx.tgid }    - Get thread group ID
+
+  Universal fields (all probe types):
+    {|ctx| $ctx.pid }     - Get process ID (thread ID)
+    {|ctx| $ctx.tgid }    - Get thread group ID (process ID)
     {|ctx| $ctx.uid }     - Get user ID
     {|ctx| $ctx.gid }     - Get group ID
     {|ctx| $ctx.comm }    - Get process command name (first 8 bytes)
     {|ctx| $ctx.ktime }   - Get kernel timestamp in nanoseconds
-    {|ctx| $ctx.arg0 }    - Get function argument 0 (kprobe/uprobe only)
+
+  Kprobe/uprobe fields:
+    {|ctx| $ctx.arg0 }    - Get function argument 0
     {|ctx| $ctx.arg1-5 }  - Get function arguments 1-5
     {|ctx| $ctx.retval }  - Get return value (kretprobe/uretprobe only)
+
+  Tracepoint fields:
+    Access fields specific to each tracepoint. Fields are read from tracefs.
+    Example for syscalls/sys_enter_openat:
+      {|ctx| $ctx.dfd }      - Directory file descriptor
+      {|ctx| $ctx.filename } - Pointer to filename string
+      {|ctx| $ctx.flags }    - Open flags
+    Example for syscalls/sys_exit_*:
+      {|ctx| $ctx.ret }      - Syscall return value
 
 Output commands:
   emit              - Send value to userspace via perf buffer
   emit-comm         - Send process name as string
-  read-str          - Read string from kernel memory pointer
-  read-user-str     - Read string from userspace memory pointer
+  read-str          - Read string from memory pointer (userspace)
+  read-kernel-str   - Read string from kernel memory (rare)
 
 Aggregation commands:
   count             - Count occurrences by key
@@ -168,6 +181,16 @@ Requirements:
                 description: "Measure file open latency using shared timestamp map",
                 result: None,
             },
+            Example {
+                example: "ebpf attach -s 'tracepoint:syscalls/sys_enter_openat' {|ctx| $ctx.filename | emit }",
+                description: "Stream filenames from openat syscalls using tracepoint",
+                result: None,
+            },
+            Example {
+                example: "ebpf attach -s 'tracepoint:syscalls/sys_exit_read' {|ctx| $ctx.ret | emit }",
+                description: "Stream read syscall return values",
+                result: None,
+            },
         ]
     }
 
@@ -188,7 +211,7 @@ fn run_attach(
     stack: &mut Stack,
     call: &Call,
 ) -> Result<PipelineData, ShellError> {
-    use crate::compiler::{EbpfProgram, IrToEbpfCompiler};
+    use crate::compiler::{EbpfProgram, IrToEbpfCompiler, ProbeContext};
     use crate::loader::{LoadError, get_state, parse_probe_spec};
 
     let probe_spec: String = call.req(engine_state, stack, 0)?;
@@ -209,6 +232,9 @@ fn run_attach(
             inner: vec![],
         })?;
 
+    // Create probe context for the compiler
+    let probe_context = ProbeContext::new(prog_type, &target);
+
     // Get the block for this closure
     let block = engine_state.get_block(closure.block_id);
 
@@ -224,20 +250,26 @@ fn run_attach(
             inner: vec![],
         })?;
 
-    // Use compile_with_captures to support:
+    // Use compile_with_context to support:
     // - context parameter syntax like {|ctx| $ctx.pid }
     // - captured integer variables from outer scope like `let pid = 1234; {|| $pid }`
-    let compile_result =
-        IrToEbpfCompiler::compile_with_captures(ir_block, engine_state, block, &closure.captures)
-            .map_err(|e| ShellError::GenericError {
-            error: "eBPF compilation failed".into(),
-            msg: e.to_string(),
-            span: Some(call.head),
-            help: Some(
-                "Check that the closure uses only supported BPF commands or context fields".into(),
-            ),
-            inner: vec![],
-        })?;
+    // - probe-aware compilation (auto-detect userspace vs kernel reads, validate retval)
+    let compile_result = IrToEbpfCompiler::compile_with_context(
+        ir_block,
+        engine_state,
+        block,
+        &closure.captures,
+        probe_context,
+    )
+    .map_err(|e| ShellError::GenericError {
+        error: "eBPF compilation failed".into(),
+        msg: e.to_string(),
+        span: Some(call.head),
+        help: Some(
+            "Check that the closure uses only supported BPF commands or context fields".into(),
+        ),
+        inner: vec![],
+    })?;
 
     let mut program = EbpfProgram::with_maps(
         prog_type,

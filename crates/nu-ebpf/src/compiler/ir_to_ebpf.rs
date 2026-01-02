@@ -6,14 +6,13 @@ use std::collections::HashMap;
 
 use nu_protocol::ast::{Block, CellPath, PathMember};
 use nu_protocol::engine::EngineState;
-use nu_protocol::ir::{Instruction, IrBlock, Literal};
+use nu_protocol::ir::{Instruction, IrBlock};
 use nu_protocol::{DeclId, RegId, VarId};
 
 use super::CompileError;
-use super::elf::{BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation};
-use super::helpers::{
-    AggregationHelpers, DataHelpers, FilterHelpers, OutputHelpers, TimingHelpers,
-};
+use super::elf::{BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext};
+use crate::kernel_btf::KernelBtf;
+use super::helpers::{AggregationHelpers, OutputHelpers, TimingHelpers};
 use super::instruction::{BpfHelper, EbpfBuilder, EbpfInsn, EbpfReg, opcode};
 use super::ir_ops::IrOps;
 use super::register_alloc::{AllocAction, RegAction, RegisterAllocator, ValueKey};
@@ -179,6 +178,9 @@ pub struct IrToEbpfCompiler<'a> {
     /// When a closure captures a variable like `let pid = 1234; {|| $pid }`,
     /// we can inline the value as a constant in the eBPF bytecode.
     captured_values: HashMap<usize, i64>,
+    /// Probe context providing information about where this program will be attached
+    /// Used for auto-detecting userspace vs kernel memory reads, validating retval access, etc.
+    probe_context: ProbeContext,
 }
 
 impl<'a> IrToEbpfCompiler<'a> {
@@ -192,44 +194,54 @@ impl<'a> IrToEbpfCompiler<'a> {
     }
 
     /// Compile an IrBlock to eBPF bytecode with full result including maps
+    ///
+    /// Uses a default probe context (kprobe). For proper probe-aware compilation,
+    /// use `compile_with_context` instead.
     pub fn compile_full(
         ir_block: &'a IrBlock,
         engine_state: &'a EngineState,
     ) -> Result<CompileResult, CompileError> {
-        Self::compile_inner(ir_block, Some(engine_state), None, &[])
+        Self::compile_inner(
+            ir_block,
+            Some(engine_state),
+            None,
+            &[],
+            ProbeContext::default_for_tests(),
+        )
     }
 
-    /// Compile an IrBlock with Block metadata for closure parameter support
+    /// Compile an IrBlock with full context including probe information
     ///
-    /// When compiling a closure like `{|ctx| $ctx.pid }`, pass the Block
-    /// so we can detect the context parameter and map field access to BPF helpers.
-    ///
-    /// The `captures` parameter allows inlining captured integer variables as constants.
-    /// For example, `let pid = 1234; {|| $pid | emit }` will inline 1234.
-    pub fn compile_with_block(
-        ir_block: &'a IrBlock,
-        engine_state: &'a EngineState,
-        block: &Block,
-    ) -> Result<CompileResult, CompileError> {
-        Self::compile_inner(ir_block, Some(engine_state), Some(block), &[])
-    }
-
-    /// Compile an IrBlock with Block metadata and closure captures
-    ///
-    /// This is the full version that supports capturing variables from outer scope.
-    pub fn compile_with_captures(
+    /// This is the recommended entry point that supports:
+    /// - Closure context parameters (`{|ctx| $ctx.pid }`)
+    /// - Captured variables from outer scope
+    /// - Probe-aware compilation (auto-detect userspace vs kernel reads, validate retval)
+    pub fn compile_with_context(
         ir_block: &'a IrBlock,
         engine_state: &'a EngineState,
         block: &Block,
         captures: &[(VarId, nu_protocol::Value)],
+        probe_context: ProbeContext,
     ) -> Result<CompileResult, CompileError> {
-        Self::compile_inner(ir_block, Some(engine_state), Some(block), captures)
+        Self::compile_inner(
+            ir_block,
+            Some(engine_state),
+            Some(block),
+            captures,
+            probe_context,
+        )
     }
 
     /// Compile without engine state (for tests, will fail on Call instructions)
     #[cfg(test)]
     pub fn compile_no_calls(ir_block: &'a IrBlock) -> Result<Vec<u8>, CompileError> {
-        let result = Self::compile_inner(ir_block, None, None, &[])?;
+        let result = Self::compile_inner(
+            ir_block,
+            None,
+            None,
+            &[],
+            ProbeContext::default_for_tests(),
+        )?;
         Ok(result.bytecode)
     }
 
@@ -238,6 +250,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         engine_state: Option<&'a EngineState>,
         block: Option<&Block>,
         captures: &[(VarId, nu_protocol::Value)],
+        probe_context: ProbeContext,
     ) -> Result<CompileResult, CompileError> {
         // Create a dummy engine state for when we don't have one
         // This will only be accessed if there's a Call instruction
@@ -289,6 +302,7 @@ impl<'a> IrToEbpfCompiler<'a> {
             context_registers: HashMap::new(),
             literal_cell_paths: HashMap::new(),
             captured_values,
+            probe_context,
         };
 
         // Save the context pointer (R1) to R9 at the start
@@ -440,10 +454,8 @@ impl<'a> IrToEbpfCompiler<'a> {
         }
 
         // Value is already in a register
-        match self.reg_alloc.get_var(var_id)? {
-            RegAction::Ready(r) => Ok(r),
-            RegAction::Reload { .. } => unreachable!("Already handled above"),
-        }
+        let RegAction::Ready(r) = self.reg_alloc.get_var(var_id)?;
+        Ok(r)
     }
 
     /// Get a register for writing to a Nushell variable (may spill another value)
@@ -519,16 +531,6 @@ impl<'a> IrToEbpfCompiler<'a> {
     /// Advance the stack offset (for manual allocation)
     pub(crate) fn advance_stack_offset(&mut self, amount: i16) {
         self.stack_offset -= amount;
-    }
-
-    /// Pop a pushed argument
-    pub(crate) fn pop_pushed_arg(&mut self) -> Option<RegId> {
-        self.pushed_args.pop()
-    }
-
-    /// Get a literal value for a register
-    pub(crate) fn get_literal_value(&self, reg: RegId) -> Option<i64> {
-        self.literal_values.get(&reg.get()).copied()
     }
 
     /// Set the type of a register
@@ -700,10 +702,8 @@ impl<'a> IrToEbpfCompiler<'a> {
         }
 
         // Value is already in a register
-        match self.reg_alloc.get(reg)? {
-            RegAction::Ready(r) => Ok(r),
-            RegAction::Reload { .. } => unreachable!("Already handled above"),
-        }
+        let RegAction::Ready(r) = self.reg_alloc.get(reg)?;
+        Ok(r)
     }
 
     fn alloc_stack_internal(&mut self, size: i16) -> Result<i16, CompileError> {
@@ -920,50 +920,22 @@ impl<'a> IrToEbpfCompiler<'a> {
         let cmd_name = decl.name();
 
         // Map known commands to BPF helpers (via extension traits)
-        // Data commands are kept for backwards compatibility but context parameter
-        // syntax ({|ctx| $ctx.pid}) is now the recommended approach.
+        // Use context parameter syntax for data access: {|ctx| $ctx.pid }
+        // Use if expressions for filtering: {|ctx| if $ctx.pid == 1234 { ... } }
         match cmd_name {
-            // Data helpers - deprecated in favor of context parameter syntax
-            // Use {|ctx| $ctx.pid } instead of {|| bpf-pid }
-            "bpf-pid" | "bpf pid" => DataHelpers::compile_bpf_pid(self, src_dst),
-            "bpf-tgid" | "bpf tgid" => DataHelpers::compile_bpf_tgid(self, src_dst),
-            "bpf-uid" | "bpf uid" => DataHelpers::compile_bpf_uid(self, src_dst),
-            "bpf-ktime" | "bpf ktime" => DataHelpers::compile_bpf_ktime(self, src_dst),
-            "bpf-comm" | "bpf comm" => DataHelpers::compile_bpf_comm(self, src_dst),
-            "bpf-arg" | "bpf arg" => DataHelpers::compile_bpf_arg(self, src_dst),
-            "bpf-retval" | "bpf retval" => DataHelpers::compile_bpf_retval(self, src_dst),
+            // Output helpers
+            "emit" => OutputHelpers::compile_bpf_emit(self, src_dst),
+            "emit-comm" => OutputHelpers::compile_bpf_emit_comm(self, src_dst),
+            "read-str" => OutputHelpers::compile_bpf_read_str(self, src_dst, true),
+            "read-kernel-str" => OutputHelpers::compile_bpf_read_str(self, src_dst, false),
 
-            // Output helpers - short names are preferred
-            "emit" | "bpf-emit" | "bpf emit" => OutputHelpers::compile_bpf_emit(self, src_dst),
-            "emit-comm" | "bpf-emit-comm" | "bpf emit-comm" => {
-                OutputHelpers::compile_bpf_emit_comm(self, src_dst)
-            }
-            "read-str" | "bpf-read-str" | "bpf read-str" => {
-                OutputHelpers::compile_bpf_read_str(self, src_dst, false)
-            }
-            "read-user-str" | "bpf-read-user-str" | "bpf read-user-str" => {
-                OutputHelpers::compile_bpf_read_str(self, src_dst, true)
-            }
+            // Aggregation helpers
+            "count" => AggregationHelpers::compile_bpf_count(self, src_dst),
+            "histogram" => AggregationHelpers::compile_bpf_histogram(self, src_dst),
 
-            // Aggregation helpers - short names are preferred
-            "count" | "bpf-count" | "bpf count" => {
-                AggregationHelpers::compile_bpf_count(self, src_dst)
-            }
-            "histogram" | "bpf-histogram" | "bpf histogram" => {
-                AggregationHelpers::compile_bpf_histogram(self, src_dst)
-            }
-
-            // Timing helpers - short names are preferred
-            "start-timer" | "bpf-start-timer" | "bpf start-timer" => {
-                TimingHelpers::compile_bpf_start_timer(self, src_dst)
-            }
-            "stop-timer" | "bpf-stop-timer" | "bpf stop-timer" => {
-                TimingHelpers::compile_bpf_stop_timer(self, src_dst)
-            }
-
-            // Filter helpers - will be replaced by 'where' in future
-            "bpf-filter-pid" | "bpf filter-pid" => FilterHelpers::compile_bpf_filter_pid(self),
-            "bpf-filter-comm" | "bpf filter-comm" => FilterHelpers::compile_bpf_filter_comm(self),
+            // Timing helpers
+            "start-timer" => TimingHelpers::compile_bpf_start_timer(self, src_dst),
+            "stop-timer" => TimingHelpers::compile_bpf_stop_timer(self, src_dst),
 
             _ => Err(CompileError::UnsupportedInstruction(format!(
                 "Call to unsupported command: {}",
@@ -1070,7 +1042,7 @@ impl<'a> IrToEbpfCompiler<'a> {
     /// Compile FollowCellPath - access a field on a value
     ///
     /// For context parameter access like `$ctx.pid`, this maps field names
-    /// to the appropriate BPF helper calls.
+    /// to the appropriate BPF helper calls or context struct offsets.
     fn compile_follow_cell_path(
         &mut self,
         src_dst: RegId,
@@ -1109,12 +1081,152 @@ impl<'a> IrToEbpfCompiler<'a> {
             }
         };
 
-        // Map field names to BPF helper calls
-        // The result goes into src_dst register
+        // For tracepoints, use the tracepoint context layout
+        if self.probe_context.is_tracepoint() {
+            return self.compile_tracepoint_field_access(src_dst, field_name);
+        }
+
+        // For kprobes/uprobes, use pt_regs-based access
+        self.compile_kprobe_field_access(src_dst, field_name)
+    }
+
+    /// Compile field access for tracepoints using tracepoint context layout
+    fn compile_tracepoint_field_access(
+        &mut self,
+        src_dst: RegId,
+        field_name: &str,
+    ) -> Result<(), CompileError> {
+        let ebpf_dst = self.alloc_reg(src_dst)?;
+
+        // Universal fields work on all probe types
+        match field_name {
+            "pid" | "tgid" | "uid" | "gid" | "comm" | "ktime" => {
+                return self.compile_universal_field(src_dst, ebpf_dst, field_name);
+            }
+            _ => {}
+        }
+
+        // Get tracepoint context from KernelBtf
+        let (category, name) = self.probe_context.tracepoint_parts().ok_or_else(|| {
+            CompileError::TracepointContextError {
+                category: "unknown".into(),
+                name: self.probe_context.target.clone(),
+                reason: "Invalid tracepoint format. Expected 'category/name'".into(),
+            }
+        })?;
+
+        let btf = KernelBtf::get();
+        let ctx = btf
+            .get_tracepoint_context(category, name)
+            .map_err(|e| CompileError::TracepointContextError {
+                category: category.into(),
+                name: name.into(),
+                reason: e.to_string(),
+            })?;
+
+        // Look up the field in the tracepoint context
+        let field_info = ctx.get_field(field_name).ok_or_else(|| {
+            CompileError::TracepointFieldNotFound {
+                field: field_name.into(),
+                available: ctx.field_names().join(", "),
+            }
+        })?;
+
+        // Load the field from the context struct
+        // R9 contains the saved context pointer (tracepoint context struct)
+        let offset = field_info.offset as i16;
+
+        // Choose load instruction based on field size
+        match field_info.size {
+            1 => {
+                self.builder()
+                    .push(EbpfInsn::ldxb(ebpf_dst, EbpfReg::R9, offset));
+            }
+            2 => {
+                self.builder()
+                    .push(EbpfInsn::ldxh(ebpf_dst, EbpfReg::R9, offset));
+            }
+            4 => {
+                self.builder()
+                    .push(EbpfInsn::ldxw(ebpf_dst, EbpfReg::R9, offset));
+            }
+            _ => {
+                // Default to 64-bit load for 8+ byte fields
+                self.builder()
+                    .push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
+            }
+        }
+
+        self.set_register_type(src_dst, BpfFieldType::Int);
+        self.set_context_register(src_dst, false);
+
+        Ok(())
+    }
+
+    /// Compile field access for kprobes/uprobes using pt_regs
+    fn compile_kprobe_field_access(
+        &mut self,
+        src_dst: RegId,
+        field_name: &str,
+    ) -> Result<(), CompileError> {
         let ebpf_dst = self.alloc_reg(src_dst)?;
 
         match field_name {
-            // Process identification
+            // Universal fields (work via BPF helpers)
+            "pid" | "tgid" | "uid" | "gid" | "comm" | "ktime" => {
+                self.compile_universal_field(src_dst, ebpf_dst, field_name)?;
+            }
+            // Function arguments (arg0-arg5 for x86_64, arg0-arg7 for aarch64)
+            name if name.starts_with("arg") => {
+                let arg_idx: usize = name[3..].parse().map_err(|_| {
+                    CompileError::UnsupportedInstruction(format!("Invalid argument: {name}"))
+                })?;
+
+                if arg_idx >= pt_regs_offsets::ARG_OFFSETS.len() {
+                    return Err(CompileError::UnsupportedInstruction(format!(
+                        "Argument index {arg_idx} out of range"
+                    )));
+                }
+
+                let offset = pt_regs_offsets::ARG_OFFSETS[arg_idx];
+                // R9 contains the saved context pointer (pt_regs)
+                self.builder()
+                    .push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
+                self.set_register_type(src_dst, BpfFieldType::Int);
+            }
+            "retval" => {
+                // Return value (for kretprobe/uretprobe only)
+                if !self.probe_context.is_return_probe() {
+                    return Err(CompileError::RetvalOnNonReturnProbe);
+                }
+                let offset = pt_regs_offsets::RETVAL_OFFSET;
+                self.builder()
+                    .push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
+                self.set_register_type(src_dst, BpfFieldType::Int);
+            }
+            _ => {
+                return Err(CompileError::UnsupportedInstruction(format!(
+                    "Unknown context field: {field_name}. Supported: pid, tgid, uid, gid, comm, ktime, arg0-arg5, retval"
+                )));
+            }
+        }
+
+        // The register no longer holds "context" - it now holds the field value
+        self.set_context_register(src_dst, false);
+
+        Ok(())
+    }
+
+    /// Compile universal context fields that work on all probe types
+    ///
+    /// These use BPF helper functions rather than reading from context struct.
+    fn compile_universal_field(
+        &mut self,
+        src_dst: RegId,
+        ebpf_dst: EbpfReg,
+        field_name: &str,
+    ) -> Result<(), CompileError> {
+        match field_name {
             "pid" => {
                 // bpf_get_current_pid_tgid() returns (tgid << 32) | pid
                 // Lower 32 bits = thread ID (what Linux calls PID)
@@ -1181,41 +1293,14 @@ impl<'a> IrToEbpfCompiler<'a> {
                     .push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
                 self.set_register_type(src_dst, BpfFieldType::Int);
             }
-            // Function arguments (arg0-arg5 for x86_64, arg0-arg7 for aarch64)
-            name if name.starts_with("arg") => {
-                let arg_idx: usize = name[3..].parse().map_err(|_| {
-                    CompileError::UnsupportedInstruction(format!("Invalid argument: {name}"))
-                })?;
-
-                if arg_idx >= pt_regs_offsets::ARG_OFFSETS.len() {
-                    return Err(CompileError::UnsupportedInstruction(format!(
-                        "Argument index {arg_idx} out of range"
-                    )));
-                }
-
-                let offset = pt_regs_offsets::ARG_OFFSETS[arg_idx];
-                // R9 contains the saved context pointer (pt_regs)
-                self.builder()
-                    .push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
-                self.set_register_type(src_dst, BpfFieldType::Int);
-            }
-            "retval" => {
-                // Return value (for kretprobe/uretprobe)
-                let offset = pt_regs_offsets::RETVAL_OFFSET;
-                self.builder()
-                    .push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
-                self.set_register_type(src_dst, BpfFieldType::Int);
-            }
             _ => {
                 return Err(CompileError::UnsupportedInstruction(format!(
-                    "Unknown context field: {field_name}. Supported: pid, tgid, uid, gid, comm, ktime, arg0-arg5, retval"
+                    "Unknown universal field: {field_name}"
                 )));
             }
         }
 
-        // The register no longer holds "context" - it now holds the field value
         self.set_context_register(src_dst, false);
-
         Ok(())
     }
 }

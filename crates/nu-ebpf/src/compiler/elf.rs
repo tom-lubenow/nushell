@@ -205,6 +205,104 @@ impl EbpfProgramType {
             EbpfProgramType::Uretprobe => "uretprobe",
         }
     }
+
+    /// Returns true if this is a return probe (kretprobe or uretprobe)
+    pub fn is_return_probe(&self) -> bool {
+        matches!(
+            self,
+            EbpfProgramType::Kretprobe | EbpfProgramType::Uretprobe
+        )
+    }
+
+    /// Returns true if this is a userspace probe (uprobe or uretprobe)
+    pub fn is_userspace(&self) -> bool {
+        matches!(
+            self,
+            EbpfProgramType::Uprobe | EbpfProgramType::Uretprobe
+        )
+    }
+}
+
+/// Context about the probe being compiled
+///
+/// This provides the compiler with information about where the eBPF program
+/// will be attached, enabling:
+/// - Automatic selection of kernel vs userspace memory reads
+/// - Compile-time validation (e.g., retval only on return probes)
+/// - Different context struct layouts for tracepoints vs kprobes
+#[derive(Debug, Clone)]
+pub struct ProbeContext {
+    /// The type of probe (kprobe, uprobe, tracepoint, etc.)
+    pub probe_type: EbpfProgramType,
+    /// The target function or tracepoint name
+    pub target: String,
+    /// For tracepoints: the category (e.g., "syscalls")
+    pub tracepoint_category: Option<String>,
+}
+
+impl ProbeContext {
+    /// Create a new probe context
+    pub fn new(probe_type: EbpfProgramType, target: impl Into<String>) -> Self {
+        let target = target.into();
+        let tracepoint_category = if matches!(probe_type, EbpfProgramType::Tracepoint) {
+            // Parse "category/name" format
+            target.split('/').next().map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        Self {
+            probe_type,
+            target,
+            tracepoint_category,
+        }
+    }
+
+    /// Create a default probe context for tests or legacy code
+    ///
+    /// Defaults to kprobe with empty target, which means:
+    /// - Not a return probe (retval access will fail)
+    /// - Not userspace (read-str defaults to kernel reads)
+    pub fn default_for_tests() -> Self {
+        Self {
+            probe_type: EbpfProgramType::Kprobe,
+            target: String::new(),
+            tracepoint_category: None,
+        }
+    }
+
+    /// Returns true if this is a return probe
+    pub fn is_return_probe(&self) -> bool {
+        self.probe_type.is_return_probe()
+    }
+
+    /// Returns true if this is a userspace probe
+    pub fn is_userspace(&self) -> bool {
+        self.probe_type.is_userspace()
+    }
+
+    /// Returns true if this is a tracepoint
+    pub fn is_tracepoint(&self) -> bool {
+        matches!(
+            self.probe_type,
+            EbpfProgramType::Tracepoint | EbpfProgramType::RawTracepoint
+        )
+    }
+
+    /// Get tracepoint category and name
+    ///
+    /// For tracepoint "syscalls/sys_enter_openat", returns Some(("syscalls", "sys_enter_openat"))
+    pub fn tracepoint_parts(&self) -> Option<(&str, &str)> {
+        if !self.is_tracepoint() {
+            return None;
+        }
+
+        let mut parts = self.target.splitn(2, '/');
+        match (parts.next(), parts.next()) {
+            (Some(category), Some(name)) => Some((category, name)),
+            _ => None,
+        }
+    }
 }
 
 /// A complete eBPF program ready for loading

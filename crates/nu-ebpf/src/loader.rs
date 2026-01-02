@@ -159,6 +159,8 @@ pub struct ActiveProbe {
     perf_buffers: Vec<CpuPerfBuffer>,
     /// Optional schema for structured events
     event_schema: Option<EventSchema>,
+    /// Pin group name (if maps are pinned for sharing)
+    pin_group: Option<String>,
 }
 
 impl std::fmt::Debug for ActiveProbe {
@@ -230,6 +232,8 @@ pub struct EbpfState {
     probes: Mutex<HashMap<u32, ActiveProbe>>,
     /// Next probe ID
     next_id: AtomicU32,
+    /// Reference counts for pin groups (for cleanup when last probe detaches)
+    pin_group_refs: Mutex<HashMap<String, u32>>,
 }
 
 impl Default for EbpfState {
@@ -243,6 +247,7 @@ impl EbpfState {
         Self {
             probes: Mutex::new(HashMap::new()),
             next_id: AtomicU32::new(1),
+            pin_group_refs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -436,6 +441,13 @@ impl EbpfState {
         let id = self.next_probe_id();
         let probe_spec = format!("{}:{}", program.prog_type.section_prefix(), program.target);
 
+        // Track pin group reference count for cleanup
+        let pin_group_owned = pin_group.map(|s| s.to_string());
+        if let Some(ref group) = pin_group_owned {
+            let mut refs = self.pin_group_refs.lock().unwrap();
+            *refs.entry(group.clone()).or_insert(0) += 1;
+        }
+
         let active_probe = ActiveProbe {
             id,
             probe_spec,
@@ -446,6 +458,7 @@ impl EbpfState {
             has_histogram_map,
             perf_buffers,
             event_schema: program.event_schema.clone(),
+            pin_group: pin_group_owned,
         };
 
         self.probes.lock().unwrap().insert(id, active_probe);
@@ -634,9 +647,27 @@ impl EbpfState {
     }
 
     /// Detach a probe by ID
+    ///
+    /// If the probe was using a pin group and this is the last probe using it,
+    /// the pinned maps will be automatically cleaned up.
     pub fn detach(&self, id: u32) -> Result<(), LoadError> {
         let mut probes = self.probes.lock().unwrap();
-        if probes.remove(&id).is_some() {
+        if let Some(probe) = probes.remove(&id) {
+            // Check if we need to clean up a pin group
+            if let Some(ref group) = probe.pin_group {
+                let mut refs = self.pin_group_refs.lock().unwrap();
+                if let Some(count) = refs.get_mut(group) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        refs.remove(group);
+                        // Clean up the pin directory
+                        let pin_path = format!("/sys/fs/bpf/nushell/{}", group);
+                        let _ = std::fs::remove_dir_all(&pin_path);
+                        // Also try to remove the parent if empty
+                        let _ = std::fs::remove_dir("/sys/fs/bpf/nushell");
+                    }
+                }
+            }
             // Dropping the ActiveProbe will detach the program
             Ok(())
         } else {

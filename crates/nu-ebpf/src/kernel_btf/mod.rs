@@ -11,6 +11,6 @@ mod service;
 mod tracepoint;
 mod types;
 
-pub use service::KernelBtf;
+pub use service::{FunctionCheckResult, KernelBtf};
 pub use tracepoint::TracepointContext;
 pub use types::{FieldInfo, TypeInfo};

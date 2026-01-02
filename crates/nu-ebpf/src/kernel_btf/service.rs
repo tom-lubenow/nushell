@@ -48,16 +48,45 @@ impl std::fmt::Display for BtfError {
 
 impl std::error::Error for BtfError {}
 
+/// Result of checking if a function exists
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FunctionCheckResult {
+    /// Function exists and can be probed
+    Exists,
+    /// Function does not exist (with suggestions for similar names)
+    NotFound { suggestions: Vec<String> },
+    /// Cannot validate - need elevated privileges to read function list
+    NeedsSudo,
+    /// Cannot validate - function list not available (old kernel, etc.)
+    CannotValidate,
+}
+
+/// Result of reading the function list (internal use)
+#[derive(Clone)]
+enum FunctionListResult {
+    /// Successfully loaded function list
+    Loaded(Vec<String>),
+    /// File exists but couldn't be read (permission denied)
+    PermissionDenied,
+    /// File doesn't exist or path not configured
+    NotAvailable,
+}
+
 /// Service for querying kernel type information
 ///
 /// This is a singleton that provides access to:
 /// - Tracepoint context layouts from tracefs
 /// - Well-known fallback layouts for common tracepoints
+/// - Function existence checks for kprobe validation
 pub struct KernelBtf {
     /// Path to tracefs events directory
     tracefs_events_path: Option<String>,
+    /// Path to available_filter_functions file
+    available_filter_functions_path: Option<String>,
     /// Cached tracepoint contexts
     tracepoint_cache: RwLock<HashMap<String, TracepointContext>>,
+    /// Cached function list result (lazy loaded)
+    function_cache: RwLock<Option<FunctionListResult>>,
 }
 
 impl KernelBtf {
@@ -66,10 +95,13 @@ impl KernelBtf {
         KERNEL_BTF.get_or_init(|| {
             // Find tracefs mount point
             let tracefs_path = Self::find_tracefs_events();
+            let filter_funcs_path = Self::find_available_filter_functions();
 
             KernelBtf {
                 tracefs_events_path: tracefs_path,
+                available_filter_functions_path: filter_funcs_path,
                 tracepoint_cache: RwLock::new(HashMap::new()),
+                function_cache: RwLock::new(None),
             }
         })
     }
@@ -91,9 +123,177 @@ impl KernelBtf {
         None
     }
 
+    /// Find the available_filter_functions file
+    fn find_available_filter_functions() -> Option<String> {
+        let paths = [
+            "/sys/kernel/tracing/available_filter_functions",
+            "/sys/kernel/debug/tracing/available_filter_functions",
+        ];
+
+        for path in paths {
+            if Path::new(path).is_file() {
+                return Some(path.to_string());
+            }
+        }
+
+        None
+    }
+
     /// Check if tracefs is available
     pub fn has_tracefs(&self) -> bool {
         self.tracefs_events_path.is_some()
+    }
+
+    /// Check if function validation is available
+    pub fn has_function_list(&self) -> bool {
+        self.available_filter_functions_path.is_some()
+    }
+
+    /// Load the list of available kernel functions (lazy, cached)
+    fn load_function_list(&self) -> FunctionListResult {
+        // Check if already loaded
+        {
+            let cache = self.function_cache.read().unwrap();
+            if let Some(ref result) = *cache {
+                return result.clone();
+            }
+        }
+
+        // Load from file
+        let result = self.read_available_functions();
+
+        // Cache the result
+        {
+            let mut cache = self.function_cache.write().unwrap();
+            *cache = Some(result.clone());
+        }
+
+        result
+    }
+
+    /// Read available functions from tracefs
+    fn read_available_functions(&self) -> FunctionListResult {
+        let path = match &self.available_filter_functions_path {
+            Some(p) => p,
+            None => return FunctionListResult::NotAvailable,
+        };
+
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                return if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    FunctionListResult::PermissionDenied
+                } else {
+                    FunctionListResult::NotAvailable
+                };
+            }
+        };
+
+        // Each line is a function name, possibly with module info like "func_name [module]"
+        // We extract just the function name
+        let funcs = content
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                // Handle "func_name [module]" format
+                let func_name = line.split_whitespace().next()?;
+                Some(func_name.to_string())
+            })
+            .collect();
+
+        FunctionListResult::Loaded(funcs)
+    }
+
+    /// Check if a kernel function exists and can be probed
+    ///
+    /// Returns a FunctionCheckResult indicating whether the function exists,
+    /// doesn't exist (with suggestions), or validation is not possible.
+    pub fn check_function(&self, name: &str) -> FunctionCheckResult {
+        if self.available_filter_functions_path.is_none() {
+            return FunctionCheckResult::CannotValidate;
+        }
+
+        match self.load_function_list() {
+            FunctionListResult::PermissionDenied => FunctionCheckResult::NeedsSudo,
+            FunctionListResult::NotAvailable => FunctionCheckResult::CannotValidate,
+            FunctionListResult::Loaded(ref funcs) if funcs.is_empty() => {
+                // Empty file - can't validate
+                FunctionCheckResult::CannotValidate
+            }
+            FunctionListResult::Loaded(ref funcs) => {
+                if funcs.iter().any(|f| f == name) {
+                    FunctionCheckResult::Exists
+                } else {
+                    let suggestions = self.find_similar_functions(funcs, name, 3);
+                    FunctionCheckResult::NotFound { suggestions }
+                }
+            }
+        }
+    }
+
+    /// Find similar function names using edit distance
+    fn find_similar_functions(&self, funcs: &[String], name: &str, max: usize) -> Vec<String> {
+        let mut candidates: Vec<(String, usize)> = funcs
+            .iter()
+            .filter_map(|f| {
+                let dist = Self::edit_distance(name, f);
+                // Only consider functions within a reasonable edit distance
+                // Allow more distance for longer function names
+                let max_dist = (name.len() / 3).max(2).min(5);
+                if dist <= max_dist {
+                    Some((f.clone(), dist))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Sort by edit distance (closest first)
+        candidates.sort_by_key(|(_, dist)| *dist);
+
+        // Return top N
+        candidates
+            .into_iter()
+            .take(max)
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Calculate Levenshtein edit distance between two strings
+    fn edit_distance(a: &str, b: &str) -> usize {
+        let a_chars: Vec<char> = a.chars().collect();
+        let b_chars: Vec<char> = b.chars().collect();
+        let a_len = a_chars.len();
+        let b_len = b_chars.len();
+
+        if a_len == 0 {
+            return b_len;
+        }
+        if b_len == 0 {
+            return a_len;
+        }
+
+        // Use two rows instead of full matrix for memory efficiency
+        let mut prev_row: Vec<usize> = (0..=b_len).collect();
+        let mut curr_row: Vec<usize> = vec![0; b_len + 1];
+
+        for (i, a_char) in a_chars.iter().enumerate() {
+            curr_row[0] = i + 1;
+
+            for (j, b_char) in b_chars.iter().enumerate() {
+                let cost = if a_char == b_char { 0 } else { 1 };
+                curr_row[j + 1] = (prev_row[j + 1] + 1) // deletion
+                    .min(curr_row[j] + 1) // insertion
+                    .min(prev_row[j] + cost); // substitution
+            }
+
+            std::mem::swap(&mut prev_row, &mut curr_row);
+        }
+
+        prev_row[b_len]
     }
 
     /// Get the tracepoint context for a given category/name
@@ -376,12 +576,18 @@ impl KernelBtf {
 mod tests {
     use super::*;
 
+    fn make_test_service() -> KernelBtf {
+        KernelBtf {
+            tracefs_events_path: None,
+            available_filter_functions_path: None,
+            tracepoint_cache: RwLock::new(HashMap::new()),
+            function_cache: RwLock::new(None),
+        }
+    }
+
     #[test]
     fn test_parse_field_line() {
-        let service = KernelBtf {
-            tracefs_events_path: None,
-            tracepoint_cache: RwLock::new(HashMap::new()),
-        };
+        let service = make_test_service();
 
         // Test integer field
         let field = service
@@ -417,10 +623,7 @@ mod tests {
 
     #[test]
     fn test_parse_format_file() {
-        let service = KernelBtf {
-            tracefs_events_path: None,
-            tracepoint_cache: RwLock::new(HashMap::new()),
-        };
+        let service = make_test_service();
 
         let content = r#"name: sys_enter_openat
 ID: 633
@@ -462,5 +665,40 @@ format:
         assert_eq!(ctx.category, "syscalls");
         assert!(ctx.has_field("id"));
         assert!(ctx.has_field("args"));
+    }
+
+    #[test]
+    fn test_edit_distance() {
+        // Identical strings
+        assert_eq!(KernelBtf::edit_distance("hello", "hello"), 0);
+
+        // Single character difference
+        assert_eq!(KernelBtf::edit_distance("hello", "hallo"), 1);
+
+        // Typo: transposition-like (two edits in edit distance)
+        assert_eq!(KernelBtf::edit_distance("sys_clone", "sys_claone"), 1);
+
+        // Missing character
+        assert_eq!(KernelBtf::edit_distance("sys_read", "sys_rea"), 1);
+
+        // Extra character
+        assert_eq!(KernelBtf::edit_distance("sys_read", "sys_readd"), 1);
+
+        // Completely different
+        assert!(KernelBtf::edit_distance("sys_read", "do_fork") > 5);
+
+        // Empty strings
+        assert_eq!(KernelBtf::edit_distance("", "abc"), 3);
+        assert_eq!(KernelBtf::edit_distance("abc", ""), 3);
+    }
+
+    #[test]
+    fn test_check_function_graceful_degradation() {
+        let service = make_test_service();
+        // When function list is not available, should return CannotValidate
+        assert_eq!(
+            service.check_function("any_function"),
+            FunctionCheckResult::CannotValidate
+        );
     }
 }

@@ -220,16 +220,53 @@ fn run_attach(
     let stream = call.has_flag(engine_state, stack, "stream")?;
     let pin_group: Option<String> = call.get_flag(engine_state, stack, "pin")?;
 
-    // Parse the probe specification
+    // Parse the probe specification (includes validation)
     let (prog_type, target) =
-        parse_probe_spec(&probe_spec).map_err(|e| ShellError::GenericError {
-            error: "Invalid probe specification".into(),
-            msg: e.to_string(),
-            span: Some(call.head),
-            help: Some(
-                "Use format like 'kprobe:sys_clone', 'tracepoint:syscalls/sys_enter_read', or 'uprobe:/path/to/bin:function'".into(),
-            ),
-            inner: vec![],
+        parse_probe_spec(&probe_spec).map_err(|e| match &e {
+            crate::loader::LoadError::FunctionNotFound { name, suggestions } => {
+                let help = if suggestions.is_empty() {
+                    format!("Check the function name. Use 'sudo cat /sys/kernel/tracing/available_filter_functions | grep {name}' to find available functions.")
+                } else {
+                    format!("Did you mean: {}?", suggestions.join(", "))
+                };
+                ShellError::GenericError {
+                    error: format!("Kernel function '{}' not found", name),
+                    msg: "This function is not available for probing".into(),
+                    span: Some(call.head),
+                    help: Some(help),
+                    inner: vec![],
+                }
+            }
+            crate::loader::LoadError::TracepointNotFound { category, name } => {
+                ShellError::GenericError {
+                    error: format!("Tracepoint '{}/{}' not found", category, name),
+                    msg: "This tracepoint does not exist".into(),
+                    span: Some(call.head),
+                    help: Some(format!(
+                        "Use 'sudo ls /sys/kernel/tracing/events/{}' to see available tracepoints in this category",
+                        category
+                    )),
+                    inner: vec![],
+                }
+            }
+            crate::loader::LoadError::NeedsSudo => {
+                ShellError::GenericError {
+                    error: "Elevated privileges required".into(),
+                    msg: "eBPF operations require root or CAP_BPF capability".into(),
+                    span: Some(call.head),
+                    help: Some("Run nushell with sudo: sudo nu".into()),
+                    inner: vec![],
+                }
+            }
+            _ => ShellError::GenericError {
+                error: "Invalid probe specification".into(),
+                msg: e.to_string(),
+                span: Some(call.head),
+                help: Some(
+                    "Use format like 'kprobe:sys_clone', 'tracepoint:syscalls/sys_enter_read', or 'uprobe:/path/to/bin:function'".into(),
+                ),
+                inner: vec![],
+            },
         })?;
 
     // Create probe context for the compiler

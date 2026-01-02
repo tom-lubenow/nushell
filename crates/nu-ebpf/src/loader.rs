@@ -16,6 +16,7 @@ use bytes::BytesMut;
 use thiserror::Error;
 
 use crate::compiler::{BpfFieldType, CompileError, EbpfProgram, EbpfProgramType, EventSchema};
+use crate::kernel_btf::{FunctionCheckResult, KernelBtf};
 
 /// Errors that can occur during eBPF loading
 #[derive(Debug, Error)]
@@ -43,6 +44,18 @@ pub enum LoadError {
 
     #[error("Perf buffer error: {0}")]
     PerfBuffer(String),
+
+    #[error("Function not found: {name}")]
+    FunctionNotFound {
+        name: String,
+        suggestions: Vec<String>,
+    },
+
+    #[error("Tracepoint not found: {category}/{name}")]
+    TracepointNotFound { category: String, name: String },
+
+    #[error("Elevated privileges required")]
+    NeedsSudo,
 }
 
 /// Parsed uprobe/uretprobe target information
@@ -708,6 +721,58 @@ pub fn get_state() -> Arc<EbpfState> {
         .clone()
 }
 
+/// Validate a kprobe/kretprobe target function exists
+///
+/// If the function doesn't exist, returns an error with suggestions for similar function names.
+/// If elevated privileges are needed to validate, returns NeedsSudo error.
+fn validate_kprobe_target(func_name: &str) -> Result<(), LoadError> {
+    let btf = KernelBtf::get();
+
+    match btf.check_function(func_name) {
+        FunctionCheckResult::Exists => Ok(()),
+        FunctionCheckResult::NotFound { suggestions } => Err(LoadError::FunctionNotFound {
+            name: func_name.to_string(),
+            suggestions,
+        }),
+        FunctionCheckResult::NeedsSudo => Err(LoadError::NeedsSudo),
+        FunctionCheckResult::CannotValidate => {
+            // Can't validate - allow the attempt, kernel will reject if invalid
+            Ok(())
+        }
+    }
+}
+
+/// Validate a tracepoint target exists
+///
+/// Tracepoint format: category/name (e.g., syscalls/sys_enter_openat)
+fn validate_tracepoint_target(target: &str) -> Result<(), LoadError> {
+    let btf = KernelBtf::get();
+
+    // If we can't validate (no tracefs), allow the attempt
+    if !btf.has_tracefs() {
+        return Ok(());
+    }
+
+    // Parse category/name
+    let parts: Vec<&str> = target.splitn(2, '/').collect();
+    if parts.len() != 2 {
+        return Err(LoadError::Load(format!(
+            "Invalid tracepoint format: {target}. Expected: category/name (e.g., syscalls/sys_enter_openat)"
+        )));
+    }
+
+    let (category, name) = (parts[0], parts[1]);
+
+    if btf.tracepoint_exists(category, name) {
+        return Ok(());
+    }
+
+    Err(LoadError::TracepointNotFound {
+        category: category.to_string(),
+        name: name.to_string(),
+    })
+}
+
 /// Parse a probe specification like "kprobe:sys_clone" or "tracepoint:syscalls/sys_enter_read"
 ///
 /// Supported formats:
@@ -740,10 +805,24 @@ pub fn parse_probe_spec(spec: &str) -> Result<(EbpfProgramType, String), LoadErr
         )));
     }
 
+    let target = parts[1];
+
     let prog_type = match parts[0] {
-        "kprobe" => EbpfProgramType::Kprobe,
-        "kretprobe" => EbpfProgramType::Kretprobe,
-        "tracepoint" => EbpfProgramType::Tracepoint,
+        "kprobe" => {
+            // Validate function exists
+            validate_kprobe_target(target)?;
+            EbpfProgramType::Kprobe
+        }
+        "kretprobe" => {
+            // Validate function exists
+            validate_kprobe_target(target)?;
+            EbpfProgramType::Kretprobe
+        }
+        "tracepoint" => {
+            // Validate tracepoint exists
+            validate_tracepoint_target(target)?;
+            EbpfProgramType::Tracepoint
+        }
         "raw_tracepoint" | "raw_tp" => EbpfProgramType::RawTracepoint,
         other => {
             return Err(LoadError::Load(format!(
@@ -752,7 +831,7 @@ pub fn parse_probe_spec(spec: &str) -> Result<(EbpfProgramType, String), LoadErr
         }
     };
 
-    Ok((prog_type, parts[1].to_string()))
+    Ok((prog_type, target.to_string()))
 }
 
 #[cfg(test)]
@@ -832,8 +911,20 @@ mod tests {
 
     #[test]
     fn test_parse_probe_spec_kprobe_unchanged() {
-        let (prog_type, target) = parse_probe_spec("kprobe:sys_clone").unwrap();
-        assert!(matches!(prog_type, EbpfProgramType::Kprobe));
-        assert_eq!(target, "sys_clone");
+        // This test may fail with NeedsSudo if running without root
+        // That's expected - we're testing the parsing, not the permissions
+        let result = parse_probe_spec("kprobe:sys_clone");
+
+        match result {
+            Ok((prog_type, target)) => {
+                assert!(matches!(prog_type, EbpfProgramType::Kprobe));
+                assert_eq!(target, "sys_clone");
+            }
+            Err(LoadError::NeedsSudo) => {
+                // Expected when running tests without root - validation correctly detected
+                // that we don't have permission to read the function list
+            }
+            Err(e) => panic!("Unexpected error: {:?}", e),
+        }
     }
 }

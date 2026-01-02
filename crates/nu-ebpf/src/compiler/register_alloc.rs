@@ -26,7 +26,6 @@ pub enum ValueKey {
     Var(usize),
 }
 
-
 /// Action needed when accessing a register
 #[derive(Debug)]
 pub enum RegAction {
@@ -40,10 +39,7 @@ pub enum AllocAction {
     /// Register is free, just use it
     Free(EbpfReg),
     /// Need to spill this value first, then use the register
-    Spill {
-        reg: EbpfReg,
-        victim_key: ValueKey,
-    },
+    Spill { reg: EbpfReg, victim_key: ValueKey },
 }
 
 /// Maps Nushell register IDs to eBPF registers with spilling support

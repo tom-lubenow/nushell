@@ -11,11 +11,11 @@ use nu_protocol::{DeclId, RegId, VarId};
 
 use super::CompileError;
 use super::elf::{BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext};
-use crate::kernel_btf::KernelBtf;
 use super::helpers::{AggregationHelpers, OutputHelpers, TimingHelpers};
 use super::instruction::{BpfHelper, EbpfBuilder, EbpfInsn, EbpfReg, opcode};
 use super::ir_ops::IrOps;
 use super::register_alloc::{AllocAction, RegAction, RegisterAllocator, ValueKey};
+use crate::kernel_btf::KernelBtf;
 
 /// Result of compiling IR to eBPF
 pub struct CompileResult {
@@ -238,13 +238,8 @@ impl<'a> IrToEbpfCompiler<'a> {
     /// Compile without engine state (for tests, will fail on Call instructions)
     #[cfg(test)]
     pub fn compile_no_calls(ir_block: &'a IrBlock) -> Result<Vec<u8>, CompileError> {
-        let result = Self::compile_inner(
-            ir_block,
-            None,
-            None,
-            &[],
-            ProbeContext::default_for_tests(),
-        )?;
+        let result =
+            Self::compile_inner(ir_block, None, None, &[], ProbeContext::default_for_tests())?;
         Ok(result.bytecode)
     }
 
@@ -996,8 +991,11 @@ impl<'a> IrToEbpfCompiler<'a> {
                     // Copy first 8 bytes
                     self.builder
                         .push(EbpfInsn::ldxdw(EbpfReg::R0, EbpfReg::R10, src_offset));
-                    self.builder
-                        .push(EbpfInsn::stxdw(EbpfReg::R10, field_stack_offset, EbpfReg::R0));
+                    self.builder.push(EbpfInsn::stxdw(
+                        EbpfReg::R10,
+                        field_stack_offset,
+                        EbpfReg::R0,
+                    ));
                     // Copy second 8 bytes
                     self.builder
                         .push(EbpfInsn::ldxdw(EbpfReg::R0, EbpfReg::R10, src_offset + 8));
@@ -1135,21 +1133,21 @@ impl<'a> IrToEbpfCompiler<'a> {
         })?;
 
         let btf = KernelBtf::get();
-        let ctx = btf
-            .get_tracepoint_context(category, name)
-            .map_err(|e| CompileError::TracepointContextError {
+        let ctx = btf.get_tracepoint_context(category, name).map_err(|e| {
+            CompileError::TracepointContextError {
                 category: category.into(),
                 name: name.into(),
                 reason: e.to_string(),
-            })?;
-
-        // Look up the field in the tracepoint context
-        let field_info = ctx.get_field(field_name).ok_or_else(|| {
-            CompileError::TracepointFieldNotFound {
-                field: field_name.into(),
-                available: ctx.field_names().join(", "),
             }
         })?;
+
+        // Look up the field in the tracepoint context
+        let field_info =
+            ctx.get_field(field_name)
+                .ok_or_else(|| CompileError::TracepointFieldNotFound {
+                    field: field_name.into(),
+                    available: ctx.field_names().join(", "),
+                })?;
 
         // Load the field from the context struct
         // R9 contains the saved context pointer (tracepoint context struct)

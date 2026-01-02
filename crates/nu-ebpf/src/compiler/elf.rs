@@ -216,10 +216,7 @@ impl EbpfProgramType {
 
     /// Returns true if this is a userspace probe (uprobe or uretprobe)
     pub fn is_userspace(&self) -> bool {
-        matches!(
-            self,
-            EbpfProgramType::Uprobe | EbpfProgramType::Uretprobe
-        )
+        matches!(self, EbpfProgramType::Uprobe | EbpfProgramType::Uretprobe)
     }
 }
 

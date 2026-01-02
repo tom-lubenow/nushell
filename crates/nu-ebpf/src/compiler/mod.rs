@@ -6,6 +6,7 @@ mod btf;
 mod elf;
 mod helpers;
 pub mod instruction;
+mod ir_ops;
 mod ir_to_ebpf;
 mod register_alloc;
 

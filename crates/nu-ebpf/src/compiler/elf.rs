@@ -27,6 +27,16 @@ pub enum BpfMapType {
     RingBuf = 27,
 }
 
+/// Pinning type for BPF maps (libbpf convention)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum BpfPinningType {
+    /// No pinning - map is private to this program
+    None = 0,
+    /// Pin by name - maps with same name share data across programs
+    ByName = 1,
+}
+
 /// Definition of a BPF map (legacy format for libbpf/Aya compatibility)
 #[derive(Debug, Clone)]
 #[repr(C)]
@@ -36,6 +46,8 @@ pub struct BpfMapDef {
     pub value_size: u32,
     pub max_entries: u32,
     pub map_flags: u32,
+    /// Pinning type - set to ByName for shared maps between programs
+    pub pinning: BpfPinningType,
 }
 
 impl BpfMapDef {
@@ -47,6 +59,7 @@ impl BpfMapDef {
             value_size: 4,  // sizeof(u32) - perf event fd
             max_entries: 0, // Will be set to num_cpus by loader
             map_flags: 0,
+            pinning: BpfPinningType::None,
         }
     }
 
@@ -58,6 +71,7 @@ impl BpfMapDef {
             value_size: 8,      // sizeof(i64) - the count
             max_entries: 10240, // Maximum number of unique keys
             map_flags: 0,
+            pinning: BpfPinningType::None,
         }
     }
 
@@ -69,6 +83,7 @@ impl BpfMapDef {
             value_size: 8,      // sizeof(i64) - timestamp in nanoseconds
             max_entries: 10240, // Maximum concurrent traced threads
             map_flags: 0,
+            pinning: BpfPinningType::None,
         }
     }
 
@@ -80,17 +95,25 @@ impl BpfMapDef {
             value_size: 8,   // sizeof(i64) - count
             max_entries: 64, // 64 buckets covers 0 to 2^63
             map_flags: 0,
+            pinning: BpfPinningType::None,
         }
+    }
+
+    /// Enable pinning for this map (allows sharing between programs)
+    pub fn with_pinning(mut self) -> Self {
+        self.pinning = BpfPinningType::ByName;
+        self
     }
 
     /// Serialize to bytes (little-endian)
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(20);
+        let mut bytes = Vec::with_capacity(24);
         bytes.extend_from_slice(&self.map_type.to_le_bytes());
         bytes.extend_from_slice(&self.key_size.to_le_bytes());
         bytes.extend_from_slice(&self.value_size.to_le_bytes());
         bytes.extend_from_slice(&self.max_entries.to_le_bytes());
         bytes.extend_from_slice(&self.map_flags.to_le_bytes());
+        bytes.extend_from_slice(&(self.pinning as u32).to_le_bytes());
         bytes
     }
 }
@@ -266,6 +289,19 @@ impl EbpfProgram {
         }
     }
 
+    /// Enable pinning on all maps in this program
+    ///
+    /// When pinning is enabled, maps will be pinned to the BPF filesystem
+    /// and can be shared between separate eBPF programs. This is required
+    /// for latency measurement using start-timer/stop-timer across
+    /// kprobe/kretprobe pairs.
+    pub fn with_pinning(mut self) -> Self {
+        for map in &mut self.maps {
+            map.def.pinning = BpfPinningType::ByName;
+        }
+        self
+    }
+
     /// Create a simple "hello world" kprobe that just returns 0
     ///
     /// This is useful for testing the loading infrastructure.
@@ -306,12 +342,13 @@ impl EbpfProgram {
                 sh_flags: object::elf::SHF_ALLOC as u64 | object::elf::SHF_WRITE as u64,
             };
 
-            // BTF-defined maps use a struct with pointer-sized fields (32 bytes per map)
-            let btf_map_size = 32u64;
+            // BTF-defined maps use a struct with pointer-sized fields (40 bytes per map)
+            // Fields: type, key_size, value_size, max_entries, pinning (5 pointers * 8 bytes)
+            let btf_map_size = 40u64;
 
             for map in &self.maps {
                 // BTF-defined map data is all zeros (values come from BTF type metadata)
-                let map_data = [0u8; 32];
+                let map_data = [0u8; 40];
                 let map_offset = obj.append_section_data(maps_section_id, &map_data, 8);
 
                 // Add a symbol for this map (must be GLOBAL with DEFAULT visibility for libbpf/Aya)
@@ -444,19 +481,23 @@ impl EbpfProgram {
             // Note: 0 means auto-size (e.g., num_cpus for perf event arrays)
             let max_entries_ptr = btf.add_uint_type(int_type, map.def.max_entries);
 
+            // pinning field: __uint(pinning, LIBBPF_PIN_BY_NAME) for shared maps
+            let pinning_ptr = btf.add_uint_type(int_type, map.def.pinning as u32);
+
             // Create the anonymous map struct with pointer-sized members
             let struct_type = btf.add_btf_map_struct(&[
                 ("type", type_ptr),
                 ("key_size", key_size_ptr),
                 ("value_size", value_size_ptr),
                 ("max_entries", max_entries_ptr),
+                ("pinning", pinning_ptr),
             ]);
 
             // Add a variable for this map
             let var_type = btf.add_var(&map.name, struct_type, BtfVarLinkage::GlobalAlloc);
 
-            // Size of BTF-defined map struct (4 pointers * 8 bytes = 32 bytes)
-            let map_size = 32u32;
+            // Size of BTF-defined map struct (5 pointers * 8 bytes = 40 bytes)
+            let map_size = 40u32;
             vars.push((var_type, offset, map_size));
             offset += map_size;
         }
@@ -476,9 +517,9 @@ impl EbpfProgram {
         let mut data = Vec::new();
 
         for _map in &self.maps {
-            // BTF-defined map struct has 4 pointer fields = 32 bytes
+            // BTF-defined map struct has 5 pointer fields = 40 bytes
             // All zeros - actual values are encoded in BTF type metadata
-            data.extend_from_slice(&[0u8; 32]);
+            data.extend_from_slice(&[0u8; 40]);
         }
 
         data

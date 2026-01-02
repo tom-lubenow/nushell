@@ -63,10 +63,9 @@ pub use attach::EbpfAttach;
 pub use counters::EbpfCounters;
 pub use detach::EbpfDetach;
 pub use events::EbpfEvents;
+// Short-named helper commands (preferred)
 pub use helpers::{
-    BpfArg, BpfComm, BpfCount, BpfEmit, BpfEmitComm, BpfFilterComm, BpfFilterPid, BpfHistogram,
-    BpfKtime, BpfPid, BpfReadStr, BpfReadUserStr, BpfRetval, BpfStartTimer, BpfStopTimer, BpfTgid,
-    BpfUid,
+    Count, Emit, EmitComm, Histogram, ReadStr, ReadUserStr, StartTimer, StopTimer,
 };
 pub use histogram::EbpfHistogram;
 pub use list::EbpfList;
@@ -77,6 +76,7 @@ use nu_protocol::engine::Command;
 /// Get all eBPF commands
 pub fn commands() -> Vec<Box<dyn Command>> {
     vec![
+        // Main eBPF management commands
         Box::new(EbpfAttach),
         Box::new(EbpfCounters),
         Box::new(EbpfDetach),
@@ -84,23 +84,16 @@ pub fn commands() -> Vec<Box<dyn Command>> {
         Box::new(EbpfHistogram),
         Box::new(EbpfList),
         Box::new(EbpfTrace),
-        // BPF helper commands (usable in closures)
-        Box::new(BpfPid),
-        Box::new(BpfTgid),
-        Box::new(BpfUid),
-        Box::new(BpfKtime),
-        Box::new(BpfComm),
-        Box::new(BpfArg),
-        Box::new(BpfRetval),
-        Box::new(BpfReadStr),
-        Box::new(BpfReadUserStr),
-        Box::new(BpfCount),
-        Box::new(BpfEmit),
-        Box::new(BpfEmitComm),
-        Box::new(BpfFilterPid),
-        Box::new(BpfFilterComm),
-        Box::new(BpfStartTimer),
-        Box::new(BpfStopTimer),
-        Box::new(BpfHistogram),
+        // Helper commands for use in eBPF closures
+        // Use context parameter syntax for data: {|ctx| $ctx.pid | emit }
+        // Use if expressions for filtering: {|ctx| if $ctx.pid == 1234 { ... } }
+        Box::new(Emit),
+        Box::new(EmitComm),
+        Box::new(Count),
+        Box::new(Histogram),
+        Box::new(StartTimer),
+        Box::new(StopTimer),
+        Box::new(ReadStr),
+        Box::new(ReadUserStr),
     ]
 }

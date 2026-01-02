@@ -4,8 +4,9 @@
 
 use std::collections::HashMap;
 
+use nu_protocol::ast::{Block, CellPath, PathMember};
 use nu_protocol::engine::EngineState;
-use nu_protocol::ir::{Instruction, IrBlock};
+use nu_protocol::ir::{Instruction, IrBlock, Literal};
 use nu_protocol::{DeclId, RegId, VarId};
 
 use super::CompileError;
@@ -167,6 +168,18 @@ pub struct IrToEbpfCompiler<'a> {
     label_positions: HashMap<usize, usize>,
     /// Next available label ID
     next_label: usize,
+    /// The VarId of the closure's context parameter (if any)
+    /// When a closure like `{|ctx| $ctx.pid }` is compiled, this tracks which VarId is `ctx`
+    context_param_var_id: Option<VarId>,
+    /// Track which registers currently hold the context variable
+    /// This allows us to intercept field access like `$ctx.pid`
+    context_registers: HashMap<u32, bool>,
+    /// Track cell path literals loaded into registers
+    literal_cell_paths: HashMap<u32, CellPath>,
+    /// Captured variable values from the closure (for compile-time constant inlining)
+    /// When a closure captures a variable like `let pid = 1234; {|| $pid }`,
+    /// we can inline the value as a constant in the eBPF bytecode.
+    captured_values: HashMap<usize, i64>,
 }
 
 impl<'a> IrToEbpfCompiler<'a> {
@@ -184,25 +197,71 @@ impl<'a> IrToEbpfCompiler<'a> {
         ir_block: &'a IrBlock,
         engine_state: &'a EngineState,
     ) -> Result<CompileResult, CompileError> {
-        Self::compile_inner(ir_block, Some(engine_state))
+        Self::compile_inner(ir_block, Some(engine_state), None, &[])
+    }
+
+    /// Compile an IrBlock with Block metadata for closure parameter support
+    ///
+    /// When compiling a closure like `{|ctx| $ctx.pid }`, pass the Block
+    /// so we can detect the context parameter and map field access to BPF helpers.
+    ///
+    /// The `captures` parameter allows inlining captured integer variables as constants.
+    /// For example, `let pid = 1234; {|| $pid | emit }` will inline 1234.
+    pub fn compile_with_block(
+        ir_block: &'a IrBlock,
+        engine_state: &'a EngineState,
+        block: &Block,
+    ) -> Result<CompileResult, CompileError> {
+        Self::compile_inner(ir_block, Some(engine_state), Some(block), &[])
+    }
+
+    /// Compile an IrBlock with Block metadata and closure captures
+    ///
+    /// This is the full version that supports capturing variables from outer scope.
+    pub fn compile_with_captures(
+        ir_block: &'a IrBlock,
+        engine_state: &'a EngineState,
+        block: &Block,
+        captures: &[(VarId, nu_protocol::Value)],
+    ) -> Result<CompileResult, CompileError> {
+        Self::compile_inner(ir_block, Some(engine_state), Some(block), captures)
     }
 
     /// Compile without engine state (for tests, will fail on Call instructions)
     #[cfg(test)]
     pub fn compile_no_calls(ir_block: &'a IrBlock) -> Result<Vec<u8>, CompileError> {
-        let result = Self::compile_inner(ir_block, None)?;
+        let result = Self::compile_inner(ir_block, None, None, &[])?;
         Ok(result.bytecode)
     }
 
     fn compile_inner(
         ir_block: &'a IrBlock,
         engine_state: Option<&'a EngineState>,
+        block: Option<&Block>,
+        captures: &[(VarId, nu_protocol::Value)],
     ) -> Result<CompileResult, CompileError> {
         // Create a dummy engine state for when we don't have one
         // This will only be accessed if there's a Call instruction
         static DUMMY: std::sync::OnceLock<EngineState> = std::sync::OnceLock::new();
         let dummy_state = DUMMY.get_or_init(EngineState::new);
         let engine_state = engine_state.unwrap_or(dummy_state);
+
+        // Extract the context parameter VarId from the block's signature
+        // For closures like `{|ctx| $ctx.pid }`, this is the VarId of `ctx`
+        let context_param_var_id = block.and_then(|b| {
+            b.signature
+                .required_positional
+                .first()
+                .and_then(|arg| arg.var_id)
+        });
+
+        // Extract integer values from captures for compile-time constant inlining
+        let mut captured_values = HashMap::new();
+        for (var_id, value) in captures {
+            if let nu_protocol::Value::Int { val, .. } = value {
+                captured_values.insert(var_id.get(), *val);
+            }
+        }
 
         let mut compiler = IrToEbpfCompiler {
             ir_block,
@@ -227,6 +286,10 @@ impl<'a> IrToEbpfCompiler<'a> {
             pending_internal_jumps: Vec::new(),
             label_positions: HashMap::new(),
             next_label: 0,
+            context_param_var_id,
+            context_registers: HashMap::new(),
+            literal_cell_paths: HashMap::new(),
+            captured_values,
         };
 
         // Save the context pointer (R1) to R9 at the start
@@ -236,6 +299,14 @@ impl<'a> IrToEbpfCompiler<'a> {
             .builder
             .push(EbpfInsn::mov64_reg(EbpfReg::R9, EbpfReg::R1));
         compiler.ctx_saved = true;
+
+        // Pre-initialize callee-saved registers R6-R8 to 0
+        // This ensures all registers have known values on all execution paths,
+        // which is required by the BPF verifier. Without this, short-circuit
+        // evaluation (like `or`) can leave registers uninitialized on some paths.
+        compiler.builder.push(EbpfInsn::mov64_imm(EbpfReg::R6, 0));
+        compiler.builder.push(EbpfInsn::mov64_imm(EbpfReg::R7, 0));
+        compiler.builder.push(EbpfInsn::mov64_imm(EbpfReg::R8, 0));
 
         // Compile each instruction, tracking IR->eBPF index mapping
         for (idx, instr) in ir_block.instructions.iter().enumerate() {
@@ -486,6 +557,43 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.literal_strings.insert(reg.get(), value);
     }
 
+    /// Set a literal cell path for a register
+    pub(crate) fn set_literal_cell_path(&mut self, reg: RegId, path: CellPath) {
+        self.literal_cell_paths.insert(reg.get(), path);
+    }
+
+    /// Get a literal cell path for a register
+    pub(crate) fn get_literal_cell_path(&self, reg: RegId) -> Option<&CellPath> {
+        self.literal_cell_paths.get(&reg.get())
+    }
+
+    /// Get a captured variable value (from closure captures)
+    ///
+    /// This allows inlining captured integer variables as compile-time constants.
+    /// For example, `let pid = 1234; {|| $pid }` will return Some(1234) for $pid's VarId.
+    pub(crate) fn get_captured_value(&self, var_id: VarId) -> Option<i64> {
+        self.captured_values.get(&var_id.get()).copied()
+    }
+
+    /// Check if a VarId is the context parameter
+    pub(crate) fn is_context_param(&self, var_id: VarId) -> bool {
+        self.context_param_var_id == Some(var_id)
+    }
+
+    /// Mark a register as containing the context variable
+    pub(crate) fn set_context_register(&mut self, reg: RegId, is_context: bool) {
+        if is_context {
+            self.context_registers.insert(reg.get(), true);
+        } else {
+            self.context_registers.remove(&reg.get());
+        }
+    }
+
+    /// Check if a register contains the context variable
+    pub(crate) fn is_context_register(&self, reg: RegId) -> bool {
+        self.context_registers.get(&reg.get()).copied().unwrap_or(false)
+    }
+
     /// Get a slice of the IR block's data buffer
     pub(crate) fn get_data_slice(&self, start: usize, len: usize) -> &[u8] {
         &self.ir_block.data[start..start + len]
@@ -644,6 +752,9 @@ impl<'a> IrToEbpfCompiler<'a> {
             // Control flow (local methods)
             Instruction::BranchIf { cond, index } => self.compile_branch_if(*cond, *index as usize),
             Instruction::Jump { index } => self.compile_jump(*index as usize),
+            Instruction::Match { pattern, src, index } => {
+                self.compile_match(pattern, *src, *index as usize)
+            }
 
             // Command calls (dispatches to helper traits)
             Instruction::Call { decl_id, src_dst } => self.compile_call(*decl_id, *src_dst),
@@ -667,39 +778,53 @@ impl<'a> IrToEbpfCompiler<'a> {
                 self.compile_record_insert(*src_dst, *key, *val)
             }
 
+            // Cell path access (for context parameter field access like $ctx.pid)
+            Instruction::FollowCellPath { src_dst, path } => {
+                self.compile_follow_cell_path(*src_dst, *path)
+            }
+
             // Unsupported instructions
             other => Err(CompileError::UnsupportedInstruction(format!("{:?}", other))),
         }
     }
 
     /// Compile conditional branch (branch if cond is truthy)
+    ///
+    /// For filter-style `if` expressions (if without else), when the condition
+    /// is false we exit the eBPF program early with 0. This implements
+    /// kernel-side filtering.
+    ///
+    /// Note: Nushell's IR uses `not` before `branch-if`, so:
+    /// - cond == 0 means the ORIGINAL condition was TRUE (execute true block)
+    /// - cond != 0 means the ORIGINAL condition was FALSE (would jump to else/skip)
     fn compile_branch_if(&mut self, cond: RegId, target_ir_idx: usize) -> Result<(), CompileError> {
         let ebpf_cond = self.ensure_reg(cond)?;
 
-        // Branch if cond != 0
-        // We'll use JNE with imm=0, but eBPF JNE with imm requires BPF_K
-        // Actually we need to compare against 0 - if non-zero, jump
-        // Use: jeq cond, 0, +1; ja target
-        // If cond == 0, skip the jump. Otherwise, jump.
-        // But we want to jump if truthy, so:
-        // jne cond, 0, target (jump if cond != 0)
+        // Nushell's `if` IR pattern is:
+        //   compare -> not -> branch-if
+        // So branch-if's cond is the INVERTED comparison result:
+        // - cond == 0: original condition TRUE, execute the if-body
+        // - cond != 0: original condition FALSE, skip to else/end
+        //
+        // For filtering, when original condition is FALSE, we exit early.
+        // So we exit when cond != 0.
 
-        // eBPF doesn't have JNE with immediate in all verifiers, use JEQ to skip
-        // Actually it does: BPF_JMP | BPF_JNE | BPF_K
-        let jump_idx = self.builder.len();
+        // Jump over the early exit if cond == 0 (original condition TRUE)
         self.builder.push(EbpfInsn::new(
-            opcode::BPF_JMP | opcode::BPF_JNE | opcode::BPF_K,
+            opcode::BPF_JMP | opcode::BPF_JEQ | opcode::BPF_K, // JEQ instead of JNE
             ebpf_cond.as_u8(),
             0,
-            0, // Placeholder offset - will be fixed up
+            2, // Skip 2 instructions (mov + exit)
             0, // Compare against 0
         ));
 
-        // Record this jump for fixup
-        self.pending_jumps.push(PendingJump {
-            ebpf_insn_idx: jump_idx,
-            target_ir_idx,
-        });
+        // Early exit when cond != 0 (original condition FALSE, filter didn't match)
+        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
+        self.builder.push(EbpfInsn::exit());
+
+        // No pending jump needed - we've hardcoded the offset and handled the false path
+        // The true block follows immediately after the early exit
+        let _ = target_ir_idx; // Silence unused warning
 
         Ok(())
     }
@@ -718,6 +843,70 @@ impl<'a> IrToEbpfCompiler<'a> {
         Ok(())
     }
 
+    /// Compile pattern match (for short-circuit boolean evaluation)
+    ///
+    /// This is used by `and` and `or` operators for short-circuit evaluation:
+    /// - `and`: generates `match (false), src, target` - jump if src is false
+    /// - `or`: generates `match (true), src, target` - jump if src is true
+    fn compile_match(
+        &mut self,
+        pattern: &nu_protocol::ast::Pattern,
+        src: RegId,
+        target_ir_idx: usize,
+    ) -> Result<(), CompileError> {
+        use nu_protocol::ast::Pattern;
+
+        let ebpf_src = self.ensure_reg(src)?;
+
+        match pattern {
+            Pattern::Value(value) => {
+                if let nu_protocol::Value::Bool { val, .. } = value {
+                    // For boolean short-circuit:
+                    // - match (false), src, target: if src == 0, jump to target
+                    // - match (true), src, target: if src != 0, jump to target
+                    let jump_idx = self.builder.len();
+
+                    if *val {
+                        // Pattern is `true` - jump if src != 0
+                        self.builder.push(EbpfInsn::new(
+                            opcode::BPF_JMP | opcode::BPF_JNE | opcode::BPF_K,
+                            ebpf_src.as_u8(),
+                            0,
+                            0, // Placeholder offset
+                            0, // Compare against 0
+                        ));
+                    } else {
+                        // Pattern is `false` - jump if src == 0
+                        self.builder.push(EbpfInsn::new(
+                            opcode::BPF_JMP | opcode::BPF_JEQ | opcode::BPF_K,
+                            ebpf_src.as_u8(),
+                            0,
+                            0, // Placeholder offset
+                            0, // Compare against 0
+                        ));
+                    }
+
+                    // Record this jump for fixup
+                    self.pending_jumps.push(PendingJump {
+                        ebpf_insn_idx: jump_idx,
+                        target_ir_idx,
+                    });
+
+                    Ok(())
+                } else {
+                    Err(CompileError::UnsupportedInstruction(format!(
+                        "Match with non-boolean pattern value: {:?}",
+                        value
+                    )))
+                }
+            }
+            _ => Err(CompileError::UnsupportedInstruction(format!(
+                "Match with unsupported pattern type: {:?}",
+                pattern
+            ))),
+        }
+    }
+
     /// Compile a command call - maps known commands to BPF helpers
     ///
     /// This dispatches to the appropriate helper trait method based on command name.
@@ -727,8 +916,11 @@ impl<'a> IrToEbpfCompiler<'a> {
         let cmd_name = decl.name();
 
         // Map known commands to BPF helpers (via extension traits)
+        // Data commands are kept for backwards compatibility but context parameter
+        // syntax ({|ctx| $ctx.pid}) is now the recommended approach.
         match cmd_name {
-            // Data helpers (DataHelpers trait)
+            // Data helpers - deprecated in favor of context parameter syntax
+            // Use {|ctx| $ctx.pid } instead of {|| bpf-pid }
             "bpf-pid" | "bpf pid" => DataHelpers::compile_bpf_pid(self, src_dst),
             "bpf-tgid" | "bpf tgid" => DataHelpers::compile_bpf_tgid(self, src_dst),
             "bpf-uid" | "bpf uid" => DataHelpers::compile_bpf_uid(self, src_dst),
@@ -737,31 +929,35 @@ impl<'a> IrToEbpfCompiler<'a> {
             "bpf-arg" | "bpf arg" => DataHelpers::compile_bpf_arg(self, src_dst),
             "bpf-retval" | "bpf retval" => DataHelpers::compile_bpf_retval(self, src_dst),
 
-            // Output helpers (OutputHelpers trait)
-            "bpf-emit" | "bpf emit" => OutputHelpers::compile_bpf_emit(self, src_dst),
-            "bpf-emit-comm" | "bpf emit-comm" => OutputHelpers::compile_bpf_emit_comm(self, src_dst),
-            "bpf-read-str" | "bpf read-str" => {
+            // Output helpers - short names are preferred
+            "emit" | "bpf-emit" | "bpf emit" => OutputHelpers::compile_bpf_emit(self, src_dst),
+            "emit-comm" | "bpf-emit-comm" | "bpf emit-comm" => {
+                OutputHelpers::compile_bpf_emit_comm(self, src_dst)
+            }
+            "read-str" | "bpf-read-str" | "bpf read-str" => {
                 OutputHelpers::compile_bpf_read_str(self, src_dst, false)
             }
-            "bpf-read-user-str" | "bpf read-user-str" => {
+            "read-user-str" | "bpf-read-user-str" | "bpf read-user-str" => {
                 OutputHelpers::compile_bpf_read_str(self, src_dst, true)
             }
 
-            // Aggregation helpers (AggregationHelpers trait)
-            "bpf-count" | "bpf count" => AggregationHelpers::compile_bpf_count(self, src_dst),
-            "bpf-histogram" | "bpf histogram" => {
+            // Aggregation helpers - short names are preferred
+            "count" | "bpf-count" | "bpf count" => {
+                AggregationHelpers::compile_bpf_count(self, src_dst)
+            }
+            "histogram" | "bpf-histogram" | "bpf histogram" => {
                 AggregationHelpers::compile_bpf_histogram(self, src_dst)
             }
 
-            // Timing helpers (TimingHelpers trait)
-            "bpf-start-timer" | "bpf start-timer" => {
+            // Timing helpers - short names are preferred
+            "start-timer" | "bpf-start-timer" | "bpf start-timer" => {
                 TimingHelpers::compile_bpf_start_timer(self, src_dst)
             }
-            "bpf-stop-timer" | "bpf stop-timer" => {
+            "stop-timer" | "bpf-stop-timer" | "bpf stop-timer" => {
                 TimingHelpers::compile_bpf_stop_timer(self, src_dst)
             }
 
-            // Filter helpers (FilterHelpers trait)
+            // Filter helpers - will be replaced by 'where' in future
             "bpf-filter-pid" | "bpf filter-pid" => FilterHelpers::compile_bpf_filter_pid(self),
             "bpf-filter-comm" | "bpf filter-comm" => FilterHelpers::compile_bpf_filter_comm(self),
 
@@ -863,6 +1059,138 @@ impl<'a> IrToEbpfCompiler<'a> {
             stack_offset: field_stack_offset,
             field_type,
         });
+
+        Ok(())
+    }
+
+    /// Compile FollowCellPath - access a field on a value
+    ///
+    /// For context parameter access like `$ctx.pid`, this maps field names
+    /// to the appropriate BPF helper calls.
+    fn compile_follow_cell_path(
+        &mut self,
+        src_dst: RegId,
+        path_reg: RegId,
+    ) -> Result<(), CompileError> {
+        // Check if this is accessing a field on the context parameter
+        if !self.is_context_register(src_dst) {
+            return Err(CompileError::UnsupportedInstruction(
+                "FollowCellPath on non-context value not supported".into(),
+            ));
+        }
+
+        // Get the cell path to find the field name
+        let cell_path = self.get_literal_cell_path(path_reg).cloned().ok_or_else(|| {
+            CompileError::UnsupportedInstruction("Cell path literal not found".into())
+        })?;
+
+        // We only support single-level field access like $ctx.pid
+        if cell_path.members.len() != 1 {
+            return Err(CompileError::UnsupportedInstruction(format!(
+                "Multi-level cell path not supported: {} members",
+                cell_path.members.len()
+            )));
+        }
+
+        // Extract the field name
+        let field_name = match &cell_path.members[0] {
+            PathMember::String { val, .. } => val.as_str(),
+            PathMember::Int { .. } => {
+                return Err(CompileError::UnsupportedInstruction(
+                    "Integer index on context not supported".into(),
+                ));
+            }
+        };
+
+        // Map field names to BPF helper calls
+        // The result goes into src_dst register
+        let ebpf_dst = self.alloc_reg(src_dst)?;
+
+        match field_name {
+            // Process identification
+            "pid" => {
+                // bpf_get_current_pid_tgid() returns (tgid << 32) | pid
+                // Lower 32 bits = thread ID (what Linux calls PID)
+                self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
+                // Mask to get lower 32 bits
+                self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
+                self.builder().push(EbpfInsn::and64_imm(ebpf_dst, 0x7FFFFFFF));
+                self.set_register_type(src_dst, BpfFieldType::Int);
+            }
+            "tgid" => {
+                // Upper 32 bits = thread group ID (what userspace calls PID)
+                self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
+                self.builder().push(EbpfInsn::rsh64_imm(EbpfReg::R0, 32));
+                self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
+                self.set_register_type(src_dst, BpfFieldType::Int);
+            }
+            "uid" => {
+                // bpf_get_current_uid_gid() returns (gid << 32) | uid
+                self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentUidGid));
+                self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
+                self.builder().push(EbpfInsn::and64_imm(ebpf_dst, 0x7FFFFFFF));
+                self.set_register_type(src_dst, BpfFieldType::Int);
+            }
+            "gid" => {
+                self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentUidGid));
+                self.builder().push(EbpfInsn::rsh64_imm(EbpfReg::R0, 32));
+                self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
+                self.set_register_type(src_dst, BpfFieldType::Int);
+            }
+            "comm" => {
+                // Get first 8 bytes of command name as i64 (for efficient comparison)
+                self.check_stack_space(16)?;
+                let stack_offset = self.current_stack_offset() - 16;
+                self.advance_stack_offset(16);
+
+                // bpf_get_current_comm(buf, size)
+                self.builder().push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
+                self.builder().push(EbpfInsn::add64_imm(EbpfReg::R1, stack_offset as i32));
+                self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R2, 16));
+                self.builder().push(EbpfInsn::call(BpfHelper::GetCurrentComm));
+
+                // Load first 8 bytes as i64
+                self.builder().push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R10, stack_offset));
+                self.set_register_type(src_dst, BpfFieldType::Comm);
+            }
+            "ktime" => {
+                // bpf_ktime_get_ns() returns nanoseconds since boot
+                self.builder().push(EbpfInsn::call(BpfHelper::KtimeGetNs));
+                self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
+                self.set_register_type(src_dst, BpfFieldType::Int);
+            }
+            // Function arguments (arg0-arg5 for x86_64, arg0-arg7 for aarch64)
+            name if name.starts_with("arg") => {
+                let arg_idx: usize = name[3..].parse().map_err(|_| {
+                    CompileError::UnsupportedInstruction(format!("Invalid argument: {name}"))
+                })?;
+
+                if arg_idx >= pt_regs_offsets::ARG_OFFSETS.len() {
+                    return Err(CompileError::UnsupportedInstruction(format!(
+                        "Argument index {arg_idx} out of range"
+                    )));
+                }
+
+                let offset = pt_regs_offsets::ARG_OFFSETS[arg_idx];
+                // R9 contains the saved context pointer (pt_regs)
+                self.builder().push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
+                self.set_register_type(src_dst, BpfFieldType::Int);
+            }
+            "retval" => {
+                // Return value (for kretprobe/uretprobe)
+                let offset = pt_regs_offsets::RETVAL_OFFSET;
+                self.builder().push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R9, offset));
+                self.set_register_type(src_dst, BpfFieldType::Int);
+            }
+            _ => {
+                return Err(CompileError::UnsupportedInstruction(format!(
+                    "Unknown context field: {field_name}. Supported: pid, tgid, uid, gid, comm, ktime, arg0-arg5, retval"
+                )));
+            }
+        }
+
+        // The register no longer holds "context" - it now holds the field value
+        self.set_context_register(src_dst, false);
 
         Ok(())
     }

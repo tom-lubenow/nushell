@@ -119,7 +119,14 @@ impl RegisterAllocator {
     /// Get a register for reading a variable (may need reload from stack)
     pub fn get_var(&mut self, var_id: VarId) -> Result<RegAction, CompileError> {
         let key = ValueKey::Var(var_id.get());
-        self.get_value(key, || format!("Variable ${} not allocated", var_id.get()))
+        self.get_value(key, || {
+            format!(
+                "Variable ${} not available in eBPF closure. eBPF closures cannot capture \
+                 variables from outer scope - use literal values instead (e.g., == 1234 \
+                 instead of == $my_var)",
+                var_id.get()
+            )
+        })
     }
 
     fn get_value(

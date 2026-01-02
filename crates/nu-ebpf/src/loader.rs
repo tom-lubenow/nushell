@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aya::Ebpf;
+use aya::{Ebpf, EbpfLoader};
 use aya::maps::{HashMap as AyaHashMap, PerfEventArray};
 use aya::programs::{KProbe, RawTracePoint, TracePoint, UProbe};
 use aya::util::online_cpus;
@@ -253,11 +253,45 @@ impl EbpfState {
 
     /// Load and attach an eBPF program
     pub fn attach(&self, program: &EbpfProgram) -> Result<u32, LoadError> {
+        self.attach_with_pin(program, None)
+    }
+
+    /// Load and attach an eBPF program with optional map pinning
+    ///
+    /// If `pin_group` is Some, maps will be pinned to /sys/fs/bpf/nushell/<group>/.
+    /// This enables map sharing between separate eBPF programs - for example, a kprobe
+    /// and kretprobe can share a timestamp map for latency measurement via start-timer/stop-timer.
+    ///
+    /// When a pinned map already exists, the new program will reuse it instead of creating a new one.
+    /// Maps are automatically unpinned when no programs are using them.
+    pub fn attach_with_pin(
+        &self,
+        program: &EbpfProgram,
+        pin_group: Option<&str>,
+    ) -> Result<u32, LoadError> {
         // Generate ELF
         let elf_bytes = program.to_elf()?;
 
-        // Load with Aya
-        let mut ebpf = Ebpf::load(&elf_bytes).map_err(|e| {
+        // Load with Aya using EbpfLoader for optional map pinning
+        let mut ebpf = if let Some(group) = pin_group {
+            let pin_path = format!("/sys/fs/bpf/nushell/{}", group);
+            // Create the directory if it doesn't exist
+            std::fs::create_dir_all(&pin_path).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    LoadError::PermissionDenied
+                } else {
+                    LoadError::Load(format!("Failed to create pin directory {}: {}", pin_path, e))
+                }
+            })?;
+            // Use EbpfLoader with map pinning to enable map sharing between programs
+            EbpfLoader::new()
+                .map_pin_path(&pin_path)
+                .load(&elf_bytes)
+        } else {
+            // No pinning - use simple Ebpf::load
+            Ebpf::load(&elf_bytes)
+        }
+        .map_err(|e| {
             let msg = e.to_string();
             if msg.contains("EPERM") || msg.contains("permission") {
                 LoadError::PermissionDenied

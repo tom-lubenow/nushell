@@ -2,6 +2,7 @@
 
 use nu_engine::command_prelude::*;
 use nu_protocol::engine::Closure;
+use nu_protocol::{record, Record};
 
 #[derive(Clone)]
 pub struct EbpfAttach;
@@ -20,9 +21,46 @@ impl Command for EbpfAttach {
 it to the specified probe point. The closure runs in the kernel whenever
 the probe point is hit.
 
-The closure can use special BPF commands like bpf-pid, bpf-emit, bpf-count,
-bpf-comm, bpf-filter-pid, bpf-filter-comm, bpf-start-timer, bpf-stop-timer,
-and bpf-histogram. See the individual command help for details.
+Context parameter syntax (recommended):
+  The closure can take a context parameter to access probe information:
+    {|ctx| $ctx.pid }     - Get process ID
+    {|ctx| $ctx.tgid }    - Get thread group ID
+    {|ctx| $ctx.uid }     - Get user ID
+    {|ctx| $ctx.gid }     - Get group ID
+    {|ctx| $ctx.comm }    - Get process command name (first 8 bytes)
+    {|ctx| $ctx.ktime }   - Get kernel timestamp in nanoseconds
+    {|ctx| $ctx.arg0 }    - Get function argument 0 (kprobe/uprobe only)
+    {|ctx| $ctx.arg1-5 }  - Get function arguments 1-5
+    {|ctx| $ctx.retval }  - Get return value (kretprobe/uretprobe only)
+
+Output commands:
+  emit              - Send value to userspace via perf buffer
+  emit-comm         - Send process name as string
+  read-str          - Read string from kernel memory pointer
+  read-user-str     - Read string from userspace memory pointer
+
+Aggregation commands:
+  count             - Count occurrences by key
+  histogram         - Add value to log2 histogram
+
+Timing commands:
+  start-timer       - Start latency timer (in entry probe)
+  stop-timer        - Stop timer and return elapsed ns (in return probe)
+
+Shared maps (--pin):
+  Use --pin <group> to share maps between separate eBPF programs.
+  This is required for latency measurement across kprobe/kretprobe pairs.
+  Example:
+    ebpf attach --pin latency 'kprobe:do_sys_open' {|ctx| start-timer }
+    ebpf attach --pin latency -s 'kretprobe:do_sys_open' {|ctx| stop-timer | emit }
+
+Filtering (using if expressions):
+  Use if to filter events at the kernel level - the closure exits
+  early if the condition is false:
+    {|ctx| if $ctx.pid == 1234 { $ctx.pid | emit } }
+    {|ctx| if $ctx.comm == "nginx" { ... } }
+    {|ctx| if $ctx.uid == 0 and $ctx.gid == 0 { ... } }
+    {|ctx| if $ctx.pid == 1234 or $ctx.uid == 0 { ... } }
 
 Kernel probe formats:
   kprobe:function_name      - Attach to kernel function entry
@@ -36,6 +74,13 @@ Userspace probe formats:
   uprobe:/path:func+0x10    - Attach to function + offset
   uprobe:/path:func@1234    - Attach only to process with PID 1234
 
+Captured variables:
+  - Integer variables from outer scope can be captured and inlined:
+      let pid = 1234; {|ctx| if $ctx.pid == $pid { ... } }  # OK
+  - Non-integer captures (strings, lists, etc.) are not supported
+  - Only a subset of Nushell operations are supported (no loops, closures, etc.)
+  - String comparisons limited to 8 characters
+
 Requirements:
   - Linux kernel 4.18+
   - CAP_BPF capability or root access"#
@@ -44,8 +89,9 @@ Requirements:
     fn signature(&self) -> Signature {
         Signature::build("ebpf attach")
             .input_output_types(vec![
-                (Type::Nothing, Type::Int),
-                (Type::Nothing, Type::Binary),
+                (Type::Nothing, Type::Int),     // Returns probe ID (default)
+                (Type::Nothing, Type::Binary),  // Returns ELF with --dry-run
+                (Type::Nothing, Type::table()), // Streams events with --stream
             ])
             .required(
                 "probe",
@@ -58,9 +104,20 @@ Requirements:
                 "The closure to compile and run as eBPF bytecode in the kernel.",
             )
             .switch(
+                "stream",
+                "Stream events directly (Ctrl-C to stop)",
+                Some('s'),
+            )
+            .switch(
                 "dry-run",
                 "Generate bytecode but don't load into kernel",
                 Some('n'),
+            )
+            .named(
+                "pin",
+                SyntaxShape::String,
+                "Pin maps to share between probes (e.g., --pin mygroup)",
+                Some('p'),
             )
             .category(Category::Experimental)
     }
@@ -72,23 +129,33 @@ Requirements:
     fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                example: "ebpf attach 'kprobe:sys_clone' {|| 0 }",
-                description: "Attach a probe to the sys_clone syscall",
+                example: "ebpf attach --stream 'kprobe:sys_clone' {|ctx| $ctx.pid | emit }",
+                description: "Stream events from sys_clone (Ctrl-C to stop)",
                 result: None,
             },
             Example {
-                example: "let id = ebpf attach 'kprobe:sys_read' {|| 0 }; ebpf detach $id",
-                description: "Attach and then detach a probe",
+                example: "ebpf attach -s 'kprobe:sys_read' {|ctx| $ctx.tgid | emit } | first 10",
+                description: "Capture first 10 sys_read events",
                 result: None,
             },
             Example {
-                example: "ebpf attach 'uprobe:/usr/bin/python3:Py_Initialize' {|| bpf-pid | bpf-emit }",
-                description: "Trace Python interpreter initialization",
+                example: "ebpf attach -s 'kprobe:sys_read' {|ctx| if $ctx.pid == 1234 { $ctx.pid | emit } }",
+                description: "Only trace sys_read for PID 1234 (kernel-side filtering)",
                 result: None,
             },
             Example {
-                example: "ebpf attach 'uretprobe:/lib/x86_64-linux-gnu/libc.so.6:malloc' {|| bpf-pid | bpf-emit }",
-                description: "Trace malloc returns in libc",
+                example: "let id = ebpf attach 'kprobe:sys_read' {|ctx| $ctx.pid | emit }; ebpf detach $id",
+                description: "Attach and then detach a probe manually",
+                result: None,
+            },
+            Example {
+                example: "ebpf attach -s 'uprobe:/usr/bin/python3:Py_Initialize' {|ctx| $ctx.pid | emit }",
+                description: "Stream Python interpreter initialization events",
+                result: None,
+            },
+            Example {
+                example: "ebpf attach --pin lat 'kprobe:do_sys_open' {|ctx| start-timer }; ebpf attach --pin lat -s 'kretprobe:do_sys_open' {|ctx| stop-timer | emit }",
+                description: "Measure file open latency using shared timestamp map",
                 result: None,
             },
         ]
@@ -117,6 +184,8 @@ fn run_attach(
     let probe_spec: String = call.req(engine_state, stack, 0)?;
     let closure: Closure = call.req(engine_state, stack, 1)?;
     let dry_run = call.has_flag(engine_state, stack, "dry-run")?;
+    let stream = call.has_flag(engine_state, stack, "stream")?;
+    let pin_group: Option<String> = call.get_flag(engine_state, stack, "pin")?;
 
     // Parse the probe specification
     let (prog_type, target) =
@@ -145,17 +214,23 @@ fn run_attach(
             inner: vec![],
         })?;
 
-    let compile_result = IrToEbpfCompiler::compile_full(ir_block, engine_state).map_err(|e| {
-        ShellError::GenericError {
-            error: "eBPF compilation failed".into(),
-            msg: e.to_string(),
-            span: Some(call.head),
-            help: Some("Check that the closure uses only supported BPF commands".into()),
-            inner: vec![],
-        }
-    })?;
+    // Use compile_with_captures to support:
+    // - context parameter syntax like {|ctx| $ctx.pid }
+    // - captured integer variables from outer scope like `let pid = 1234; {|| $pid }`
+    let compile_result =
+        IrToEbpfCompiler::compile_with_captures(ir_block, engine_state, block, &closure.captures)
+            .map_err(|e| ShellError::GenericError {
+                error: "eBPF compilation failed".into(),
+                msg: e.to_string(),
+                span: Some(call.head),
+                help: Some(
+                    "Check that the closure uses only supported BPF commands or context fields"
+                        .into(),
+                ),
+                inner: vec![],
+            })?;
 
-    let program = EbpfProgram::with_maps(
+    let mut program = EbpfProgram::with_maps(
         prog_type,
         &target,
         "nushell_ebpf",
@@ -164,6 +239,12 @@ fn run_attach(
         compile_result.relocations,
         compile_result.event_schema,
     );
+
+    // Enable map pinning if --pin is specified
+    // This allows maps to be shared between separate eBPF programs
+    if pin_group.is_some() {
+        program = program.with_pinning();
+    }
 
     if dry_run {
         // Return the ELF bytes for inspection
@@ -180,7 +261,7 @@ fn run_attach(
 
     // Load and attach the program
     let state = get_state();
-    let probe_id = state.attach(&program).map_err(|e| {
+    let probe_id = state.attach_with_pin(&program, pin_group.as_deref()).map_err(|e| {
         let (error, help) = match &e {
             LoadError::PermissionDenied => (
                 "Permission denied".into(),
@@ -197,5 +278,100 @@ fn run_attach(
         }
     })?;
 
-    Ok(Value::int(probe_id as i64, call.head).into_pipeline_data())
+    if stream {
+        // Stream events directly - return a ListStream
+        let span = call.head;
+        let signals = engine_state.signals().clone();
+        let iter = EventStreamIterator::new(probe_id, span);
+        let list_stream = nu_protocol::ListStream::new(iter, span, signals);
+        Ok(PipelineData::ListStream(list_stream, None))
+    } else {
+        // Return probe ID for manual event polling
+        Ok(Value::int(probe_id as i64, call.head).into_pipeline_data())
+    }
+}
+
+/// Iterator that streams events from an attached eBPF probe
+#[cfg(target_os = "linux")]
+struct EventStreamIterator {
+    probe_id: u32,
+    span: nu_protocol::Span,
+    pending_events: std::collections::VecDeque<Value>,
+}
+
+#[cfg(target_os = "linux")]
+impl EventStreamIterator {
+    fn new(probe_id: u32, span: nu_protocol::Span) -> Self {
+        Self {
+            probe_id,
+            span,
+            pending_events: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn poll_batch(&mut self) {
+        use crate::loader::{BpfEventData, BpfFieldValue, get_state};
+        use std::time::Duration;
+
+        let state = get_state();
+        if let Ok(events) = state.poll_events(self.probe_id, Duration::from_millis(100)) {
+            for e in events {
+                let value = match e.data {
+                    BpfEventData::Record(fields) => {
+                        let mut rec = Record::new();
+                        for (name, value) in fields {
+                            let val = match value {
+                                BpfFieldValue::Int(v) => Value::int(v, self.span),
+                                BpfFieldValue::String(s) => Value::string(s, self.span),
+                            };
+                            rec.push(name, val);
+                        }
+                        rec.push("cpu", Value::int(e.cpu as i64, self.span));
+                        Value::record(rec, self.span)
+                    }
+                    _ => {
+                        let value = match e.data {
+                            BpfEventData::Int(v) => Value::int(v, self.span),
+                            BpfEventData::String(s) => Value::string(s, self.span),
+                            BpfEventData::Bytes(b) => Value::binary(b, self.span),
+                            BpfEventData::Record(_) => unreachable!(),
+                        };
+                        Value::record(
+                            record! {
+                                "value" => value,
+                                "cpu" => Value::int(e.cpu as i64, self.span),
+                            },
+                            self.span,
+                        )
+                    }
+                };
+                self.pending_events.push_back(value);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Iterator for EventStreamIterator {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Return pending events first
+        if let Some(event) = self.pending_events.pop_front() {
+            return Some(event);
+        }
+
+        // Poll for more events (blocking briefly)
+        self.poll_batch();
+        self.pending_events.pop_front()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for EventStreamIterator {
+    fn drop(&mut self) {
+        // Detach the probe when the stream ends
+        use crate::loader::get_state;
+        let _ = get_state().detach(self.probe_id);
+    }
 }

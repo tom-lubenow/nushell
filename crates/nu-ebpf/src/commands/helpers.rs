@@ -2,6 +2,15 @@
 //!
 //! These commands map to BPF helper functions when compiled to eBPF.
 //! At regular runtime, they provide equivalent functionality.
+//!
+//! The preferred API uses:
+//! - Context parameter syntax: `{|ctx| $ctx.pid | emit }`
+//! - Short-named commands: `emit`, `count`, `histogram`, etc.
+//!
+//! The old bpf-* prefixed commands are kept for backward compatibility
+//! but are no longer registered.
+
+#![allow(dead_code)] // Old bpf-* commands kept for reference
 
 use nu_engine::command_prelude::*;
 
@@ -893,5 +902,380 @@ impl Command for BpfCount {
         // At regular runtime, just pass through (counting happens in eBPF)
         let value = input.into_value(call.head)?;
         Ok(value.into_pipeline_data())
+    }
+}
+
+// =============================================================================
+// Short-named commands (preferred over bpf-* prefixed versions)
+// =============================================================================
+
+/// Emit a value to the perf buffer (short name for bpf-emit)
+#[derive(Clone)]
+pub struct Emit;
+
+impl Command for Emit {
+    fn name(&self) -> &str {
+        "emit"
+    }
+
+    fn description(&self) -> &str {
+        "Emit a value to the eBPF perf buffer for streaming to userspace."
+    }
+
+    fn extra_description(&self) -> &str {
+        r#"Supports both single values (integers) and structured records.
+When given a record, all fields are emitted as a single structured event.
+Use with context parameter syntax: {|ctx| $ctx.pid | emit }"#
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("emit")
+            .input_output_types(vec![
+                (Type::Int, Type::Int),
+                (Type::Any, Type::Any),
+            ])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                example: "ebpf attach 'kprobe:sys_read' {|ctx| $ctx.pid | emit }",
+                description: "Emit the PID on each sys_read call",
+                result: None,
+            },
+            Example {
+                example: "ebpf attach 'kprobe:sys_read' {|ctx| { pid: $ctx.pid, time: $ctx.ktime } | emit }",
+                description: "Emit a structured event",
+                result: None,
+            },
+        ]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let value = input.into_value(call.head)?;
+        eprintln!(
+            "[emit] {}",
+            value.to_expanded_string(", ", &nu_protocol::Config::default())
+        );
+        Ok(value.into_pipeline_data())
+    }
+}
+
+/// Count occurrences by key (short name for bpf-count)
+#[derive(Clone)]
+pub struct Count;
+
+impl Command for Count {
+    fn name(&self) -> &str {
+        "count"
+    }
+
+    fn description(&self) -> &str {
+        "Count occurrences by key in an eBPF hash map."
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("count")
+            .input_output_types(vec![(Type::Int, Type::Int)])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                example: "ebpf attach 'kprobe:sys_read' {|ctx| $ctx.pid | count }",
+                description: "Count events per PID",
+                result: None,
+            },
+        ]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let value = input.into_value(call.head)?;
+        Ok(value.into_pipeline_data())
+    }
+}
+
+/// Add a value to a log2 histogram (short name for bpf-histogram)
+#[derive(Clone)]
+pub struct Histogram;
+
+impl Command for Histogram {
+    fn name(&self) -> &str {
+        "histogram"
+    }
+
+    fn description(&self) -> &str {
+        "Add a value to a log2 histogram in eBPF."
+    }
+
+    fn extra_description(&self) -> &str {
+        r#"Computes the log2 bucket for the input value and increments
+the counter for that bucket. Use with latency measurement:
+  ebpf attach 'kretprobe:func' {|| stop-timer | histogram }"#
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("histogram")
+            .input_output_types(vec![(Type::Int, Type::Int)])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                example: "ebpf attach 'kretprobe:sys_read' {|| stop-timer | histogram }",
+                description: "Add latency to histogram",
+                result: None,
+            },
+        ]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let value = input.into_value(call.head)?;
+        if let Ok(v) = value.as_int() {
+            let bucket = if v <= 0 {
+                0
+            } else {
+                64 - (v as u64).leading_zeros()
+            };
+            eprintln!("[histogram] Value {} -> bucket {}", v, bucket);
+        }
+        Ok(value.into_pipeline_data())
+    }
+}
+
+/// Start a timer for latency measurement (short name for bpf-start-timer)
+#[derive(Clone)]
+pub struct StartTimer;
+
+impl Command for StartTimer {
+    fn name(&self) -> &str {
+        "start-timer"
+    }
+
+    fn description(&self) -> &str {
+        "Start a timer for latency measurement. Pair with stop-timer."
+    }
+
+    fn extra_description(&self) -> &str {
+        r#"Stores the current kernel timestamp keyed by thread ID.
+Use in entry probes (kprobe:func) to mark the start time.
+Call stop-timer in the return probe (kretprobe:func) to get elapsed time."#
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("start-timer")
+            .input_output_types(vec![(Type::Nothing, Type::Nothing)])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![Example {
+            example: "ebpf attach 'kprobe:sys_read' {|| start-timer }",
+            description: "Start timer in entry probe",
+            result: None,
+        }]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        eprintln!("[start-timer] Would store timestamp for TID");
+        Ok(Value::nothing(call.head).into_pipeline_data())
+    }
+}
+
+/// Stop a timer and return elapsed nanoseconds (short name for bpf-stop-timer)
+#[derive(Clone)]
+pub struct StopTimer;
+
+impl Command for StopTimer {
+    fn name(&self) -> &str {
+        "stop-timer"
+    }
+
+    fn description(&self) -> &str {
+        "Stop timer and return elapsed nanoseconds. Pair with start-timer."
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("stop-timer")
+            .input_output_types(vec![(Type::Nothing, Type::Int)])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                example: "ebpf attach 'kretprobe:sys_read' {|| stop-timer | emit }",
+                description: "Stop timer and emit the latency",
+                result: None,
+            },
+        ]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        eprintln!("[stop-timer] Would compute elapsed time for TID");
+        Ok(Value::int(0, call.head).into_pipeline_data())
+    }
+}
+
+/// Emit the current process name (short name for bpf-emit-comm)
+#[derive(Clone)]
+pub struct EmitComm;
+
+impl Command for EmitComm {
+    fn name(&self) -> &str {
+        "emit-comm"
+    }
+
+    fn description(&self) -> &str {
+        "Emit the current process name to the perf buffer as a string."
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("emit-comm")
+            .input_output_types(vec![(Type::Nothing, Type::String)])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![Example {
+            example: "ebpf attach 'kprobe:sys_read' {|| emit-comm }",
+            description: "Emit the current process name",
+            result: None,
+        }]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        _input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        #[cfg(unix)]
+        let comm = std::fs::read_to_string("/proc/self/comm")
+            .unwrap_or_else(|_| "unknown\n".to_string())
+            .trim()
+            .to_string();
+        #[cfg(not(unix))]
+        let comm = "unknown".to_string();
+
+        eprintln!("[emit-comm] {}", comm);
+        Ok(Value::string(comm, call.head).into_pipeline_data())
+    }
+}
+
+/// Read a string from kernel memory (short name for bpf-read-str)
+#[derive(Clone)]
+pub struct ReadStr;
+
+impl Command for ReadStr {
+    fn name(&self) -> &str {
+        "read-str"
+    }
+
+    fn description(&self) -> &str {
+        "Read a string from kernel memory pointer and emit it (max 128 bytes)."
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("read-str")
+            .input_output_types(vec![(Type::Int, Type::String)])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![Example {
+            example: "ebpf attach 'kprobe:sys_open' {|ctx| $ctx.arg1 | read-str }",
+            description: "Read filename from first argument",
+            result: None,
+        }]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let ptr = input.into_value(call.head)?;
+        eprintln!("[read-str] Would read string from pointer {:?}", ptr);
+        Ok(Value::string("<kernel string>", call.head).into_pipeline_data())
+    }
+}
+
+/// Read a string from user-space memory (short name for bpf-read-user-str)
+#[derive(Clone)]
+pub struct ReadUserStr;
+
+impl Command for ReadUserStr {
+    fn name(&self) -> &str {
+        "read-user-str"
+    }
+
+    fn description(&self) -> &str {
+        "Read a string from user-space memory pointer and emit it (max 128 bytes)."
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("read-user-str")
+            .input_output_types(vec![(Type::Int, Type::String)])
+            .category(Category::Experimental)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![Example {
+            example: "ebpf attach 'kprobe:do_sys_openat2' {|ctx| $ctx.arg1 | read-user-str }",
+            description: "Read filename from user-space pointer",
+            result: None,
+        }]
+    }
+
+    fn run(
+        &self,
+        _engine_state: &EngineState,
+        _stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        let ptr = input.into_value(call.head)?;
+        eprintln!(
+            "[read-user-str] Would read string from pointer {:?}",
+            ptr
+        );
+        Ok(Value::string("<user string>", call.head).into_pipeline_data())
     }
 }

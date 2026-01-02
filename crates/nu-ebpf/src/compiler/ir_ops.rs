@@ -100,6 +100,15 @@ impl IrOps for IrToEbpfCompiler<'_> {
                 self.builder().push(EbpfInsn::mov64_imm(ebpf_dst, 0));
                 Ok(())
             }
+            Literal::CellPath(cell_path) => {
+                // Track the cell path for later use in FollowCellPath
+                // Cell paths themselves don't need a register value - they're used
+                // to guide field access compilation
+                self.set_literal_cell_path(dst, (**cell_path).clone());
+                // Set a dummy value in the register (won't be used)
+                self.builder().push(EbpfInsn::mov64_imm(ebpf_dst, 0));
+                Ok(())
+            }
             _ => Err(CompileError::UnsupportedLiteral),
         }
     }
@@ -169,6 +178,24 @@ impl IrOps for IrToEbpfCompiler<'_> {
             // Comparison operations - result is 0 or 1
             Operator::Comparison(cmp) => {
                 self.compile_comparison(ebpf_lhs, cmp, ebpf_rhs)?;
+            }
+            // Boolean logical operations
+            Operator::Boolean(bool_op) => {
+                use nu_protocol::ast::Boolean;
+                match bool_op {
+                    Boolean::And => {
+                        // Logical AND: result = lhs & rhs (works for boolean 0/1 values)
+                        self.builder().push(EbpfInsn::and64_reg(ebpf_lhs, ebpf_rhs));
+                    }
+                    Boolean::Or => {
+                        // Logical OR: result = lhs | rhs (works for boolean 0/1 values)
+                        self.builder().push(EbpfInsn::or64_reg(ebpf_lhs, ebpf_rhs));
+                    }
+                    Boolean::Xor => {
+                        // Logical XOR: result = lhs ^ rhs (works for boolean 0/1 values)
+                        self.builder().push(EbpfInsn::xor64_reg(ebpf_lhs, ebpf_rhs));
+                    }
+                }
             }
             _ => {
                 return Err(CompileError::UnsupportedInstruction(format!(
@@ -270,6 +297,40 @@ impl IrOps for IrToEbpfCompiler<'_> {
     }
 
     fn compile_load_variable(&mut self, dst: RegId, var_id: VarId) -> Result<(), CompileError> {
+        // Check if this is loading the context parameter
+        if self.is_context_param(var_id) {
+            // Mark the destination register as containing the context
+            // We don't emit any code here - actual BPF helpers are called
+            // when fields are accessed via FollowCellPath
+            self.set_context_register(dst, true);
+            // Allocate the register but don't load anything yet
+            let ebpf_dst = self.alloc_reg(dst)?;
+            // Set a placeholder value (won't be used directly)
+            self.builder().push(EbpfInsn::mov64_imm(ebpf_dst, 0));
+            return Ok(());
+        }
+
+        // Check if this is a captured variable from outer scope
+        // We can inline integer values as compile-time constants
+        if let Some(value) = self.get_captured_value(var_id) {
+            // Only 32-bit values are supported (covers PIDs, UIDs, etc.)
+            if value < i32::MIN as i64 || value > i32::MAX as i64 {
+                return Err(CompileError::UnsupportedInstruction(format!(
+                    "Captured value {} is too large. Only 32-bit integers are supported.",
+                    value
+                )));
+            }
+
+            let ebpf_dst = self.alloc_reg(dst)?;
+            // Track the literal value for commands that need compile-time constants
+            self.set_literal_value(dst, value);
+
+            // Load the captured value as an immediate
+            self.builder()
+                .push(EbpfInsn::mov64_imm(ebpf_dst, value as i32));
+            return Ok(());
+        }
+
         let ebpf_var = self.ensure_var(var_id)?;
         let ebpf_dst = self.alloc_reg(dst)?;
 

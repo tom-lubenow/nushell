@@ -136,18 +136,18 @@ impl TimingHelpers for IrToEbpfCompiler<'_> {
         self.emit_jump_if_zero_to_label(EbpfReg::R0, no_timer_label);
 
         // Value exists - load the start timestamp
-        // R1 = start_time = *R0
+        // Save to callee-saved register R6 (not clobbered by helper calls)
         self.builder()
-            .push(EbpfInsn::ldxdw(EbpfReg::R1, EbpfReg::R0, 0));
+            .push(EbpfInsn::ldxdw(EbpfReg::R6, EbpfReg::R0, 0));
 
         // Get current time
         self.builder().push(EbpfInsn::call(BpfHelper::KtimeGetNs));
         // R0 = current_time
 
         // Compute delta = current_time - start_time
-        // R0 = R0 - R1
+        // R0 = R0 - R6
         self.builder()
-            .push(EbpfInsn::sub64_reg(EbpfReg::R0, EbpfReg::R1));
+            .push(EbpfInsn::sub64_reg(EbpfReg::R0, EbpfReg::R6));
 
         // Save the delta temporarily
         self.check_stack_space(8)?;

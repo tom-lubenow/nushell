@@ -1,4 +1,4 @@
-//! Display histogram values from bpf-histogram
+//! Display histogram values from the `histogram` command
 
 use nu_engine::command_prelude::*;
 
@@ -12,11 +12,11 @@ impl Command for EbpfHistogram {
     }
 
     fn description(&self) -> &str {
-        "Display histogram values from a probe using bpf-histogram"
+        "Display histogram values collected by the histogram command in an eBPF closure."
     }
 
     fn extra_description(&self) -> &str {
-        r#"Displays the histogram data collected by bpf-histogram.
+        r#"Reads the histogram map from an attached probe that uses the `histogram` command.
 Each row shows a log2 bucket range and the count of values in that bucket.
 
 The output includes:
@@ -25,8 +25,14 @@ The output includes:
 - count: Number of values that fell in this bucket
 - bar: Visual representation of the count
 
-For latency histograms (from bpf-stop-timer), the range is shown in
-nanoseconds by default. Use --unit to change the display unit."#
+For latency histograms (from stop-timer), use --ns to display ranges
+as human-readable durations (ns, us, ms, s).
+
+Example workflow:
+  ebpf attach --pin lat 'kprobe:sys_read' {|ctx| start-timer }
+  let id = ebpf attach --pin lat 'kretprobe:sys_read' {|ctx| stop-timer | histogram }
+  sleep 5sec
+  ebpf histogram $id --ns"#
     }
 
     fn signature(&self) -> Signature {
@@ -34,7 +40,7 @@ nanoseconds by default. Use --unit to change the display unit."#
             .required("id", SyntaxShape::Int, "Probe ID to get histogram from")
             .switch(
                 "ns",
-                "Show ranges as nanoseconds (default for latency)",
+                "Show ranges as human-readable durations (ns, us, ms, s)",
                 None,
             )
             .input_output_types(vec![(Type::Nothing, Type::table())])
@@ -44,13 +50,13 @@ nanoseconds by default. Use --unit to change the display unit."#
     fn examples(&self) -> Vec<Example<'_>> {
         vec![
             Example {
-                example: "ebpf histogram 1",
-                description: "Show histogram from probe 1",
+                example: "let id = ebpf attach 'kretprobe:sys_read' {|ctx| stop-timer | histogram }; sleep 5sec; ebpf histogram $id",
+                description: "Collect and display latency histogram for sys_read",
                 result: None,
             },
             Example {
-                example: "ebpf histogram 1 --ns",
-                description: "Show histogram with nanosecond ranges",
+                example: "ebpf histogram $id --ns",
+                description: "Show histogram with human-readable nanosecond ranges",
                 result: None,
             },
         ]

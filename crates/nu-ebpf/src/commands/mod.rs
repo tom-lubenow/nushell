@@ -6,7 +6,6 @@
 mod attach;
 mod counters;
 mod detach;
-mod events;
 mod helpers;
 mod histogram;
 mod list;
@@ -62,11 +61,7 @@ pub(crate) fn validate_probe_id(id: i64, span: Span) -> Result<u32, ShellError> 
 pub use attach::EbpfAttach;
 pub use counters::EbpfCounters;
 pub use detach::EbpfDetach;
-pub use events::EbpfEvents;
-// Short-named helper commands (preferred)
-pub use helpers::{
-    Count, Emit, EmitComm, Histogram, ReadStr, ReadUserStr, StartTimer, StopTimer,
-};
+pub use helpers::{Count, Emit, EmitComm, Histogram, ReadStr, ReadUserStr, StartTimer, StopTimer};
 pub use histogram::EbpfHistogram;
 pub use list::EbpfList;
 pub use trace::EbpfTrace;
@@ -80,13 +75,10 @@ pub fn commands() -> Vec<Box<dyn Command>> {
         Box::new(EbpfAttach),
         Box::new(EbpfCounters),
         Box::new(EbpfDetach),
-        Box::new(EbpfEvents),
         Box::new(EbpfHistogram),
         Box::new(EbpfList),
         Box::new(EbpfTrace),
         // Helper commands for use in eBPF closures
-        // Use context parameter syntax for data: {|ctx| $ctx.pid | emit }
-        // Use if expressions for filtering: {|ctx| if $ctx.pid == 1234 { ... } }
         Box::new(Emit),
         Box::new(EmitComm),
         Box::new(Count),

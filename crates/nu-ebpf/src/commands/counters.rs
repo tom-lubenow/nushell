@@ -1,4 +1,4 @@
-//! Display counter values from bpf-count
+//! Display counter values from the `count` command
 
 use nu_engine::command_prelude::*;
 
@@ -12,7 +12,20 @@ impl Command for EbpfCounters {
     }
 
     fn description(&self) -> &str {
-        "Display counter values from a probe using bpf-count"
+        "Display counter values collected by the count command in an eBPF closure."
+    }
+
+    fn extra_description(&self) -> &str {
+        r#"Reads the counter map from an attached probe that uses the `count` command.
+Each row shows a key and the number of times that key was counted.
+
+If the key is a process name (from using $ctx.comm), it will be displayed
+as a string. Otherwise numeric keys are displayed as integers.
+
+Example workflow:
+  let id = ebpf attach 'kprobe:sys_read' {|ctx| $ctx.pid | count }
+  sleep 5sec
+  ebpf counters $id"#
     }
 
     fn signature(&self) -> Signature {
@@ -23,11 +36,18 @@ impl Command for EbpfCounters {
     }
 
     fn examples(&self) -> Vec<Example<'_>> {
-        vec![Example {
-            example: "ebpf counters 1",
-            description: "Show counter values from probe 1",
-            result: None,
-        }]
+        vec![
+            Example {
+                example: "let id = ebpf attach 'kprobe:sys_read' {|ctx| $ctx.pid | count }; sleep 5sec; ebpf counters $id",
+                description: "Count sys_read calls per PID and display results",
+                result: None,
+            },
+            Example {
+                example: "ebpf counters $id | sort-by count --reverse",
+                description: "Show counters sorted by count descending",
+                result: None,
+            },
+        ]
     }
 
     fn run(

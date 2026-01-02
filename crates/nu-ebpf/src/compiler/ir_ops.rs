@@ -12,8 +12,9 @@ use nu_protocol::ir::Literal;
 use nu_protocol::{RegId, VarId};
 
 use crate::compiler::CompileError;
+use crate::compiler::elf::BpfFieldType;
 use crate::compiler::instruction::{EbpfInsn, EbpfReg, opcode};
-use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, RecordBuilder};
+use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, RecordBuilder, StackString};
 
 /// Extension trait for IR operation compilation
 pub trait IrOps {
@@ -30,6 +31,15 @@ pub trait IrOps {
         lhs: EbpfReg,
         cmp: &Comparison,
         rhs: EbpfReg,
+    ) -> Result<(), CompileError>;
+    /// Compare two stack-based strings
+    /// Returns result (0 or 1) in dst_reg
+    fn compile_string_comparison(
+        &mut self,
+        lhs_str: StackString,
+        rhs_str: StackString,
+        cmp: &Comparison,
+        dst_reg: EbpfReg,
     ) -> Result<(), CompileError>;
     fn compile_return(&mut self, src: RegId) -> Result<(), CompileError>;
     fn compile_store_variable(&mut self, var_id: VarId, src: RegId) -> Result<(), CompileError>;
@@ -78,13 +88,14 @@ impl IrOps for IrToEbpfCompiler<'_> {
                     self.set_literal_string(dst, s.to_string());
                 }
 
-                // Convert first 8 bytes of string to i64 for comparison
-                // This matches how bpf-comm encodes process names
-                let mut arr = [0u8; 8];
-                let len = string_owned.len().min(8);
-                arr[..len].copy_from_slice(&string_owned[..len]);
-                let val = i64::from_le_bytes(arr);
-                self.emit_load_64bit_imm(ebpf_dst, val);
+                // Store string on stack for proper comparison support
+                // The register will hold a pointer to the stack location
+                let stack_str = self.store_string_literal_on_stack(&string_owned, ebpf_dst)?;
+
+                // Track the stack string for comparison operations
+                self.set_stack_string(dst, stack_str);
+                self.set_register_type(dst, BpfFieldType::String);
+
                 Ok(())
             }
             Literal::Record { .. } => {
@@ -129,6 +140,37 @@ impl IrOps for IrToEbpfCompiler<'_> {
         op: &Operator,
         rhs: RegId,
     ) -> Result<(), CompileError> {
+        // Check for string comparison before allocating registers
+        // String comparisons need special handling since strings are on the stack
+        if let Operator::Comparison(cmp) = op {
+            let lhs_str = self.get_stack_string(lhs_dst);
+            let rhs_str = self.get_stack_string(rhs);
+
+            if lhs_str.is_some() || rhs_str.is_some() {
+                // At least one operand is a stack string - use string comparison
+                let lhs_str = lhs_str.unwrap_or_else(|| {
+                    // RHS is a string but LHS is not - this is unusual but handle it
+                    // by treating LHS as an 8-byte value (likely an error in the program)
+                    StackString {
+                        offset: 0,
+                        size: 8,
+                    }
+                });
+                let rhs_str = rhs_str.unwrap_or_else(|| {
+                    // LHS is a string but RHS is not
+                    StackString {
+                        offset: 0,
+                        size: 8,
+                    }
+                });
+
+                // Allocate result register
+                let ebpf_lhs = self.alloc_reg(lhs_dst)?;
+
+                return self.compile_string_comparison(lhs_str, rhs_str, cmp, ebpf_lhs);
+            }
+        }
+
         let ebpf_lhs = self.ensure_reg(lhs_dst)?;
         let ebpf_rhs = self.ensure_reg(rhs)?;
 
@@ -175,7 +217,7 @@ impl IrOps for IrToEbpfCompiler<'_> {
                     self.builder().push(EbpfInsn::rsh64_reg(ebpf_lhs, ebpf_rhs));
                 }
             },
-            // Comparison operations - result is 0 or 1
+            // Comparison operations - result is 0 or 1 (non-string comparisons)
             Operator::Comparison(cmp) => {
                 self.compile_comparison(ebpf_lhs, cmp, ebpf_rhs)?;
             }
@@ -268,6 +310,136 @@ impl IrOps for IrToEbpfCompiler<'_> {
 
         // Set lhs = 1 (condition was true)
         self.builder().push(EbpfInsn::mov64_imm(lhs, 1));
+
+        Ok(())
+    }
+
+    /// Compare two stack-based strings byte-by-byte
+    ///
+    /// Compares strings 8 bytes at a time up to the shorter string's length.
+    /// String literals include a null terminator in their size, so:
+    /// - "nginx" (stored as "nginx\0", size=6) matches "nginx\0..." but NOT "nginxmaster"
+    /// - The null terminator acts as an "end of string" marker in the comparison
+    fn compile_string_comparison(
+        &mut self,
+        lhs_str: StackString,
+        rhs_str: StackString,
+        cmp: &Comparison,
+        dst_reg: EbpfReg,
+    ) -> Result<(), CompileError> {
+        // Only Equal and NotEqual are supported for strings
+        match cmp {
+            Comparison::Equal | Comparison::NotEqual => {}
+            _ => {
+                return Err(CompileError::UnsupportedInstruction(format!(
+                    "String comparison {:?} not supported (only == and != work)",
+                    cmp
+                )));
+            }
+        }
+
+        // Determine comparison length - use the minimum of both sizes
+        // This handles cases like comparing a 16-byte comm with a 5-byte literal "nginx"
+        let compare_len = lhs_str.size.min(rhs_str.size);
+        let num_chunks = (compare_len + 7) / 8; // Round up to 8-byte chunks
+
+        // Strategy for Equal:
+        //   Set result = 1 (assume equal)
+        //   For each 8-byte chunk:
+        //     Load LHS chunk into R0
+        //     Load RHS chunk into R1
+        //     If R0 != R1, set result = 0 and jump to end
+        //   End: result is in dst_reg
+        //
+        // Strategy for NotEqual:
+        //   Set result = 0 (assume equal, i.e., not-not-equal)
+        //   For each 8-byte chunk:
+        //     Load LHS chunk into R0
+        //     Load RHS chunk into R1
+        //     If R0 != R1, set result = 1 and jump to end
+        //   End: result is in dst_reg
+
+        let is_equal = matches!(cmp, Comparison::Equal);
+
+        // Create label for the "not equal found" early exit
+        let end_label = self.create_label();
+
+        // Set initial assumption
+        if is_equal {
+            self.builder().push(EbpfInsn::mov64_imm(dst_reg, 1)); // Assume equal
+        } else {
+            self.builder().push(EbpfInsn::mov64_imm(dst_reg, 0)); // Assume equal (not != yet)
+        }
+
+        // Compare each 8-byte chunk
+        for i in 0..num_chunks {
+            let chunk_offset = (i * 8) as i16;
+            let lhs_chunk_offset = lhs_str.offset + chunk_offset;
+            let rhs_chunk_offset = rhs_str.offset + chunk_offset;
+
+            // Load LHS chunk
+            self.builder()
+                .push(EbpfInsn::ldxdw(EbpfReg::R0, EbpfReg::R10, lhs_chunk_offset));
+
+            // Load RHS chunk
+            self.builder()
+                .push(EbpfInsn::ldxdw(EbpfReg::R1, EbpfReg::R10, rhs_chunk_offset));
+
+            // For the last chunk, we may need to mask off bytes beyond the comparison length
+            let bytes_in_chunk = compare_len - (i * 8);
+            if bytes_in_chunk < 8 {
+                // Mask to only compare the relevant bytes
+                // Create a mask with 1s in the positions we care about
+                let mask: u64 = (1u64 << (bytes_in_chunk * 8)) - 1;
+                let mask_i64 = mask as i64;
+
+                // AND both with the mask
+                self.emit_load_64bit_imm(EbpfReg::R2, mask_i64);
+                self.builder()
+                    .push(EbpfInsn::and64_reg(EbpfReg::R0, EbpfReg::R2));
+                self.builder()
+                    .push(EbpfInsn::and64_reg(EbpfReg::R1, EbpfReg::R2));
+            }
+
+            // Compare R0 and R1
+            if is_equal {
+                // For Equal: if not equal, set result to 0 and jump to end
+                // jne r0, r1, +2 (skip the next 2 instructions if not equal)
+                self.builder().push(EbpfInsn::new(
+                    opcode::BPF_JMP | opcode::BPF_JNE | opcode::BPF_X,
+                    EbpfReg::R0.as_u8(),
+                    EbpfReg::R1.as_u8(),
+                    2, // Skip 2 instructions
+                    0,
+                ));
+                // Skip setting to 0 and jumping if equal (fall through to next chunk)
+                self.builder().push(EbpfInsn::jump(2)); // Skip the set-to-0 and jump-to-end
+
+                // Set result to 0 (not equal)
+                self.builder().push(EbpfInsn::mov64_imm(dst_reg, 0));
+                // Jump to end
+                self.emit_jump_to_label(end_label);
+            } else {
+                // For NotEqual: if not equal, set result to 1 and jump to end
+                self.builder().push(EbpfInsn::new(
+                    opcode::BPF_JMP | opcode::BPF_JNE | opcode::BPF_X,
+                    EbpfReg::R0.as_u8(),
+                    EbpfReg::R1.as_u8(),
+                    2, // Skip 2 instructions
+                    0,
+                ));
+                // Skip setting to 1 and jumping if equal (fall through to next chunk)
+                self.builder().push(EbpfInsn::jump(2)); // Skip the set-to-1 and jump-to-end
+
+                // Set result to 1 (not equal)
+                self.builder().push(EbpfInsn::mov64_imm(dst_reg, 1));
+                // Jump to end
+                self.emit_jump_to_label(end_label);
+            }
+        }
+
+        // Bind the end label
+        self.bind_label(end_label);
 
         Ok(())
     }

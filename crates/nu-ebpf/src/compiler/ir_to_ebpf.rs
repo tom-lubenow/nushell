@@ -124,6 +124,18 @@ pub(crate) struct RecordBuilder {
     pub base_offset: i16,
 }
 
+/// Tracks a string stored on the stack
+///
+/// Used for string types that don't fit in a register (comm, string literals, read-str results).
+/// The register associated with this string holds a pointer to the stack location.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StackString {
+    /// Stack offset where the string is stored (relative to R10, negative)
+    pub offset: i16,
+    /// Size of the string in bytes (actual content, may be less than allocated)
+    pub size: usize,
+}
+
 /// Compiles Nushell IR to eBPF bytecode
 pub struct IrToEbpfCompiler<'a> {
     ir_block: &'a IrBlock,
@@ -158,9 +170,9 @@ pub struct IrToEbpfCompiler<'a> {
     record_builders: HashMap<u32, RecordBuilder>,
     /// Track the type of value produced by each register (for schema inference)
     register_types: HashMap<u32, BpfFieldType>,
-    /// Track registers that point to stack-based strings (reg_id -> stack_offset)
-    /// For types like Comm that live on stack rather than in registers
-    stack_strings: HashMap<u32, i16>,
+    /// Track registers that point to stack-based strings (reg_id -> StackString)
+    /// For types like Comm and string literals that live on stack rather than in registers
+    stack_strings: HashMap<u32, StackString>,
     /// The event schema if structured events are used
     event_schema: Option<EventSchema>,
     /// Pending internal jumps to fix up (for intra-function control flow)
@@ -607,6 +619,66 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.record_builders.insert(reg.get(), builder);
     }
 
+    /// Track a stack-based string for a register
+    pub(crate) fn set_stack_string(&mut self, reg: RegId, stack_str: StackString) {
+        self.stack_strings.insert(reg.get(), stack_str);
+    }
+
+    /// Get the stack string info for a register (if it's a stack-based string)
+    pub(crate) fn get_stack_string(&self, reg: RegId) -> Option<StackString> {
+        self.stack_strings.get(&reg.get()).copied()
+    }
+
+    /// Store a string literal on the stack and return the StackString info
+    ///
+    /// The string is stored with a null terminator and 8-byte alignment.
+    /// The size includes the null terminator for proper comparison semantics:
+    /// - "nginx" stored as "nginx\0" (6 bytes) will only match "nginx\0..."
+    /// - "nginx" will NOT match "nginxmaster" because byte 6 differs ('\0' vs 'm')
+    pub(crate) fn store_string_literal_on_stack(
+        &mut self,
+        bytes: &[u8],
+        dst_reg: EbpfReg,
+    ) -> Result<StackString, CompileError> {
+        // Include null terminator in the size for proper comparison
+        let size_with_null = bytes.len() + 1;
+
+        // Round up to 8-byte alignment for proper memory access
+        let padded_size = ((size_with_null + 7) / 8) * 8;
+        let padded_size_i16 = padded_size as i16;
+
+        self.check_stack_space(padded_size_i16)?;
+        let stack_offset = self.current_stack_offset() - padded_size_i16;
+        self.advance_stack_offset(padded_size_i16);
+
+        // Store the string bytes + null terminator, padded with zeros
+        let mut padded = vec![0u8; padded_size];
+        padded[..bytes.len()].copy_from_slice(bytes);
+        // padded[bytes.len()] is already 0 (null terminator)
+        // remaining bytes are already 0 (padding)
+
+        for (i, chunk) in padded.chunks(8).enumerate() {
+            let val = i64::from_le_bytes(chunk.try_into().unwrap());
+            let chunk_offset = stack_offset + (i * 8) as i16;
+
+            // Use 64-bit immediate load then store
+            self.emit_load_64bit_imm(EbpfReg::R0, val);
+            self.builder
+                .push(EbpfInsn::stxdw(EbpfReg::R10, chunk_offset, EbpfReg::R0));
+        }
+
+        // Store pointer to the string in destination register
+        self.builder
+            .push(EbpfInsn::mov64_reg(dst_reg, EbpfReg::R10));
+        self.builder
+            .push(EbpfInsn::add64_imm(dst_reg, stack_offset as i32));
+
+        Ok(StackString {
+            offset: stack_offset,
+            size: size_with_null, // Includes null terminator
+        })
+    }
+
     /// Emit a 64-bit immediate load (uses two instruction slots) - exposed for helpers
     pub(crate) fn emit_load_64bit_imm(&mut self, dst: EbpfReg, val: i64) {
         // LD_DW_IMM uses two 8-byte slots
@@ -987,7 +1059,8 @@ impl<'a> IrToEbpfCompiler<'a> {
             }
             BpfFieldType::Comm => {
                 // Comm is a stack-based string - copy 16 bytes from source to destination
-                if let Some(&src_offset) = self.stack_strings.get(&val.get()) {
+                if let Some(stack_str) = self.stack_strings.get(&val.get()) {
+                    let src_offset = stack_str.offset;
                     // Copy first 8 bytes
                     self.builder
                         .push(EbpfInsn::ldxdw(EbpfReg::R0, EbpfReg::R10, src_offset));
@@ -1305,7 +1378,13 @@ impl<'a> IrToEbpfCompiler<'a> {
                     .push(EbpfInsn::add64_imm(ebpf_dst, stack_offset as i32));
 
                 // Track that this register points to a stack string
-                self.stack_strings.insert(src_dst.get(), stack_offset);
+                self.stack_strings.insert(
+                    src_dst.get(),
+                    StackString {
+                        offset: stack_offset,
+                        size: 16,
+                    },
+                );
                 self.set_register_type(src_dst, BpfFieldType::Comm);
             }
             "ktime" => {

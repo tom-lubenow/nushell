@@ -32,8 +32,11 @@ pub struct CompileResult {
 /// Name of the ring buffer map for output
 pub(crate) const RINGBUF_MAP_NAME: &str = "events";
 
-/// Name of the counter hash map for bpf-count
+/// Name of the counter hash map for bpf-count (integer keys)
 pub(crate) const COUNTER_MAP_NAME: &str = "counters";
+
+/// Name of the string counter hash map for bpf-count (string keys like $ctx.comm)
+pub(crate) const STRING_COUNTER_MAP_NAME: &str = "str_counters";
 
 /// Name of the timestamp hash map for bpf-start-timer/bpf-stop-timer
 pub(crate) const TIMESTAMP_MAP_NAME: &str = "timestamps";
@@ -197,8 +200,10 @@ pub struct IrToEbpfCompiler<'a> {
     pending_jumps: Vec<PendingJump>,
     /// Whether the program needs a ring buffer map for output
     needs_ringbuf: bool,
-    /// Whether the program needs a counter hash map
+    /// Whether the program needs a counter hash map (integer keys)
     needs_counter_map: bool,
+    /// Whether the program needs a string counter hash map (for $ctx.comm keys)
+    needs_string_counter_map: bool,
     /// Whether the program needs a timestamp hash map for latency tracking
     needs_timestamp_map: bool,
     /// Whether the program needs a histogram hash map
@@ -337,6 +342,7 @@ impl<'a> IrToEbpfCompiler<'a> {
             pending_jumps: Vec::new(),
             needs_ringbuf: false,
             needs_counter_map: false,
+            needs_string_counter_map: false,
             needs_timestamp_map: false,
             needs_histogram_map: false,
             needs_kstack_map: false,
@@ -407,6 +413,12 @@ impl<'a> IrToEbpfCompiler<'a> {
             maps.push(EbpfMap {
                 name: COUNTER_MAP_NAME.to_string(),
                 def: BpfMapDef::counter_hash(),
+            });
+        }
+        if compiler.needs_string_counter_map {
+            maps.push(EbpfMap {
+                name: STRING_COUNTER_MAP_NAME.to_string(),
+                def: BpfMapDef::string_counter_hash(),
             });
         }
         if compiler.needs_timestamp_map {
@@ -548,9 +560,14 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.needs_ringbuf = value;
     }
 
-    /// Set that the program needs a counter map
+    /// Set that the program needs a counter map (integer keys)
     pub(crate) fn set_needs_counter_map(&mut self, value: bool) {
         self.needs_counter_map = value;
+    }
+
+    /// Set that the program needs a string counter map (for $ctx.comm keys)
+    pub(crate) fn set_needs_string_counter_map(&mut self, value: bool) {
+        self.needs_string_counter_map = value;
     }
 
     /// Set that the program needs a timestamp map
@@ -1612,8 +1629,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R3, flags));
 
         // Call bpf_get_stackid
-        self.builder()
-            .push(EbpfInsn::call(BpfHelper::GetStackId));
+        self.builder().push(EbpfInsn::call(BpfHelper::GetStackId));
 
         // Result (stack ID or negative error) is in R0, move to destination
         self.builder()

@@ -156,8 +156,10 @@ pub struct ActiveProbe {
     ebpf: Ebpf,
     /// Whether this probe has a ring buffer map for output
     has_ringbuf: bool,
-    /// Whether this probe has a counter hash map
+    /// Whether this probe has a counter hash map (integer keys)
     has_counter_map: bool,
+    /// Whether this probe has a string counter hash map (string keys like $ctx.comm)
+    has_string_counter_map: bool,
     /// Whether this probe has a histogram hash map
     has_histogram_map: bool,
     /// Whether this probe has a kernel stack trace map
@@ -180,6 +182,7 @@ impl std::fmt::Debug for ActiveProbe {
             .field("attached_at", &self.attached_at)
             .field("has_ringbuf", &self.has_ringbuf)
             .field("has_counter_map", &self.has_counter_map)
+            .field("has_string_counter_map", &self.has_string_counter_map)
             .field("has_histogram_map", &self.has_histogram_map)
             .field("has_kstack_map", &self.has_kstack_map)
             .field("has_ustack_map", &self.has_ustack_map)
@@ -219,11 +222,20 @@ pub struct BpfEvent {
     pub cpu: u32,
 }
 
-/// A counter entry from the bpf-count hash map
+/// A counter entry from the bpf-count hash map (integer keys)
 #[derive(Debug, Clone)]
 pub struct CounterEntry {
-    /// The key (e.g., PID or comm as i64)
+    /// The key (e.g., PID as i64)
     pub key: i64,
+    /// The count value
+    pub count: i64,
+}
+
+/// A counter entry from the bpf-count hash map (string keys like $ctx.comm)
+#[derive(Debug, Clone)]
+pub struct StringCounterEntry {
+    /// The key (e.g., process name from $ctx.comm)
+    pub key: String,
     /// The count value
     pub count: i64,
 }
@@ -430,6 +442,7 @@ impl EbpfState {
         // Check for maps
         let has_ringbuf = ebpf.map("events").is_some();
         let has_counter_map = ebpf.map("counters").is_some();
+        let has_string_counter_map = ebpf.map("str_counters").is_some();
         let has_histogram_map = ebpf.map("histogram").is_some();
         let has_kstack_map = ebpf.map("kstacks").is_some();
         let has_ustack_map = ebpf.map("ustacks").is_some();
@@ -440,8 +453,9 @@ impl EbpfState {
                 .take_map("events")
                 .ok_or_else(|| LoadError::MapNotFound("events".to_string()))?;
 
-            let ringbuf = RingBuf::try_from(ring_map)
-                .map_err(|e| LoadError::PerfBuffer(format!("Failed to convert ring buffer map: {e}")))?;
+            let ringbuf = RingBuf::try_from(ring_map).map_err(|e| {
+                LoadError::PerfBuffer(format!("Failed to convert ring buffer map: {e}"))
+            })?;
 
             Some(ringbuf)
         } else {
@@ -466,6 +480,7 @@ impl EbpfState {
             ebpf,
             has_ringbuf,
             has_counter_map,
+            has_string_counter_map,
             has_histogram_map,
             has_kstack_map,
             has_ustack_map,
@@ -631,7 +646,7 @@ impl EbpfState {
         Ok(entries)
     }
 
-    /// Read all counter entries from a probe's counter map
+    /// Read all counter entries from a probe's counter map (integer keys)
     ///
     /// Returns all key-value pairs from the bpf-count hash map.
     pub fn get_counters(&self, id: u32) -> Result<Vec<CounterEntry>, LoadError> {
@@ -640,6 +655,42 @@ impl EbpfState {
             .into_iter()
             .map(|(key, count)| CounterEntry { key, count })
             .collect())
+    }
+
+    /// Read all counter entries from a probe's string counter map
+    ///
+    /// Returns all key-value pairs from the bpf-count hash map with string keys
+    /// (e.g., process names from $ctx.comm).
+    pub fn get_string_counters(&self, id: u32) -> Result<Vec<StringCounterEntry>, LoadError> {
+        let mut probes = self.probes.lock().unwrap();
+        let probe = probes.get_mut(&id).ok_or(LoadError::ProbeNotFound(id))?;
+
+        if !probe.has_string_counter_map {
+            return Ok(Vec::new());
+        }
+
+        let mut entries = Vec::new();
+
+        if let Some(map) = probe.ebpf.map_mut("str_counters") {
+            // String counter map uses [u8; 16] as key (comm is 16 bytes)
+            let hash_map: AyaHashMap<_, [u8; 16], i64> =
+                AyaHashMap::try_from(map).map_err(|e| {
+                    LoadError::MapNotFound(format!("Failed to convert str_counters map: {e}"))
+                })?;
+
+            for item in hash_map.iter() {
+                if let Ok((key_bytes, count)) = item {
+                    // Convert the key bytes to a string (null-terminated)
+                    let key = std::str::from_utf8(&key_bytes)
+                        .unwrap_or("")
+                        .trim_end_matches('\0')
+                        .to_string();
+                    entries.push(StringCounterEntry { key, count });
+                }
+            }
+        }
+
+        Ok(entries)
     }
 
     /// Read all histogram entries from a probe's histogram map
@@ -683,9 +734,7 @@ impl EbpfState {
         has_map: impl Fn(&ActiveProbe) -> bool,
     ) -> Result<Vec<StackTrace>, LoadError> {
         let mut probes = self.probes.lock().unwrap();
-        let probe = probes
-            .get_mut(&id)
-            .ok_or(LoadError::ProbeNotFound(id))?;
+        let probe = probes.get_mut(&id).ok_or(LoadError::ProbeNotFound(id))?;
 
         if !has_map(probe) {
             return Ok(Vec::new());
@@ -695,9 +744,10 @@ impl EbpfState {
 
         if let Some(map) = probe.ebpf.map_mut(map_name) {
             // StackTraceMap is keyed by stack_id (u32) and contains arrays of u64 IPs
-            let stack_map: aya::maps::StackTraceMap<_> =
-                aya::maps::StackTraceMap::try_from(map)
-                    .map_err(|e| LoadError::MapNotFound(format!("Failed to access {}: {}", map_name, e)))?;
+            let stack_map: aya::maps::StackTraceMap<_> = aya::maps::StackTraceMap::try_from(map)
+                .map_err(|e| {
+                    LoadError::MapNotFound(format!("Failed to access {}: {}", map_name, e))
+                })?;
 
             for item in stack_map.iter() {
                 if let Ok((stack_id, trace)) = item {

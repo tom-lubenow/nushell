@@ -76,6 +76,20 @@ impl BpfMapDef {
         }
     }
 
+    /// Create a hash map for counting with string keys (key: 16 bytes comm, value: i64)
+    ///
+    /// Used when counting by process name ($ctx.comm) instead of numeric keys.
+    pub fn string_counter_hash() -> Self {
+        Self {
+            map_type: BpfMapType::Hash as u32,
+            key_size: 16,       // sizeof(comm) - 16-byte process name
+            value_size: 8,      // sizeof(i64) - the count
+            max_entries: 10240, // Maximum number of unique keys
+            map_flags: 0,
+            pinning: BpfPinningType::None,
+        }
+    }
+
     /// Create a hash map for storing timestamps (key: i64 TID, value: i64 timestamp)
     pub fn timestamp_hash() -> Self {
         Self {
@@ -121,8 +135,8 @@ impl BpfMapDef {
     pub fn ring_buffer(size_bytes: u32) -> Self {
         Self {
             map_type: BpfMapType::RingBuf as u32,
-            key_size: 0,        // Not used for ring buffers
-            value_size: 0,      // Not used for ring buffers
+            key_size: 0,             // Not used for ring buffers
+            value_size: 0,           // Not used for ring buffers
             max_entries: size_bytes, // Buffer size in bytes (must be power of 2)
             map_flags: 0,
             pinning: BpfPinningType::None,

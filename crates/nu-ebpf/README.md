@@ -88,7 +88,7 @@ These commands are used inside eBPF closures:
 
 | Command | Description |
 |---------|-------------|
-| `count` | Increment counter keyed by input value |
+| `count` | Increment counter keyed by input value (supports both integers like `$ctx.pid` and strings like `$ctx.comm`) |
 | `histogram` | Add value to log2 histogram |
 | `start-timer` | Start latency timer (store ktime by TID) |
 | `stop-timer` | Stop timer and return elapsed nanoseconds |
@@ -107,9 +107,21 @@ ebpf attach -s 'kprobe:ksys_read' {|ctx|
 ### Count Events by Process
 
 ```nushell
-# Count read() calls per process
+# Count read() calls per process name
 let id = ebpf attach 'kprobe:ksys_read' {|ctx|
     $ctx.comm | count
+}
+sleep 5sec
+ebpf counters $id | sort-by count --reverse
+ebpf detach $id
+```
+
+### Count Events by PID
+
+```nushell
+# Count read() calls per PID
+let id = ebpf attach 'kprobe:ksys_read' {|ctx|
+    $ctx.pid | count
 }
 sleep 5sec
 ebpf counters $id | sort-by count --reverse

@@ -33,7 +33,11 @@ Example workflow:
             .required("id", SyntaxShape::Int, "Probe ID to get stack traces from")
             .switch("kernel", "Show only kernel stacks (default)", Some('k'))
             .switch("user", "Show only user stacks", Some('u'))
-            .switch("symbolize", "Resolve kernel addresses to symbols", Some('s'))
+            .switch(
+                "symbolize",
+                "Resolve kernel addresses to symbols",
+                Some('s'),
+            )
             .switch("raw", "Show raw addresses without formatting", Some('r'))
             .input_output_types(vec![(Type::Nothing, Type::table())])
             .category(Category::Experimental)

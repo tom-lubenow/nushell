@@ -43,6 +43,11 @@ Example workflow:
                 result: None,
             },
             Example {
+                example: "let id = ebpf attach 'kprobe:sys_read' {|ctx| $ctx.comm | count }; sleep 5sec; ebpf counters $id",
+                description: "Count sys_read calls per process name",
+                result: None,
+            },
+            Example {
                 example: "ebpf counters $id | sort-by count --reverse",
                 description: "Show counters sorted by count descending",
                 result: None,
@@ -74,7 +79,11 @@ fn run_counters(
     let span = call.head;
 
     let state = get_state();
-    let entries = state
+
+    let mut records: Vec<Value> = Vec::new();
+
+    // Get integer counters
+    let int_entries = state
         .get_counters(id)
         .map_err(|e| ShellError::GenericError {
             error: "Failed to get counters".into(),
@@ -84,39 +93,36 @@ fn run_counters(
             inner: vec![],
         })?;
 
-    // Convert entries to a table
-    let records: Vec<Value> = entries
-        .into_iter()
-        .map(|entry| {
-            // Try to decode key as process name (comm)
-            let key_display = match try_decode_comm(entry.key) {
-                Some(comm) => Value::string(comm, span),
-                None => Value::int(entry.key, span),
-            };
-            Value::record(
-                record! {
-                    "key" => key_display,
-                    "count" => Value::int(entry.count, span),
-                },
-                span,
-            )
-        })
-        .collect();
+    for entry in int_entries {
+        records.push(Value::record(
+            record! {
+                "key" => Value::int(entry.key, span),
+                "count" => Value::int(entry.count, span),
+            },
+            span,
+        ));
+    }
+
+    // Get string counters (from $ctx.comm | count)
+    let string_entries = state
+        .get_string_counters(id)
+        .map_err(|e| ShellError::GenericError {
+            error: "Failed to get string counters".into(),
+            msg: e.to_string(),
+            span: Some(span),
+            help: None,
+            inner: vec![],
+        })?;
+
+    for entry in string_entries {
+        records.push(Value::record(
+            record! {
+                "key" => Value::string(entry.key, span),
+                "count" => Value::int(entry.count, span),
+            },
+            span,
+        ));
+    }
 
     Ok(Value::list(records, span).into_pipeline_data())
-}
-
-/// Try to decode an i64 key as a process name (comm)
-/// Returns Some(string) if the bytes look like valid UTF-8, None otherwise
-#[cfg(target_os = "linux")]
-fn try_decode_comm(key: i64) -> Option<String> {
-    let bytes = key.to_le_bytes();
-    // Find null terminator or end
-    let len = bytes.iter().position(|&b| b == 0).unwrap_or(8);
-    // Check if bytes are printable ASCII (common for process names)
-    if bytes[..len].iter().all(|&b| b >= 0x20 && b < 0x7f) {
-        String::from_utf8(bytes[..len].to_vec()).ok()
-    } else {
-        None
-    }
 }

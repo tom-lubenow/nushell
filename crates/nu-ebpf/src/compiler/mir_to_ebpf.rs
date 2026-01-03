@@ -793,17 +793,21 @@ impl<'a> MirToEbpfCompiler<'a> {
     }
 
     /// Convert MIR type to BPF field type and size
+    /// Note: All sizes are aligned to 8 bytes for eBPF stack alignment requirements
     fn mir_type_to_bpf_field(&self, ty: &MirType) -> (BpfFieldType, usize) {
         match ty {
             MirType::I64 | MirType::U64 => (BpfFieldType::Int, 8),
-            MirType::I32 | MirType::U32 => (BpfFieldType::Int, 4),
-            MirType::I16 | MirType::U16 => (BpfFieldType::Int, 2),
-            MirType::I8 | MirType::U8 | MirType::Bool => (BpfFieldType::Int, 1),
+            // I32 still uses 8 bytes for stack alignment
+            MirType::I32 | MirType::U32 => (BpfFieldType::Int, 8),
+            MirType::I16 | MirType::U16 => (BpfFieldType::Int, 8),
+            MirType::I8 | MirType::U8 | MirType::Bool => (BpfFieldType::Int, 8),
             MirType::Array { elem, len } if matches!(elem.as_ref(), MirType::U8) && *len == 16 => {
                 (BpfFieldType::Comm, 16)
             }
             MirType::Array { elem, len } if matches!(elem.as_ref(), MirType::U8) => {
-                (BpfFieldType::String, *len)
+                // Round up to 8-byte alignment
+                let aligned_len = (*len + 7) & !7;
+                (BpfFieldType::String, aligned_len)
             }
             _ => (BpfFieldType::Int, 8), // Default to 64-bit int
         }

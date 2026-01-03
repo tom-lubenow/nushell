@@ -55,6 +55,8 @@ struct RegMetadata {
     string_slot: Option<StackSlotId>,
     /// Record fields being built
     record_fields: Vec<RecordField>,
+    /// Type of value in this register (for context fields)
+    field_type: Option<MirType>,
 }
 
 /// Lowering context for IR to MIR conversion
@@ -593,11 +595,23 @@ impl<'a> IrToMirLowering<'a> {
         let dst_vreg = self.get_vreg(src_dst);
         self.emit(MirInst::LoadCtxField {
             dst: dst_vreg,
-            field: ctx_field,
+            field: ctx_field.clone(),
         });
 
-        // Clear context flag since result is now a value
-        self.clear_metadata(src_dst);
+        // Determine the type of this context field
+        let field_type = match &ctx_field {
+            CtxField::Comm => MirType::Array {
+                elem: Box::new(MirType::U8),
+                len: 16,
+            },
+            CtxField::Pid | CtxField::Tid | CtxField::Uid | CtxField::Gid => MirType::I32,
+            _ => MirType::I64,
+        };
+
+        // Clear context flag but set the field type
+        let meta = self.get_or_create_metadata(src_dst);
+        meta.is_context = false;
+        meta.field_type = Some(field_type);
 
         Ok(())
     }
@@ -754,6 +768,12 @@ impl<'a> IrToMirLowering<'a> {
 
         let val_vreg = self.get_vreg(val);
 
+        // Get the type from the value register's metadata, defaulting to I64
+        let field_type = self
+            .get_metadata(val)
+            .and_then(|m| m.field_type.clone())
+            .unwrap_or(MirType::I64);
+
         // IMPORTANT: Create a fresh VReg and copy the value to preserve it.
         // The IR reuses registers, so val_vreg might be overwritten by subsequent operations.
         // By copying to a fresh VReg, we ensure the value is preserved until emit time.
@@ -763,12 +783,12 @@ impl<'a> IrToMirLowering<'a> {
             src: MirValue::VReg(val_vreg),
         });
 
-        // Add field to the record being built (using preserved VReg)
+        // Add field to the record being built (using preserved VReg with inferred type)
         let field = RecordField {
             name: field_name,
             value_vreg: preserved_vreg,
             stack_offset: None,
-            ty: MirType::I64, // Default, could be inferred
+            ty: field_type,
         };
 
         let meta = self.get_or_create_metadata(src_dst);

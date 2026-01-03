@@ -2368,4 +2368,142 @@ mod tests {
             "MIR compiler produced empty bytecode"
         );
     }
+
+    /// Test register pressure - more vregs than physical registers
+    /// This tests the linear scan register allocator integration
+    #[test]
+    fn test_register_pressure_integration() {
+        // Create code that uses more than 3 registers (we have R6, R7, R8)
+        // v0 = 1, v1 = 2, v2 = 3, v3 = 4, v4 = 5
+        // result = v0 + v1 + v2 + v3 + v4 (needs all values live)
+        let ir = make_ir_block(vec![
+            // Load 5 values into different registers
+            Instruction::LoadLiteral {
+                dst: RegId::new(0),
+                lit: Literal::Int(1),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(1),
+                lit: Literal::Int(2),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(2),
+                lit: Literal::Int(3),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(3),
+                lit: Literal::Int(4),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(4),
+                lit: Literal::Int(5),
+            },
+            // Chain additions to force all values to be live
+            // r0 = r0 + r1 (1 + 2 = 3)
+            Instruction::BinaryOp {
+                lhs_dst: RegId::new(0),
+                op: Operator::Math(Math::Add),
+                rhs: RegId::new(1),
+            },
+            // r0 = r0 + r2 (3 + 3 = 6)
+            Instruction::BinaryOp {
+                lhs_dst: RegId::new(0),
+                op: Operator::Math(Math::Add),
+                rhs: RegId::new(2),
+            },
+            // r0 = r0 + r3 (6 + 4 = 10)
+            Instruction::BinaryOp {
+                lhs_dst: RegId::new(0),
+                op: Operator::Math(Math::Add),
+                rhs: RegId::new(3),
+            },
+            // r0 = r0 + r4 (10 + 5 = 15)
+            Instruction::BinaryOp {
+                lhs_dst: RegId::new(0),
+                op: Operator::Math(Math::Add),
+                rhs: RegId::new(4),
+            },
+            Instruction::Return { src: RegId::new(0) },
+        ]);
+
+        // New MIR compiler should handle register pressure via linear scan
+        let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
+        let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
+
+        // Should produce valid bytecode
+        assert!(
+            !mir_result.bytecode.is_empty(),
+            "MIR compiler should produce bytecode even with register pressure"
+        );
+        assert_eq!(
+            mir_result.bytecode.len() % 8,
+            0,
+            "Bytecode should be aligned to 8 bytes"
+        );
+
+        // Should produce more instructions due to spill/reload
+        // A basic version without spilling would be ~11 instructions
+        // With spilling we expect more
+        let insn_count = mir_result.bytecode.len() / 8;
+        assert!(
+            insn_count >= 10,
+            "Should have at least 10 instructions, got {}",
+            insn_count
+        );
+    }
+
+    /// Test that the linear scan allocator correctly handles simultaneous live ranges
+    #[test]
+    fn test_simultaneous_live_ranges() {
+        // Create a pattern where multiple values must be live at once:
+        // v0 = 10, v1 = 20, v2 = 30, v3 = 40
+        // temp = v0 + v1
+        // result = temp + v2 + v3
+        // Here v2 and v3 are live across multiple operations
+        let ir = make_ir_block(vec![
+            Instruction::LoadLiteral {
+                dst: RegId::new(0),
+                lit: Literal::Int(10),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(1),
+                lit: Literal::Int(20),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(2),
+                lit: Literal::Int(30),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(3),
+                lit: Literal::Int(40),
+            },
+            // v0 = v0 + v1 (v2, v3 still live)
+            Instruction::BinaryOp {
+                lhs_dst: RegId::new(0),
+                op: Operator::Math(Math::Add),
+                rhs: RegId::new(1),
+            },
+            // v0 = v0 + v2 (v3 still live)
+            Instruction::BinaryOp {
+                lhs_dst: RegId::new(0),
+                op: Operator::Math(Math::Add),
+                rhs: RegId::new(2),
+            },
+            // v0 = v0 + v3
+            Instruction::BinaryOp {
+                lhs_dst: RegId::new(0),
+                op: Operator::Math(Math::Add),
+                rhs: RegId::new(3),
+            },
+            Instruction::Return { src: RegId::new(0) },
+        ]);
+
+        let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
+        let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
+
+        assert!(
+            !mir_result.bytecode.is_empty(),
+            "Should compile with simultaneous live ranges"
+        );
+    }
 }

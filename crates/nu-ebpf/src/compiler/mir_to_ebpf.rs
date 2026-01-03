@@ -12,9 +12,10 @@ use std::collections::HashMap;
 use crate::compiler::elf::{BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext};
 use crate::compiler::instruction::{opcode, BpfHelper, EbpfInsn, EbpfReg};
 use crate::compiler::ir_to_ebpf::pt_regs_offsets;
+use crate::compiler::elf::{BpfFieldType, SchemaField};
 use crate::compiler::mir::{
-    BasicBlock, BinOpKind, BlockId, CtxField, MirFunction, MirInst, MirProgram, MirValue,
-    StackSlotId, UnaryOpKind, VReg,
+    BasicBlock, BinOpKind, BlockId, CtxField, MirFunction, MirInst, MirProgram, MirType, MirValue,
+    RecordFieldDef, StackSlotId, UnaryOpKind, VReg,
 };
 use crate::compiler::CompileError;
 
@@ -314,6 +315,11 @@ impl<'a> MirToEbpfCompiler<'a> {
                 self.needs_ringbuf = true;
                 let data_reg = self.ensure_reg(*data)?;
                 self.compile_emit_event(data_reg, *size)?;
+            }
+
+            MirInst::EmitRecord { fields } => {
+                self.needs_ringbuf = true;
+                self.compile_emit_record(fields)?;
             }
 
             MirInst::MapUpdate { map, key, .. } => {
@@ -685,6 +691,122 @@ impl<'a> MirToEbpfCompiler<'a> {
             .push(EbpfInsn::call(BpfHelper::RingbufOutput));
 
         Ok(())
+    }
+
+    /// Compile emit record to ring buffer
+    fn compile_emit_record(&mut self, fields: &[RecordFieldDef]) -> Result<(), CompileError> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+
+        // Build schema and calculate total size
+        let mut schema_fields = Vec::new();
+        let mut offset = 0usize;
+        let mut total_size = 0usize;
+
+        for field in fields {
+            let (field_type, size) = self.mir_type_to_bpf_field(&field.ty);
+            schema_fields.push(SchemaField {
+                name: field.name.clone(),
+                field_type,
+                offset,
+            });
+            offset += size;
+            total_size += size;
+        }
+
+        // Store schema
+        self.event_schema = Some(EventSchema {
+            fields: schema_fields,
+            total_size,
+        });
+
+        // Allocate contiguous buffer on stack
+        self.check_stack_space(total_size as i16)?;
+        self.stack_offset -= total_size as i16;
+        let buffer_offset = self.stack_offset;
+
+        // Copy each field value to the buffer
+        let mut dest_offset = buffer_offset;
+        for field in fields {
+            let (_, size) = self.mir_type_to_bpf_field(&field.ty);
+
+            // Get the field value into a register
+            let field_reg = self.ensure_reg(field.value)?;
+
+            // Store to the buffer
+            // For 8-byte values, use stxdw
+            if size == 8 {
+                self.instructions
+                    .push(EbpfInsn::stxdw(EbpfReg::R10, dest_offset, field_reg));
+            } else if size == 4 {
+                self.instructions
+                    .push(EbpfInsn::stxw(EbpfReg::R10, dest_offset, field_reg));
+            } else {
+                // For larger types (like comm=16), copy in 8-byte chunks
+                // The field_reg should be a pointer to the data
+                for chunk in 0..(size / 8) {
+                    self.instructions.push(EbpfInsn::ldxdw(
+                        EbpfReg::R0,
+                        field_reg,
+                        (chunk * 8) as i16,
+                    ));
+                    self.instructions.push(EbpfInsn::stxdw(
+                        EbpfReg::R10,
+                        dest_offset + (chunk * 8) as i16,
+                        EbpfReg::R0,
+                    ));
+                }
+            }
+
+            dest_offset += size as i16;
+        }
+
+        // Emit the buffer via ring buffer
+        // bpf_ringbuf_output(map, data, size, flags)
+        let reloc_offset = self.instructions.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
+        self.instructions.push(insn1);
+        self.instructions.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: reloc_offset,
+            map_name: RINGBUF_MAP_NAME.to_string(),
+        });
+
+        // R2 = pointer to buffer
+        self.instructions
+            .push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.instructions
+            .push(EbpfInsn::add64_imm(EbpfReg::R2, buffer_offset as i32));
+
+        // R3 = total size
+        self.instructions
+            .push(EbpfInsn::mov64_imm(EbpfReg::R3, total_size as i32));
+
+        // R4 = flags
+        self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R4, 0));
+
+        self.instructions
+            .push(EbpfInsn::call(BpfHelper::RingbufOutput));
+
+        Ok(())
+    }
+
+    /// Convert MIR type to BPF field type and size
+    fn mir_type_to_bpf_field(&self, ty: &MirType) -> (BpfFieldType, usize) {
+        match ty {
+            MirType::I64 | MirType::U64 => (BpfFieldType::Int, 8),
+            MirType::I32 | MirType::U32 => (BpfFieldType::Int, 4),
+            MirType::I16 | MirType::U16 => (BpfFieldType::Int, 2),
+            MirType::I8 | MirType::U8 | MirType::Bool => (BpfFieldType::Int, 1),
+            MirType::Array { elem, len } if matches!(elem.as_ref(), MirType::U8) && *len == 16 => {
+                (BpfFieldType::Comm, 16)
+            }
+            MirType::Array { elem, len } if matches!(elem.as_ref(), MirType::U8) => {
+                (BpfFieldType::String, *len)
+            }
+            _ => (BpfFieldType::Int, 8), // Default to 64-bit int
+        }
     }
 
     /// Compile map update (for count operation)

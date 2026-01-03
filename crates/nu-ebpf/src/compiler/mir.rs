@@ -149,6 +149,17 @@ pub struct StructField {
     pub offset: usize,
 }
 
+/// A field in a record being emitted
+#[derive(Debug, Clone)]
+pub struct RecordFieldDef {
+    /// Field name
+    pub name: String,
+    /// Virtual register holding the value
+    pub value: VReg,
+    /// Type of the field
+    pub ty: MirType,
+}
+
 /// Stack slot for explicit stack allocation
 #[derive(Debug, Clone)]
 pub struct StackSlot {
@@ -381,6 +392,12 @@ pub enum MirInst {
         size: usize,
     },
 
+    /// Emit structured record to ring buffer
+    EmitRecord {
+        /// Fields to emit, in order
+        fields: Vec<RecordFieldDef>,
+    },
+
     // Context access
     /// Load context field
     LoadCtxField {
@@ -519,6 +536,11 @@ impl MirInst {
             }
             MirInst::MapDelete { key, .. } => uses.push(*key),
             MirInst::EmitEvent { data, .. } => uses.push(*data),
+            MirInst::EmitRecord { fields } => {
+                for field in fields {
+                    uses.push(field.value);
+                }
+            }
             MirInst::LoadCtxField { .. } => {}
             MirInst::ReadStr { ptr, .. } => uses.push(*ptr),
             MirInst::StrCmp { .. } => {}

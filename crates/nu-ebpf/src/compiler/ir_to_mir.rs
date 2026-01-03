@@ -13,7 +13,7 @@ use nu_protocol::{DeclId, RegId, Value, VarId};
 use super::elf::ProbeContext;
 use super::mir::{
     BasicBlock, BinOpKind, BlockId, CtxField, MapKind, MapRef, MirFunction, MirInst, MirProgram,
-    MirType, MirValue, StackSlotId, StackSlotKind, VReg,
+    MirType, MirValue, RecordFieldDef, StackSlotId, StackSlotKind, VReg,
 };
 use super::CompileError;
 
@@ -35,6 +35,8 @@ pub enum BpfCommand {
 struct RecordField {
     name: String,
     value_vreg: VReg,
+    /// Stack offset where this field's value is stored (for safety)
+    stack_offset: Option<i16>,
     ty: MirType,
 }
 
@@ -77,6 +79,8 @@ pub struct IrToMirLowering<'a> {
     ctx_param: Option<VarId>,
     /// Pipeline input register (for commands)
     pipeline_input: Option<VReg>,
+    /// Pipeline input source RegId (for metadata lookup)
+    pipeline_input_reg: Option<RegId>,
     /// Needs ringbuf map
     pub needs_ringbuf: bool,
     /// Needs counter map
@@ -107,6 +111,7 @@ impl<'a> IrToMirLowering<'a> {
             captures,
             ctx_param,
             pipeline_input: None,
+            pipeline_input_reg: None,
             needs_ringbuf: false,
             needs_counter_map: false,
         }
@@ -259,12 +264,14 @@ impl<'a> IrToMirLowering<'a> {
                 // Set up pipeline input for the next command
                 let src_vreg = self.get_vreg(*src);
                 self.pipeline_input = Some(src_vreg);
+                self.pipeline_input_reg = Some(*src);
             }
 
             Instruction::AppendRest { src } => {
                 // Same as PushPositional for our simple case
                 let src_vreg = self.get_vreg(*src);
                 self.pipeline_input = Some(src_vreg);
+                self.pipeline_input_reg = Some(*src);
             }
 
             // === Records ===
@@ -607,12 +614,39 @@ impl<'a> IrToMirLowering<'a> {
         match cmd_name.as_str() {
             "emit" => {
                 self.needs_ringbuf = true;
-                // Get the pipeline input
-                let data_vreg = self.pipeline_input.unwrap_or(dst_vreg);
-                self.emit(MirInst::EmitEvent {
-                    data: data_vreg,
-                    size: 8, // Default to 8 bytes, will be adjusted in MIR->eBPF
-                });
+                // Check if we're emitting a record - check both pipeline_input_reg and src_dst
+                // (src_dst is used when record is piped directly: { ... } | emit)
+                let record_fields = self
+                    .pipeline_input_reg
+                    .and_then(|reg| self.get_metadata(reg))
+                    .map(|m| m.record_fields.clone())
+                    .filter(|f| !f.is_empty())
+                    .or_else(|| {
+                        self.get_metadata(src_dst)
+                            .map(|m| m.record_fields.clone())
+                            .filter(|f| !f.is_empty())
+                    })
+                    .unwrap_or_default();
+
+                if !record_fields.is_empty() {
+                    // Emit a structured record
+                    let fields: Vec<RecordFieldDef> = record_fields
+                        .iter()
+                        .map(|f| RecordFieldDef {
+                            name: f.name.clone(),
+                            value: f.value_vreg,
+                            ty: f.ty.clone(),
+                        })
+                        .collect();
+                    self.emit(MirInst::EmitRecord { fields });
+                } else {
+                    // Emit a single value
+                    let data_vreg = self.pipeline_input.unwrap_or(dst_vreg);
+                    self.emit(MirInst::EmitEvent {
+                        data: data_vreg,
+                        size: 8, // Default to 8 bytes
+                    });
+                }
                 // Set result to 0
                 self.emit(MirInst::Copy {
                     dst: dst_vreg,
@@ -699,6 +733,7 @@ impl<'a> IrToMirLowering<'a> {
         }
 
         self.pipeline_input = None;
+        self.pipeline_input_reg = None;
         Ok(())
     }
 
@@ -719,10 +754,20 @@ impl<'a> IrToMirLowering<'a> {
 
         let val_vreg = self.get_vreg(val);
 
-        // Add field to the record being built
+        // IMPORTANT: Create a fresh VReg and copy the value to preserve it.
+        // The IR reuses registers, so val_vreg might be overwritten by subsequent operations.
+        // By copying to a fresh VReg, we ensure the value is preserved until emit time.
+        let preserved_vreg = self.func.alloc_vreg();
+        self.emit(MirInst::Copy {
+            dst: preserved_vreg,
+            src: MirValue::VReg(val_vreg),
+        });
+
+        // Add field to the record being built (using preserved VReg)
         let field = RecordField {
             name: field_name,
-            value_vreg: val_vreg,
+            value_vreg: preserved_vreg,
+            stack_offset: None,
             ty: MirType::I64, // Default, could be inferred
         };
 

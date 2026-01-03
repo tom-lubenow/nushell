@@ -24,8 +24,9 @@ use crate::compiler::ir_to_ebpf::pt_regs_offsets;
 use crate::compiler::elf::{BpfFieldType, SchemaField};
 use crate::compiler::mir::{
     BasicBlock, BinOpKind, BlockId, CtxField, MirFunction, MirInst, MirProgram, MirType, MirValue,
-    RecordFieldDef, StackSlotId, UnaryOpKind, VReg,
+    RecordFieldDef, StackSlotId, StackSlotKind, UnaryOpKind, VReg,
 };
+use crate::compiler::regalloc::{LinearScanAllocator, RegAllocResult};
 use crate::compiler::CompileError;
 
 /// Ring buffer map name
@@ -171,7 +172,14 @@ impl<'a> MirToEbpfCompiler<'a> {
     fn compile_function(&mut self, func: &MirFunction) -> Result<(), CompileError> {
         // Build CFG and compute analysis information
         let cfg = CFG::build(func);
-        let _liveness = LivenessInfo::compute(func, &cfg);
+        let liveness = LivenessInfo::compute(func, &cfg);
+
+        // Run linear scan register allocation
+        let mut allocator = LinearScanAllocator::new(self.available_regs.clone());
+        let alloc_result = allocator.allocate(func, &cfg, &liveness);
+
+        // Pre-populate vreg assignments from linear scan
+        self.apply_register_allocation(&alloc_result)?;
 
         // Use reverse post-order for block layout
         // This ensures that:
@@ -193,6 +201,26 @@ impl<'a> MirToEbpfCompiler<'a> {
             }
             let block = func.block(block_id).clone();
             self.compile_block(&block)?;
+        }
+
+        Ok(())
+    }
+
+    /// Apply register allocation results from linear scan
+    fn apply_register_allocation(&mut self, result: &RegAllocResult) -> Result<(), CompileError> {
+        // Pre-populate register assignments
+        for (&vreg, &phys) in &result.assignments {
+            self.vreg_to_phys.insert(vreg, phys);
+        }
+
+        // Allocate spill slots for spilled vregs
+        for (&vreg, &slot) in &result.spills {
+            // Allocate stack space for spill slot
+            self.check_stack_space(8)?;
+            self.stack_offset -= 8;
+            self.vreg_spills.insert(vreg, self.stack_offset);
+            // Map the slot ID to our stack offset (for later reference)
+            self.slot_offsets.insert(slot, self.stack_offset);
         }
 
         Ok(())

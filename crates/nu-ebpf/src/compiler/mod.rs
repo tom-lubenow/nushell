@@ -24,6 +24,7 @@ mod ir_ops;
 mod ir_to_ebpf;
 pub mod ir_to_mir;
 pub mod mir;
+pub mod mir_to_ebpf;
 mod register_alloc;
 
 pub use elf::{
@@ -32,6 +33,7 @@ pub use elf::{
 };
 pub use instruction::{BpfHelper, EbpfInsn, EbpfReg};
 pub use ir_to_ebpf::{CompileResult, IrToEbpfCompiler};
+pub use mir_to_ebpf::{compile_mir_to_ebpf, MirCompileResult};
 
 use thiserror::Error;
 

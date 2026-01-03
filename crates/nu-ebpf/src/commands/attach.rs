@@ -225,15 +225,17 @@ fn run_attach(
     let pin_group: Option<String> = call.get_flag(engine_state, stack, "pin")?;
     let use_mir = call.has_flag(engine_state, stack, "mir-compiler")?;
 
-    // MIR compiler path (experimental, not yet fully implemented)
+    // MIR compiler path (experimental)
     if use_mir {
-        return Err(ShellError::GenericError {
-            error: "MIR compiler not yet implemented".into(),
-            msg: "The --mir-compiler flag enables the experimental MIR-based compiler, which is still under development".into(),
-            span: Some(call.head),
-            help: Some("Remove --mir-compiler to use the current compiler".into()),
-            inner: vec![],
-        });
+        return compile_with_mir(
+            engine_state,
+            call,
+            &probe_spec,
+            &closure,
+            dry_run,
+            stream,
+            pin_group,
+        );
     }
 
     // Parse the probe specification (includes validation)
@@ -383,6 +385,145 @@ fn run_attach(
         Ok(PipelineData::ListStream(list_stream, None))
     } else {
         // Return probe ID for manual event polling
+        Ok(Value::int(probe_id as i64, call.head).into_pipeline_data())
+    }
+}
+
+/// Compile using the experimental MIR-based compiler
+#[cfg(target_os = "linux")]
+fn compile_with_mir(
+    engine_state: &EngineState,
+    call: &Call,
+    probe_spec: &str,
+    closure: &Closure,
+    dry_run: bool,
+    stream: bool,
+    pin_group: Option<String>,
+) -> Result<PipelineData, ShellError> {
+    use crate::compiler::{
+        compile_mir_to_ebpf, ir_to_mir::lower_ir_to_mir, EbpfProgram, ProbeContext,
+    };
+    use crate::loader::{get_state, parse_probe_spec, LoadError};
+
+    // Parse probe spec
+    let (prog_type, target) = parse_probe_spec(probe_spec).map_err(|e| ShellError::GenericError {
+        error: "Invalid probe specification".into(),
+        msg: e.to_string(),
+        span: Some(call.head),
+        help: Some("Use format like 'kprobe:sys_clone'".into()),
+        inner: vec![],
+    })?;
+
+    let probe_context = ProbeContext::new(prog_type, &target);
+
+    // Get block and IR
+    let block = engine_state.get_block(closure.block_id);
+    let ir_block = block.ir_block.as_ref().ok_or_else(|| ShellError::GenericError {
+        error: "No IR available for closure".into(),
+        msg: "The closure could not be compiled to IR".into(),
+        span: Some(call.head),
+        help: Some("Ensure the closure is a simple expression".into()),
+        inner: vec![],
+    })?;
+
+    // Extract context parameter VarId
+    let ctx_param = block
+        .signature
+        .required_positional
+        .first()
+        .map(|p| p.var_id)
+        .flatten()
+        .map(|vid| nu_protocol::RegId::new(vid.get() as u32));
+
+    // Convert captures to (String, i64) pairs
+    let captures: Vec<(String, i64)> = closure
+        .captures
+        .iter()
+        .filter_map(|(var_id, value)| {
+            if let nu_protocol::Value::Int { val, .. } = value {
+                // We use var_id as the "name" since that's what we track
+                Some((format!("var_{}", var_id.get()), *val))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Lower IR to MIR
+    let mir_program =
+        lower_ir_to_mir(ir_block, Some(&probe_context), Some(engine_state), &captures, ctx_param)
+            .map_err(|e| ShellError::GenericError {
+                error: "MIR lowering failed".into(),
+                msg: e.to_string(),
+                span: Some(call.head),
+                help: Some("The closure may use unsupported operations".into()),
+                inner: vec![],
+            })?;
+
+    // Compile MIR to eBPF
+    let compile_result = compile_mir_to_ebpf(&mir_program, Some(&probe_context)).map_err(|e| {
+        ShellError::GenericError {
+            error: "MIR to eBPF compilation failed".into(),
+            msg: e.to_string(),
+            span: Some(call.head),
+            help: Some("Check that the closure uses supported BPF operations".into()),
+            inner: vec![],
+        }
+    })?;
+
+    let mut program = EbpfProgram::with_maps(
+        prog_type,
+        &target,
+        "nushell_ebpf_mir",
+        compile_result.bytecode,
+        compile_result.maps,
+        compile_result.relocations,
+        compile_result.event_schema,
+    );
+
+    if pin_group.is_some() {
+        program = program.with_pinning();
+    }
+
+    if dry_run {
+        let elf = program.to_elf().map_err(|e| ShellError::GenericError {
+            error: "Failed to generate ELF".into(),
+            msg: e.to_string(),
+            span: Some(call.head),
+            help: None,
+            inner: vec![],
+        })?;
+        return Ok(Value::binary(elf, call.head).into_pipeline_data());
+    }
+
+    // Load and attach
+    let state = get_state();
+    let probe_id = state
+        .attach_with_pin(&program, pin_group.as_deref())
+        .map_err(|e| {
+            let (error, help) = match &e {
+                LoadError::PermissionDenied => (
+                    "Permission denied".into(),
+                    Some("Try running with sudo".into()),
+                ),
+                _ => (e.to_string(), None),
+            };
+            ShellError::GenericError {
+                error: "Failed to attach eBPF probe".into(),
+                msg: error,
+                span: Some(call.head),
+                help,
+                inner: vec![],
+            }
+        })?;
+
+    if stream {
+        let span = call.head;
+        let signals = engine_state.signals().clone();
+        let iter = EventStreamIterator::new(probe_id, span);
+        let list_stream = nu_protocol::ListStream::new(iter, span, signals);
+        Ok(PipelineData::ListStream(list_stream, None))
+    } else {
         Ok(Value::int(probe_id as i64, call.head).into_pipeline_data())
     }
 }

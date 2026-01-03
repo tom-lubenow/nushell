@@ -131,6 +131,11 @@ Requirements:
                 "Pin maps to share between probes (e.g., --pin mygroup)",
                 Some('p'),
             )
+            .switch(
+                "mir-compiler",
+                "Use experimental MIR-based compiler (for testing)",
+                None,
+            )
             .category(Category::Experimental)
     }
 
@@ -218,6 +223,18 @@ fn run_attach(
     let dry_run = call.has_flag(engine_state, stack, "dry-run")?;
     let stream = call.has_flag(engine_state, stack, "stream")?;
     let pin_group: Option<String> = call.get_flag(engine_state, stack, "pin")?;
+    let use_mir = call.has_flag(engine_state, stack, "mir-compiler")?;
+
+    // MIR compiler path (experimental, not yet fully implemented)
+    if use_mir {
+        return Err(ShellError::GenericError {
+            error: "MIR compiler not yet implemented".into(),
+            msg: "The --mir-compiler flag enables the experimental MIR-based compiler, which is still under development".into(),
+            span: Some(call.head),
+            help: Some("Remove --mir-compiler to use the current compiler".into()),
+            inner: vec![],
+        });
+    }
 
     // Parse the probe specification (includes validation)
     let (prog_type, target) =

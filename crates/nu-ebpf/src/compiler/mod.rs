@@ -1,6 +1,20 @@
 //! eBPF bytecode compiler
 //!
 //! This module handles compilation from Nushell IR to eBPF bytecode.
+//!
+//! ## Compilation Pipeline
+//!
+//! Current (legacy):
+//! ```text
+//! Nushell IR → [ir_to_ebpf] → eBPF bytecode
+//! ```
+//!
+//! New (MIR-based, in progress):
+//! ```text
+//! Nushell IR → [ir_to_mir] → MIR → [mir_to_ebpf] → eBPF bytecode
+//! ```
+//!
+//! The MIR compiler can be enabled with `--mir-compiler` flag (experimental).
 
 mod btf;
 mod elf;
@@ -8,6 +22,8 @@ mod helpers;
 pub mod instruction;
 mod ir_ops;
 mod ir_to_ebpf;
+pub mod ir_to_mir;
+pub mod mir;
 mod register_alloc;
 
 pub use elf::{

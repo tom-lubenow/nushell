@@ -24,6 +24,7 @@ pub enum BpfMapType {
     Hash = 1,
     Array = 2,
     PerfEventArray = 4,
+    StackTrace = 7,
     RingBuf = 27,
 }
 
@@ -94,6 +95,18 @@ impl BpfMapDef {
             key_size: 8,     // sizeof(i64) - bucket index (log2 of value)
             value_size: 8,   // sizeof(i64) - count
             max_entries: 64, // 64 buckets covers 0 to 2^63
+            map_flags: 0,
+            pinning: BpfPinningType::None,
+        }
+    }
+
+    /// Create a stack trace map for storing stack traces
+    pub fn stack_trace_map() -> Self {
+        Self {
+            map_type: BpfMapType::StackTrace as u32,
+            key_size: 4,         // sizeof(u32) - stack ID
+            value_size: 127 * 8, // PERF_MAX_STACK_DEPTH frames * sizeof(u64)
+            max_entries: 1024,   // Maximum number of unique stack traces
             map_flags: 0,
             pinning: BpfPinningType::None,
         }

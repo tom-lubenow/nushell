@@ -168,6 +168,10 @@ pub struct ActiveProbe {
     has_counter_map: bool,
     /// Whether this probe has a histogram hash map
     has_histogram_map: bool,
+    /// Whether this probe has a kernel stack trace map
+    has_kstack_map: bool,
+    /// Whether this probe has a user stack trace map
+    has_ustack_map: bool,
     /// Perf buffers for each CPU (only if has_perf_map)
     perf_buffers: Vec<CpuPerfBuffer>,
     /// Optional schema for structured events
@@ -185,6 +189,8 @@ impl std::fmt::Debug for ActiveProbe {
             .field("has_perf_map", &self.has_perf_map)
             .field("has_counter_map", &self.has_counter_map)
             .field("has_histogram_map", &self.has_histogram_map)
+            .field("has_kstack_map", &self.has_kstack_map)
+            .field("has_ustack_map", &self.has_ustack_map)
             .field("event_schema", &self.event_schema.is_some())
             .finish()
     }
@@ -237,6 +243,15 @@ pub struct HistogramEntry {
     pub bucket: i64,
     /// The count of values in this bucket
     pub count: i64,
+}
+
+/// A stack trace with raw instruction pointer addresses
+#[derive(Debug, Clone)]
+pub struct StackTrace {
+    /// The stack ID (used as key in the stack trace map)
+    pub id: i64,
+    /// The instruction pointer addresses (frames from top to bottom)
+    pub frames: Vec<u64>,
 }
 
 /// Global state for managing eBPF probes
@@ -424,6 +439,8 @@ impl EbpfState {
         let has_perf_map = ebpf.map("events").is_some();
         let has_counter_map = ebpf.map("counters").is_some();
         let has_histogram_map = ebpf.map("histogram").is_some();
+        let has_kstack_map = ebpf.map("kstacks").is_some();
+        let has_ustack_map = ebpf.map("ustacks").is_some();
         let mut perf_buffers = Vec::new();
 
         // Set up perf buffers if the program uses bpf-emit
@@ -470,6 +487,8 @@ impl EbpfState {
             has_perf_map,
             has_counter_map,
             has_histogram_map,
+            has_kstack_map,
+            has_ustack_map,
             perf_buffers,
             event_schema: program.event_schema.clone(),
             pin_group: pin_group_owned,
@@ -658,6 +677,69 @@ impl EbpfState {
         entries.sort_by_key(|e| e.bucket);
 
         Ok(entries)
+    }
+
+    /// Read all kernel stack traces from a probe's stack trace map
+    ///
+    /// Returns all stack traces collected by $ctx.kstack.
+    /// Each stack trace contains a unique ID and the instruction pointer addresses.
+    pub fn get_kernel_stacks(&self, id: u32) -> Result<Vec<StackTrace>, LoadError> {
+        self.get_stacks_from_map(id, "kstacks", |p| p.has_kstack_map)
+    }
+
+    /// Read all user stack traces from a probe's stack trace map
+    ///
+    /// Returns all stack traces collected by $ctx.ustack.
+    /// Each stack trace contains a unique ID and the instruction pointer addresses.
+    pub fn get_user_stacks(&self, id: u32) -> Result<Vec<StackTrace>, LoadError> {
+        self.get_stacks_from_map(id, "ustacks", |p| p.has_ustack_map)
+    }
+
+    /// Helper to read stack traces from a named stack trace map
+    fn get_stacks_from_map(
+        &self,
+        id: u32,
+        map_name: &str,
+        has_map: impl Fn(&ActiveProbe) -> bool,
+    ) -> Result<Vec<StackTrace>, LoadError> {
+        let mut probes = self.probes.lock().unwrap();
+        let probe = probes
+            .get_mut(&id)
+            .ok_or(LoadError::ProbeNotFound(id))?;
+
+        if !has_map(probe) {
+            return Ok(Vec::new());
+        }
+
+        let mut stacks = Vec::new();
+
+        if let Some(map) = probe.ebpf.map_mut(map_name) {
+            // StackTraceMap is keyed by stack_id (u32) and contains arrays of u64 IPs
+            let stack_map: aya::maps::StackTraceMap<_> =
+                aya::maps::StackTraceMap::try_from(map)
+                    .map_err(|e| LoadError::MapNotFound(format!("Failed to access {}: {}", map_name, e)))?;
+
+            for item in stack_map.iter() {
+                if let Ok((stack_id, trace)) = item {
+                    // Extract instruction pointers from the trace, filtering zeros
+                    let frames: Vec<u64> = trace
+                        .frames()
+                        .iter()
+                        .map(|f| f.ip)
+                        .filter(|&ip| ip != 0)
+                        .collect();
+
+                    if !frames.is_empty() {
+                        stacks.push(StackTrace {
+                            id: stack_id as i64,
+                            frames,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(stacks)
     }
 
     /// Detach a probe by ID

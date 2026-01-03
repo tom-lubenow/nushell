@@ -41,6 +41,12 @@ pub(crate) const TIMESTAMP_MAP_NAME: &str = "timestamps";
 /// Name of the histogram hash map for bpf-histogram
 pub(crate) const HISTOGRAM_MAP_NAME: &str = "histogram";
 
+/// Name of the kernel stack trace map
+pub(crate) const KSTACK_MAP_NAME: &str = "kstacks";
+
+/// Name of the user stack trace map
+pub(crate) const USTACK_MAP_NAME: &str = "ustacks";
+
 /// Maximum eBPF stack size in bytes (kernel limit)
 /// Stack grows downward from R10, so this is the most negative offset allowed
 const BPF_STACK_LIMIT: i16 = -512;
@@ -197,6 +203,10 @@ pub struct IrToEbpfCompiler<'a> {
     needs_timestamp_map: bool,
     /// Whether the program needs a histogram hash map
     needs_histogram_map: bool,
+    /// Whether the program needs a kernel stack trace map
+    needs_kstack_map: bool,
+    /// Whether the program needs a user stack trace map
+    needs_ustack_map: bool,
     /// Relocations for map references
     relocations: Vec<MapRelocation>,
     /// Current stack offset for temporary storage (grows negative from R10)
@@ -329,6 +339,8 @@ impl<'a> IrToEbpfCompiler<'a> {
             needs_counter_map: false,
             needs_timestamp_map: false,
             needs_histogram_map: false,
+            needs_kstack_map: false,
+            needs_ustack_map: false,
             relocations: Vec::new(),
             stack_offset: -8, // Start at -8 from R10
             ctx_saved: false,
@@ -406,6 +418,18 @@ impl<'a> IrToEbpfCompiler<'a> {
             maps.push(EbpfMap {
                 name: HISTOGRAM_MAP_NAME.to_string(),
                 def: BpfMapDef::histogram_hash(),
+            });
+        }
+        if compiler.needs_kstack_map {
+            maps.push(EbpfMap {
+                name: KSTACK_MAP_NAME.to_string(),
+                def: BpfMapDef::stack_trace_map(),
+            });
+        }
+        if compiler.needs_ustack_map {
+            maps.push(EbpfMap {
+                name: USTACK_MAP_NAME.to_string(),
+                def: BpfMapDef::stack_trace_map(),
             });
         }
 
@@ -536,6 +560,16 @@ impl<'a> IrToEbpfCompiler<'a> {
     /// Set that the program needs a histogram map
     pub(crate) fn set_needs_histogram_map(&mut self, value: bool) {
         self.needs_histogram_map = value;
+    }
+
+    /// Set that the program needs a kernel stack trace map
+    pub(crate) fn set_needs_kstack_map(&mut self, value: bool) {
+        self.needs_kstack_map = value;
+    }
+
+    /// Set that the program needs a user stack trace map
+    pub(crate) fn set_needs_ustack_map(&mut self, value: bool) {
+        self.needs_ustack_map = value;
     }
 
     /// Add a map relocation
@@ -1494,7 +1528,7 @@ impl<'a> IrToEbpfCompiler<'a> {
 
         match field_name {
             // Universal fields (work via BPF helpers)
-            "pid" | "tgid" | "uid" | "gid" | "comm" | "ktime" => {
+            "pid" | "tgid" | "uid" | "gid" | "comm" | "ktime" | "kstack" | "ustack" => {
                 self.compile_universal_field(src_dst, ebpf_dst, field_name)?;
             }
             // Function arguments (arg0-arg5 for x86_64, arg0-arg7 for aarch64)
@@ -1527,13 +1561,60 @@ impl<'a> IrToEbpfCompiler<'a> {
             }
             _ => {
                 return Err(CompileError::UnsupportedInstruction(format!(
-                    "Unknown context field: {field_name}. Supported: pid, tgid, uid, gid, comm, ktime, arg0-arg5, retval"
+                    "Unknown context field: {field_name}. Supported: pid, tgid, uid, gid, comm, ktime, kstack, ustack, arg0-arg5, retval"
                 )));
             }
         }
 
         // The register no longer holds "context" - it now holds the field value
         self.set_context_register(src_dst, false);
+
+        Ok(())
+    }
+
+    /// Compile bpf_get_stackid() call to get kernel or user stack trace ID
+    ///
+    /// This calls bpf_get_stackid(ctx, map, flags) which returns a stack ID
+    /// that can be used to look up the actual stack trace from the map.
+    fn compile_get_stackid(
+        &mut self,
+        src_dst: RegId,
+        ebpf_dst: EbpfReg,
+        user_stack: bool,
+    ) -> Result<(), CompileError> {
+        let map_name = if user_stack {
+            USTACK_MAP_NAME
+        } else {
+            KSTACK_MAP_NAME
+        };
+        // BPF_F_USER_STACK = 256, use 0 for kernel stack
+        let flags: i32 = if user_stack { 256 } else { 0 };
+
+        // R1 = ctx (restore from R9 where we saved it at program start)
+        self.builder()
+            .push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R9));
+
+        // R2 = map fd (will be relocated by loader)
+        let reloc_offset = self.builder().len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R2);
+        self.builder().push(insn1);
+        self.builder().push(insn2);
+        self.add_relocation(MapRelocation {
+            insn_offset: reloc_offset,
+            map_name: map_name.to_string(),
+        });
+
+        // R3 = flags
+        self.builder().push(EbpfInsn::mov64_imm(EbpfReg::R3, flags));
+
+        // Call bpf_get_stackid
+        self.builder()
+            .push(EbpfInsn::call(BpfHelper::GetStackId));
+
+        // Result (stack ID or negative error) is in R0, move to destination
+        self.builder()
+            .push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
+        self.set_register_type(src_dst, BpfFieldType::Int);
 
         Ok(())
     }
@@ -1624,6 +1705,16 @@ impl<'a> IrToEbpfCompiler<'a> {
                 self.builder()
                     .push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R0));
                 self.set_register_type(src_dst, BpfFieldType::Int);
+            }
+            "kstack" => {
+                // Get kernel stack trace ID
+                self.set_needs_kstack_map(true);
+                self.compile_get_stackid(src_dst, ebpf_dst, false)?;
+            }
+            "ustack" => {
+                // Get user stack trace ID
+                self.set_needs_ustack_map(true);
+                self.compile_get_stackid(src_dst, ebpf_dst, true)?;
             }
             _ => {
                 return Err(CompileError::UnsupportedInstruction(format!(

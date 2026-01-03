@@ -8,12 +8,9 @@ This crate enables writing eBPF programs directly in Nushell syntax. Closures ar
 
 ```nushell
 # Trace all file opens and show which processes are opening files
-let id = ebpf attach 'kprobe:do_sys_openat2' {|ctx|
+ebpf attach -s 'kprobe:do_sys_openat2' {|ctx|
     { pid: $ctx.pid, comm: $ctx.comm } | emit
-}
-sleep 5sec
-ebpf events $id
-ebpf detach $id
+} | first 10
 ```
 
 ## Requirements
@@ -31,9 +28,10 @@ ebpf detach $id
 | `ebpf attach <probe> {closure}` | Compile and attach an eBPF probe |
 | `ebpf detach <id>` | Detach a probe by ID |
 | `ebpf list` | List all active probes |
-| `ebpf events <id>` | Poll events from a probe's perf buffer |
+| `ebpf attach -s` | Stream events directly (with --stream flag) |
 | `ebpf counters <id>` | Display counter values from `count` |
 | `ebpf histogram <id>` | Display histogram from `histogram` |
+| `ebpf stacks <id>` | Display stack traces from `$ctx.kstack`/`$ctx.ustack` |
 
 ### Probe Types
 
@@ -57,6 +55,8 @@ Access probe context via the closure parameter `{|ctx| ... }`:
 | `$ctx.comm` | Process name (16-byte string) |
 | `$ctx.arg0` - `$ctx.arg5` | Function arguments (kprobe) |
 | `$ctx.ret` | Return value (kretprobe only) |
+| `$ctx.kstack` | Kernel stack trace ID |
+| `$ctx.ustack` | User stack trace ID |
 
 For tracepoints, context fields are read from the kernel's format specification:
 ```nushell
@@ -92,13 +92,10 @@ These commands are used inside eBPF closures:
 ### Trace System Calls
 
 ```nushell
-# Watch which processes are reading files
-let id = ebpf attach 'kprobe:ksys_read' {|ctx|
+# Watch which processes are reading files (stream 100 events)
+ebpf attach -s 'kprobe:ksys_read' {|ctx|
     $ctx.pid | emit
-}
-sleep 2sec
-ebpf events $id | uniq-by value | each { get value }
-ebpf detach $id
+} | first 100 | uniq-by value | each { get value }
 ```
 
 ### Count Events by Process
@@ -117,12 +114,9 @@ ebpf detach $id
 
 ```nushell
 # Emit structured events with multiple fields
-let id = ebpf attach 'kprobe:do_sys_openat2' {|ctx|
+ebpf attach -s 'kprobe:do_sys_openat2' {|ctx|
     { pid: $ctx.pid, uid: $ctx.uid, time: $ctx.ktime } | emit
-}
-sleep 1sec
-ebpf events $id
-ebpf detach $id
+} | first 10
 ```
 
 ### Conditional Tracing
@@ -182,13 +176,35 @@ Output:
 
 ```nushell
 # Trace file paths being opened (read from userspace pointer)
-let id = ebpf attach 'kprobe:do_sys_openat2' {|ctx|
+ebpf attach -s 'kprobe:do_sys_openat2' {|ctx|
     $ctx.arg1 | read-str
+} | first 10
+```
+
+### Stack Traces
+
+```nushell
+# Capture kernel stack traces for file opens
+let id = ebpf attach 'kprobe:do_sys_openat2' {|ctx|
+    { pid: $ctx.pid, kstack: $ctx.kstack } | emit
 }
 sleep 2sec
-ebpf events $id
+ebpf stacks $id --symbolize
 ebpf detach $id
 ```
+
+Output:
+```
+╭───┬────┬────────┬─────────────────────────────────────────────────────────╮
+│ # │ id │  type  │                         frames                          │
+├───┼────┼────────┼─────────────────────────────────────────────────────────┤
+│ 0 │ 42 │ kernel │ [do_sys_openat2+0x0, __x64_sys_openat+0x55, ...]        │
+│ 1 │ 43 │ kernel │ [do_sys_openat2+0x0, __x64_sys_open+0x1d, ...]          │
+╰───┴────┴────────┴─────────────────────────────────────────────────────────╯
+```
+
+The `--symbolize` flag resolves kernel addresses to function names via `/proc/kallsyms`.
+Note: Reading `/proc/kallsyms` may require root or `kernel.kptr_restrict=0`.
 
 ### Dry Run (Generate Bytecode)
 
@@ -207,7 +223,7 @@ ebpf attach --dry-run 'kprobe:ksys_read' {|ctx| $ctx.pid | emit } | save probe.e
                                                           │
                                                           v
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  ebpf events    │ <-- │  Perf Buffer     │ <-- │  Kernel (aya)   │
+│  ebpf attach -s │ <-- │  Perf Buffer     │ <-- │  Kernel (aya)   │
 │  (userspace)    │     │  (events map)    │     │  (BPF verifier) │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
 ```

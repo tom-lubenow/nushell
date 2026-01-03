@@ -22,6 +22,8 @@ pub mod compiler;
 pub mod kernel_btf;
 #[cfg(target_os = "linux")]
 pub mod loader;
+#[cfg(target_os = "linux")]
+pub mod symbolize;
 
 pub mod commands;
 

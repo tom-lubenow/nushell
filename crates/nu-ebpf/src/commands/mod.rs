@@ -9,6 +9,7 @@ mod detach;
 mod helpers;
 mod histogram;
 mod list;
+mod stacks;
 mod trace;
 
 use nu_protocol::{ShellError, Span};
@@ -64,6 +65,7 @@ pub use detach::EbpfDetach;
 pub use helpers::{Count, Emit, Histogram, ReadKernelStr, ReadStr, StartTimer, StopTimer};
 pub use histogram::EbpfHistogram;
 pub use list::EbpfList;
+pub use stacks::EbpfStacks;
 pub use trace::EbpfTrace;
 
 use nu_protocol::engine::Command;
@@ -77,6 +79,7 @@ pub fn commands() -> Vec<Box<dyn Command>> {
         Box::new(EbpfDetach),
         Box::new(EbpfHistogram),
         Box::new(EbpfList),
+        Box::new(EbpfStacks),
         Box::new(EbpfTrace),
         // Helper commands for use in eBPF closures
         Box::new(Emit),

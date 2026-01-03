@@ -137,7 +137,7 @@ fn has_side_effects(inst: &MirInst) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::mir::{BasicBlock, BinOpKind, BlockId, MirInst, MirValue};
+    use crate::compiler::mir::{BinOpKind, MirInst, MirValue};
 
     fn make_function_with_dead_code() -> MirFunction {
         // v0 = 1

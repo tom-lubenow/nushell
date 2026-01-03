@@ -20,12 +20,12 @@
 //! - Well-suited to eBPF's limited register set
 //! - Produces good results in practice
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::cmp::Ordering;
 
 use super::cfg::{CFG, LiveInterval, LivenessInfo, compute_live_intervals};
 use super::instruction::EbpfReg;
-use super::mir::{MirFunction, StackSlotId, StackSlotKind, VReg};
+use super::mir::{MirFunction, StackSlotId, VReg};
 
 /// Result of register allocation
 #[derive(Debug)]
@@ -104,7 +104,8 @@ pub struct LinearScanAllocator {
     active: Vec<ActiveInterval>,
     /// Free physical registers
     free_regs: Vec<EbpfReg>,
-    /// All available physical registers
+    /// All available physical registers (reserved for register reuse analysis)
+    #[allow(dead_code)]
     all_regs: Vec<EbpfReg>,
     /// VReg -> assigned register
     assignments: HashMap<VReg, EbpfReg>,
@@ -234,11 +235,10 @@ impl LinearScanAllocator {
                 self.spills.insert(interval.vreg, slot);
 
                 // No register assigned - will need reload at use points
-                for &use_point in &interval.use_points {
-                    // Need a register for this use - will reload
-                    // For now, record that a reload is needed
-                    // The actual register will be determined during code generation
-                }
+                // TODO: Track reload points when we implement spill code generation
+                // for &use_point in &interval.use_points {
+                //     // Record that a reload is needed
+                // }
             }
         }
     }
@@ -264,8 +264,9 @@ pub fn allocate_registers(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use super::*;
-    use crate::compiler::mir::{BasicBlock, BinOpKind, BlockId, MirInst, MirValue};
+    use crate::compiler::mir::{BinOpKind, MirInst, MirValue};
 
     fn make_simple_function() -> MirFunction {
         // v0 = 1

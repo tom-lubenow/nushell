@@ -24,7 +24,7 @@ use crate::compiler::ir_to_ebpf::pt_regs_offsets;
 use crate::compiler::elf::{BpfFieldType, SchemaField};
 use crate::compiler::mir::{
     BasicBlock, BinOpKind, BlockId, CtxField, MirFunction, MirInst, MirProgram, MirType, MirValue,
-    RecordFieldDef, StackSlotId, StackSlotKind, UnaryOpKind, VReg,
+    RecordFieldDef, StackSlotId, UnaryOpKind, VReg,
 };
 use crate::compiler::regalloc::{LinearScanAllocator, RegAllocResult};
 use crate::compiler::CompileError;
@@ -549,8 +549,16 @@ impl<'a> MirToEbpfCompiler<'a> {
                 ));
             }
 
-            // Not yet implemented
-            _ => {
+            // Instructions reserved for future features
+            MirInst::Load { .. }
+            | MirInst::Store { .. }
+            | MirInst::LoadSlot { .. }
+            | MirInst::StoreSlot { .. }
+            | MirInst::CallHelper { .. }
+            | MirInst::MapLookup { .. }
+            | MirInst::MapDelete { .. }
+            | MirInst::StrCmp { .. }
+            | MirInst::RecordStore { .. } => {
                 return Err(CompileError::UnsupportedInstruction(format!(
                     "MIR instruction {:?} not yet implemented",
                     inst

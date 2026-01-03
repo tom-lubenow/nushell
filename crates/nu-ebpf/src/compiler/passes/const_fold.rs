@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::compiler::cfg::CFG;
-use crate::compiler::mir::{BinOpKind, BlockId, MirFunction, MirInst, MirValue, UnaryOpKind, VReg};
+use crate::compiler::mir::{BinOpKind, MirFunction, MirInst, MirValue, UnaryOpKind, VReg};
 use super::MirPass;
 
 /// Constant Folding pass
@@ -203,7 +203,7 @@ impl ConstantFolding {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::mir::BasicBlock;
+    use crate::compiler::mir::BlockId;
 
     fn make_constant_add_function() -> MirFunction {
         // v0 = 2

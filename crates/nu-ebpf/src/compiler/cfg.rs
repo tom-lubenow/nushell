@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::mir::{BasicBlock, BlockId, MirFunction, MirInst, VReg};
+use super::mir::{BlockId, MirFunction, VReg};
 
 /// Control Flow Graph built from MIR
 #[derive(Debug)]
@@ -179,8 +179,8 @@ impl CFG {
     /// Uses finger-based algorithm: walk up the dominator tree from both nodes
     fn intersect(
         &self,
-        mut b1: BlockId,
-        mut b2: BlockId,
+        b1: BlockId,
+        b2: BlockId,
         doms: &HashMap<BlockId, Option<BlockId>>,
         rpo_index: &HashMap<BlockId, usize>,
     ) -> BlockId {

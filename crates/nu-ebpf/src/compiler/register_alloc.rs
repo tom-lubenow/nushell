@@ -23,6 +23,7 @@ pub enum ValueLocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueKey {
     Reg(u32),
+    #[allow(dead_code)]
     Var(usize),
 }
 

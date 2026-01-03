@@ -116,7 +116,7 @@ pub fn default_passes() -> PassManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::mir::{BasicBlock, BinOpKind, BlockId, MirInst, MirValue, VReg};
+    use crate::compiler::mir::{MirInst, MirValue};
 
     fn make_simple_function() -> MirFunction {
         let mut func = MirFunction::new();
@@ -159,7 +159,7 @@ mod tests {
         let mut func = make_simple_function();
 
         // Should run without error
-        let changes = pm.run(&mut func);
+        let _changes = pm.run(&mut func);
 
         // Function should still be valid
         assert!(!func.blocks.is_empty());

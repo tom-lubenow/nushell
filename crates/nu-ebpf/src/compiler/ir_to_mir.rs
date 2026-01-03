@@ -36,6 +36,7 @@ struct RecordField {
     name: String,
     value_vreg: VReg,
     /// Stack offset where this field's value is stored (for safety)
+    #[allow(dead_code)] // Reserved for future stack safety checks
     stack_offset: Option<i16>,
     ty: MirType,
 }
@@ -44,6 +45,7 @@ struct RecordField {
 #[derive(Debug, Clone, Copy)]
 struct BoundedRange {
     /// Start value
+    #[allow(dead_code)] // Used for counter initialization (stored in vreg)
     start: i64,
     /// Step value
     step: i64,
@@ -103,7 +105,8 @@ pub struct IrToMirLowering<'a> {
     current_block: BlockId,
     /// IR block for data access
     ir_block: Option<&'a IrBlock>,
-    /// Probe context for field access
+    /// Probe context for field access (reserved for future BTF/CO-RE support)
+    #[allow(dead_code)]
     probe_ctx: Option<&'a ProbeContext>,
     /// Engine state for looking up commands
     engine_state: Option<&'a EngineState>,
@@ -190,6 +193,8 @@ impl<'a> IrToMirLowering<'a> {
     }
 
     /// Clear metadata for a register (when it's written to)
+    /// Reserved for future use with more complex metadata tracking
+    #[allow(dead_code)]
     fn clear_metadata(&mut self, reg: RegId) {
         self.reg_metadata.remove(&reg.get());
     }

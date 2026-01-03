@@ -18,10 +18,27 @@
 use std::collections::HashMap;
 
 use crate::compiler::cfg::{CFG, LivenessInfo};
-use crate::compiler::elf::{BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext};
+use crate::compiler::elf::{BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext, SchemaField};
 use crate::compiler::instruction::{opcode, BpfHelper, EbpfInsn, EbpfReg};
-use crate::compiler::ir_to_ebpf::pt_regs_offsets;
-use crate::compiler::elf::{BpfFieldType, SchemaField};
+
+/// pt_regs offsets for x86_64 architecture
+/// These are the byte offsets into the pt_regs structure for accessing
+/// function arguments and return values in kprobes.
+mod pt_regs_offsets {
+    /// Offsets for function arguments (arg0-arg5) in pt_regs on x86_64
+    /// Arguments are passed in: rdi, rsi, rdx, rcx, r8, r9
+    pub const ARG_OFFSETS: [i16; 6] = [
+        112, // rdi (arg0)
+        104, // rsi (arg1)
+        96,  // rdx (arg2)
+        88,  // rcx (arg3)
+        72,  // r8 (arg4)
+        64,  // r9 (arg5)
+    ];
+
+    /// Offset for return value (rax) in pt_regs on x86_64
+    pub const RETVAL_OFFSET: i16 = 80;
+}
 use crate::compiler::mir::{
     BasicBlock, BinOpKind, BlockId, CtxField, MirFunction, MirInst, MirProgram, MirType, MirValue,
     RecordFieldDef, StackSlotId, UnaryOpKind, VReg,
@@ -1509,7 +1526,6 @@ pub fn compile_mir_to_ebpf(
 mod tests {
     use super::*;
     use crate::compiler::ir_to_mir::lower_ir_to_mir;
-    use crate::compiler::IrToEbpfCompiler;
     use nu_protocol::ast::{Math, Operator};
     use nu_protocol::ir::{IrBlock, Instruction, Literal};
     use nu_protocol::RegId;
@@ -1527,9 +1543,9 @@ mod tests {
         }
     }
 
-    /// Test that both compilers produce valid bytecode for return zero
+    /// Test valid bytecode for return zero
     #[test]
-    fn test_parity_return_zero() {
+    fn test_return_zero() {
         let ir = make_ir_block(vec![
             Instruction::LoadLiteral {
                 dst: RegId::new(0),
@@ -1538,34 +1554,15 @@ mod tests {
             Instruction::Return { src: RegId::new(0) },
         ]);
 
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
-        assert!(
-            !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
-        );
-
-        // Both should produce eBPF bytecode that's a multiple of 8 bytes
-        assert_eq!(
-            old_result.len() % 8,
-            0,
-            "Old compiler bytecode should be aligned to 8 bytes"
-        );
-        assert_eq!(
-            mir_result.bytecode.len() % 8,
-            0,
-            "MIR compiler bytecode should be aligned to 8 bytes"
-        );
+        assert!(!mir_result.bytecode.is_empty(), "Should produce bytecode");
+        assert_eq!(mir_result.bytecode.len() % 8, 0, "Bytecode should be aligned to 8 bytes");
     }
 
-    /// Test that both compilers produce valid bytecode for addition
+    /// Test valid bytecode for addition
     #[test]
-    fn test_parity_add() {
+    fn test_add() {
         let ir = make_ir_block(vec![
             Instruction::LoadLiteral {
                 dst: RegId::new(0),
@@ -1583,22 +1580,14 @@ mod tests {
             Instruction::Return { src: RegId::new(0) },
         ]);
 
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
-        assert!(
-            !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
-        );
+        assert!(!mir_result.bytecode.is_empty(), "Should produce bytecode");
     }
 
     /// Test that old compiler handles branching (MIR branch test is separate)
     #[test]
-    fn test_parity_branch() {
+    fn test_branch() {
         let ir = make_ir_block(vec![
             Instruction::LoadLiteral {
                 dst: RegId::new(0),
@@ -1614,17 +1603,12 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler - verify it handles branching
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
         // MIR compiler branching is tested separately with proper block construction
     }
 
     /// Test multiplication
     #[test]
-    fn test_parity_multiply() {
+    fn test_multiply() {
         let ir = make_ir_block(vec![
             Instruction::LoadLiteral {
                 dst: RegId::new(0),
@@ -1641,17 +1625,12 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
@@ -1862,7 +1841,7 @@ mod tests {
 
     /// Test parity for subtraction
     #[test]
-    fn test_parity_subtract() {
+    fn test_subtract() {
         let ir = make_ir_block(vec![
             Instruction::LoadLiteral {
                 dst: RegId::new(0),
@@ -1879,23 +1858,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for division
     #[test]
-    fn test_parity_divide() {
+    fn test_divide() {
         let ir = make_ir_block(vec![
             Instruction::LoadLiteral {
                 dst: RegId::new(0),
@@ -1912,23 +1886,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for modulo operation
     #[test]
-    fn test_parity_modulo() {
+    fn test_modulo() {
         let ir = make_ir_block(vec![
             Instruction::LoadLiteral {
                 dst: RegId::new(0),
@@ -1945,23 +1914,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for comparison: greater than
     #[test]
-    fn test_parity_greater_than() {
+    fn test_greater_than() {
         use nu_protocol::ast::Comparison;
 
         let ir = make_ir_block(vec![
@@ -1980,23 +1944,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for comparison: less than
     #[test]
-    fn test_parity_less_than() {
+    fn test_less_than() {
         use nu_protocol::ast::Comparison;
 
         let ir = make_ir_block(vec![
@@ -2015,23 +1974,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for comparison: equal
     #[test]
-    fn test_parity_equal() {
+    fn test_equal() {
         use nu_protocol::ast::Comparison;
 
         let ir = make_ir_block(vec![
@@ -2050,23 +2004,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for comparison: not equal
     #[test]
-    fn test_parity_not_equal() {
+    fn test_not_equal() {
         use nu_protocol::ast::Comparison;
 
         let ir = make_ir_block(vec![
@@ -2085,23 +2034,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for logical NOT
     #[test]
-    fn test_parity_logical_not() {
+    fn test_logical_not() {
         let ir = make_ir_block(vec![
             Instruction::LoadLiteral {
                 dst: RegId::new(0),
@@ -2112,23 +2056,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for bitwise AND
     #[test]
-    fn test_parity_bitwise_and() {
+    fn test_bitwise_and() {
         use nu_protocol::ast::Bits;
 
         let ir = make_ir_block(vec![
@@ -2147,23 +2086,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for bitwise OR
     #[test]
-    fn test_parity_bitwise_or() {
+    fn test_bitwise_or() {
         use nu_protocol::ast::Bits;
 
         let ir = make_ir_block(vec![
@@ -2182,23 +2116,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for left shift
     #[test]
-    fn test_parity_shift_left() {
+    fn test_shift_left() {
         use nu_protocol::ast::Bits;
 
         let ir = make_ir_block(vec![
@@ -2217,23 +2146,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for chained arithmetic: (a + b) * c
     #[test]
-    fn test_parity_chained_arithmetic() {
+    fn test_chained_arithmetic() {
         let ir = make_ir_block(vec![
             // a = 2
             Instruction::LoadLiteral {
@@ -2264,23 +2188,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for conditional return
     #[test]
-    fn test_parity_conditional_return() {
+    fn test_conditional_return() {
         let ir = make_ir_block(vec![
             // Load condition
             Instruction::LoadLiteral {
@@ -2307,23 +2226,18 @@ mod tests {
             // True branch: return 42
             Instruction::Return { src: RegId::new(1) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for large constant
     #[test]
-    fn test_parity_large_constant() {
+    fn test_large_constant() {
         let ir = make_ir_block(vec![
             Instruction::LoadLiteral {
                 dst: RegId::new(0),
@@ -2331,23 +2245,18 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
     /// Test parity for negative constant
     #[test]
-    fn test_parity_negative_constant() {
+    fn test_negative_constant() {
         let ir = make_ir_block(vec![
             Instruction::LoadLiteral {
                 dst: RegId::new(0),
@@ -2355,17 +2264,12 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
-
-        // Old compiler
-        let old_result = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
-        assert!(!old_result.is_empty(), "Old compiler produced empty bytecode");
-
-        // New MIR compiler
+        // Compile and verify
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(
             !mir_result.bytecode.is_empty(),
-            "MIR compiler produced empty bytecode"
+            "Should produce empty bytecode"
         );
     }
 
@@ -2426,7 +2330,7 @@ mod tests {
             Instruction::Return { src: RegId::new(0) },
         ]);
 
-        // New MIR compiler should handle register pressure via linear scan
+        // Compile and verify should handle register pressure via linear scan
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
 

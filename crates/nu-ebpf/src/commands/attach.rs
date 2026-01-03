@@ -131,11 +131,6 @@ Requirements:
                 "Pin maps to share between probes (e.g., --pin mygroup)",
                 Some('p'),
             )
-            .switch(
-                "mir-compiler",
-                "Use experimental MIR-based compiler (for testing)",
-                None,
-            )
             .category(Category::Experimental)
     }
 
@@ -215,203 +210,61 @@ fn run_attach(
     stack: &mut Stack,
     call: &Call,
 ) -> Result<PipelineData, ShellError> {
-    use crate::compiler::{EbpfProgram, IrToEbpfCompiler, ProbeContext};
-    use crate::loader::{LoadError, get_state, parse_probe_spec};
+    use crate::compiler::{
+        compile_mir_to_ebpf, ir_to_mir::lower_ir_to_mir, EbpfProgram, ProbeContext,
+    };
+    use crate::loader::{get_state, parse_probe_spec, LoadError};
 
     let probe_spec: String = call.req(engine_state, stack, 0)?;
     let closure: Closure = call.req(engine_state, stack, 1)?;
     let dry_run = call.has_flag(engine_state, stack, "dry-run")?;
     let stream = call.has_flag(engine_state, stack, "stream")?;
     let pin_group: Option<String> = call.get_flag(engine_state, stack, "pin")?;
-    let use_mir = call.has_flag(engine_state, stack, "mir-compiler")?;
-
-    // MIR compiler path (experimental)
-    if use_mir {
-        return compile_with_mir(
-            engine_state,
-            call,
-            &probe_spec,
-            &closure,
-            dry_run,
-            stream,
-            pin_group,
-        );
-    }
 
     // Parse the probe specification (includes validation)
-    let (prog_type, target) =
-        parse_probe_spec(&probe_spec).map_err(|e| match &e {
-            crate::loader::LoadError::FunctionNotFound { name, suggestions } => {
-                let help = if suggestions.is_empty() {
-                    format!("Check the function name. Use 'sudo cat /sys/kernel/tracing/available_filter_functions | grep {name}' to find available functions.")
-                } else {
-                    format!("Did you mean: {}?", suggestions.join(", "))
-                };
-                ShellError::GenericError {
-                    error: format!("Kernel function '{}' not found", name),
-                    msg: "This function is not available for probing".into(),
-                    span: Some(call.head),
-                    help: Some(help),
-                    inner: vec![],
-                }
-            }
-            crate::loader::LoadError::TracepointNotFound { category, name } => {
-                ShellError::GenericError {
-                    error: format!("Tracepoint '{}/{}' not found", category, name),
-                    msg: "This tracepoint does not exist".into(),
-                    span: Some(call.head),
-                    help: Some(format!(
-                        "Use 'sudo ls /sys/kernel/tracing/events/{}' to see available tracepoints in this category",
-                        category
-                    )),
-                    inner: vec![],
-                }
-            }
-            crate::loader::LoadError::NeedsSudo => {
-                ShellError::GenericError {
-                    error: "Elevated privileges required".into(),
-                    msg: "eBPF operations require root or CAP_BPF capability".into(),
-                    span: Some(call.head),
-                    help: Some("Run nushell with sudo: sudo nu".into()),
-                    inner: vec![],
-                }
-            }
-            _ => ShellError::GenericError {
-                error: "Invalid probe specification".into(),
-                msg: e.to_string(),
-                span: Some(call.head),
-                help: Some(
-                    "Use format like 'kprobe:sys_clone', 'tracepoint:syscalls/sys_enter_read', or 'uprobe:/path/to/bin:function'".into(),
-                ),
-                inner: vec![],
-            },
-        })?;
-
-    // Create probe context for the compiler
-    let probe_context = ProbeContext::new(prog_type, &target);
-
-    // Get the block for this closure
-    let block = engine_state.get_block(closure.block_id);
-
-    // Compile the closure's IR to eBPF
-    let ir_block = block
-        .ir_block
-        .as_ref()
-        .ok_or_else(|| ShellError::GenericError {
-            error: "No IR available for closure".into(),
-            msg: "The closure could not be compiled to IR".into(),
-            span: Some(call.head),
-            help: Some("Ensure the closure is a simple expression that can be compiled".into()),
-            inner: vec![],
-        })?;
-
-    // Use compile_with_context to support:
-    // - context parameter syntax like {|ctx| $ctx.pid }
-    // - captured integer variables from outer scope like `let pid = 1234; {|| $pid }`
-    // - probe-aware compilation (auto-detect userspace vs kernel reads, validate retval)
-    let compile_result = IrToEbpfCompiler::compile_with_context(
-        ir_block,
-        engine_state,
-        block,
-        &closure.captures,
-        probe_context,
-    )
-    .map_err(|e| ShellError::GenericError {
-        error: "eBPF compilation failed".into(),
-        msg: e.to_string(),
-        span: Some(call.head),
-        help: Some(
-            "Check that the closure uses only supported BPF commands or context fields".into(),
-        ),
-        inner: vec![],
-    })?;
-
-    let mut program = EbpfProgram::with_maps(
-        prog_type,
-        &target,
-        "nushell_ebpf",
-        compile_result.bytecode,
-        compile_result.maps,
-        compile_result.relocations,
-        compile_result.event_schema,
-    );
-
-    // Enable map pinning if --pin is specified
-    // This allows maps to be shared between separate eBPF programs
-    if pin_group.is_some() {
-        program = program.with_pinning();
-    }
-
-    if dry_run {
-        // Return the ELF bytes for inspection
-        let elf = program.to_elf().map_err(|e| ShellError::GenericError {
-            error: "Failed to generate ELF".into(),
-            msg: e.to_string(),
-            span: Some(call.head),
-            help: None,
-            inner: vec![],
-        })?;
-
-        return Ok(Value::binary(elf, call.head).into_pipeline_data());
-    }
-
-    // Load and attach the program
-    let state = get_state();
-    let probe_id = state
-        .attach_with_pin(&program, pin_group.as_deref())
-        .map_err(|e| {
-            let (error, help) = match &e {
-                LoadError::PermissionDenied => (
-                    "Permission denied".into(),
-                    Some("Try running with sudo or grant CAP_BPF capability".into()),
-                ),
-                _ => (e.to_string(), None),
+    let (prog_type, target) = parse_probe_spec(&probe_spec).map_err(|e| match &e {
+        crate::loader::LoadError::FunctionNotFound { name, suggestions } => {
+            let help = if suggestions.is_empty() {
+                format!("Check the function name. Use 'sudo cat /sys/kernel/tracing/available_filter_functions | grep {name}' to find available functions.")
+            } else {
+                format!("Did you mean: {}?", suggestions.join(", "))
             };
             ShellError::GenericError {
-                error: "Failed to attach eBPF probe".into(),
-                msg: error,
+                error: format!("Kernel function '{}' not found", name),
+                msg: "This function is not available for probing".into(),
                 span: Some(call.head),
-                help,
+                help: Some(help),
                 inner: vec![],
             }
-        })?;
-
-    if stream {
-        // Stream events directly - return a ListStream
-        let span = call.head;
-        let signals = engine_state.signals().clone();
-        let iter = EventStreamIterator::new(probe_id, span);
-        let list_stream = nu_protocol::ListStream::new(iter, span, signals);
-        Ok(PipelineData::ListStream(list_stream, None))
-    } else {
-        // Return probe ID for manual event polling
-        Ok(Value::int(probe_id as i64, call.head).into_pipeline_data())
-    }
-}
-
-/// Compile using the experimental MIR-based compiler
-#[cfg(target_os = "linux")]
-fn compile_with_mir(
-    engine_state: &EngineState,
-    call: &Call,
-    probe_spec: &str,
-    closure: &Closure,
-    dry_run: bool,
-    stream: bool,
-    pin_group: Option<String>,
-) -> Result<PipelineData, ShellError> {
-    use crate::compiler::{
-        compile_mir_to_ebpf, ir_to_mir::lower_ir_to_mir, EbpfProgram, ProbeContext,
-    };
-    use crate::loader::{get_state, parse_probe_spec, LoadError};
-
-    // Parse probe spec
-    let (prog_type, target) = parse_probe_spec(probe_spec).map_err(|e| ShellError::GenericError {
-        error: "Invalid probe specification".into(),
-        msg: e.to_string(),
-        span: Some(call.head),
-        help: Some("Use format like 'kprobe:sys_clone'".into()),
-        inner: vec![],
+        }
+        crate::loader::LoadError::TracepointNotFound { category, name } => {
+            ShellError::GenericError {
+                error: format!("Tracepoint '{}/{}' not found", category, name),
+                msg: "This tracepoint does not exist".into(),
+                span: Some(call.head),
+                help: Some(format!(
+                    "Use 'sudo ls /sys/kernel/tracing/events/{}' to see available tracepoints in this category",
+                    category
+                )),
+                inner: vec![],
+            }
+        }
+        crate::loader::LoadError::NeedsSudo => ShellError::GenericError {
+            error: "Elevated privileges required".into(),
+            msg: "eBPF operations require root or CAP_BPF capability".into(),
+            span: Some(call.head),
+            help: Some("Run nushell with sudo: sudo nu".into()),
+            inner: vec![],
+        },
+        _ => ShellError::GenericError {
+            error: "Invalid probe specification".into(),
+            msg: e.to_string(),
+            span: Some(call.head),
+            help: Some(
+                "Use format like 'kprobe:sys_clone', 'tracepoint:syscalls/sys_enter_read', or 'uprobe:/path/to/bin:function'".into(),
+            ),
+            inner: vec![],
+        },
     })?;
 
     let probe_context = ProbeContext::new(prog_type, &target);
@@ -434,13 +287,12 @@ fn compile_with_mir(
         .map(|p| p.var_id)
         .flatten();
 
-    // Convert captures to (String, i64) pairs
+    // Convert captures to (String, i64) pairs for integer captures
     let captures: Vec<(String, i64)> = closure
         .captures
         .iter()
         .filter_map(|(var_id, value)| {
             if let nu_protocol::Value::Int { val, .. } = value {
-                // We use var_id as the "name" since that's what we track
                 Some((format!("var_{}", var_id.get()), *val))
             } else {
                 None
@@ -452,7 +304,7 @@ fn compile_with_mir(
     let mir_program =
         lower_ir_to_mir(ir_block, Some(&probe_context), Some(engine_state), &captures, ctx_param)
             .map_err(|e| ShellError::GenericError {
-                error: "MIR lowering failed".into(),
+                error: "eBPF compilation failed".into(),
                 msg: e.to_string(),
                 span: Some(call.head),
                 help: Some("The closure may use unsupported operations".into()),
@@ -462,7 +314,7 @@ fn compile_with_mir(
     // Compile MIR to eBPF
     let compile_result = compile_mir_to_ebpf(&mir_program, Some(&probe_context)).map_err(|e| {
         ShellError::GenericError {
-            error: "MIR to eBPF compilation failed".into(),
+            error: "eBPF compilation failed".into(),
             msg: e.to_string(),
             span: Some(call.head),
             help: Some("Check that the closure uses supported BPF operations".into()),
@@ -473,7 +325,7 @@ fn compile_with_mir(
     let mut program = EbpfProgram::with_maps(
         prog_type,
         &target,
-        "nushell_ebpf_mir",
+        "nushell_ebpf",
         compile_result.bytecode,
         compile_result.maps,
         compile_result.relocations,
@@ -503,7 +355,7 @@ fn compile_with_mir(
             let (error, help) = match &e {
                 LoadError::PermissionDenied => (
                     "Permission denied".into(),
-                    Some("Try running with sudo".into()),
+                    Some("Try running with sudo or grant CAP_BPF capability".into()),
                 ),
                 _ => (e.to_string(), None),
             };

@@ -384,6 +384,18 @@ impl<'a> IrToMirLowering<'a> {
                 meta.cell_path = Some((**cell_path).clone());
             }
 
+            Literal::Record { capacity: _ } => {
+                // Record allocation - just track that this is a record
+                // Actual fields are added via RecordInsert
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::Const(0), // Placeholder
+                });
+                // Initialize empty record fields in metadata
+                let meta = self.get_or_create_metadata(dst);
+                meta.record_fields = Vec::new();
+            }
+
             _ => {
                 return Err(CompileError::UnsupportedLiteral);
             }

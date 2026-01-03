@@ -11,7 +11,7 @@ use nu_protocol::{DeclId, RegId, VarId};
 
 use super::CompileError;
 use super::elf::{BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext};
-use super::helpers::{AggregationHelpers, OutputHelpers, TimingHelpers};
+use super::helpers::{AggregationHelpers, FilterHelpers, OutputHelpers, TimingHelpers};
 use super::instruction::{BpfHelper, EbpfBuilder, EbpfInsn, EbpfReg, opcode};
 use super::ir_ops::IrOps;
 use super::register_alloc::{AllocAction, RegAction, RegisterAllocator, ValueKey};
@@ -1270,6 +1270,9 @@ impl<'a> IrToEbpfCompiler<'a> {
             "emit" => OutputHelpers::compile_bpf_emit(self, src_dst),
             "read-str" => OutputHelpers::compile_bpf_read_str(self, src_dst, true),
             "read-kernel-str" => OutputHelpers::compile_bpf_read_str(self, src_dst, false),
+
+            // Filter helper
+            "filter" => FilterHelpers::compile_bpf_filter(self, src_dst),
 
             // Aggregation helpers
             "count" => AggregationHelpers::compile_bpf_count(self, src_dst),

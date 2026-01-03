@@ -74,9 +74,15 @@ These commands are used inside eBPF closures:
 
 | Command | Description |
 |---------|-------------|
-| `emit` | Emit value, string, or record to perf buffer |
+| `emit` | Emit value, string, or record to ring buffer |
 | `read-str` | Read string from userspace memory pointer |
 | `read-kernel-str` | Read string from kernel memory pointer |
+
+#### Control Flow
+
+| Command | Description |
+|---------|-------------|
+| `filter` | Exit program early if condition is false |
 
 #### Aggregation
 
@@ -119,10 +125,24 @@ ebpf attach -s 'kprobe:do_sys_openat2' {|ctx|
 } | first 10
 ```
 
+### Filtering Events
+
+```nushell
+# Only emit events for root user (uid == 0)
+ebpf attach -s 'kprobe:do_sys_openat2' {|ctx|
+    $ctx.uid == 0 | filter | $ctx.pid | emit
+} | first 10
+
+# Filter out low PIDs
+ebpf attach -s 'kprobe:ksys_read' {|ctx|
+    $ctx.pid > 1000 | filter | { pid: $ctx.pid, comm: $ctx.comm } | emit
+} | first 10
+```
+
 ### Conditional Tracing
 
 ```nushell
-# Only emit events for a specific PID
+# Use if for more complex conditions
 let id = ebpf attach 'kprobe:ksys_read' {|ctx|
     if $ctx.pid == 1234 {
         $ctx.pid | emit

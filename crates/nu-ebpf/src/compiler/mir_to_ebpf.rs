@@ -33,6 +33,10 @@ use crate::compiler::CompileError;
 pub const RINGBUF_MAP_NAME: &str = "events";
 /// Counter map name
 pub const COUNTER_MAP_NAME: &str = "counters";
+/// Histogram map name
+pub const HISTOGRAM_MAP_NAME: &str = "histogram";
+/// Timestamp map name (for timing)
+pub const TIMESTAMP_MAP_NAME: &str = "timestamps";
 
 /// Result of MIR to eBPF compilation
 pub struct MirCompileResult {
@@ -72,6 +76,10 @@ pub struct MirToEbpfCompiler<'a> {
     needs_ringbuf: bool,
     /// Needs counter map
     needs_counter_map: bool,
+    /// Needs histogram map
+    needs_histogram_map: bool,
+    /// Needs timestamp map
+    needs_timestamp_map: bool,
     /// Event schema for structured output
     event_schema: Option<EventSchema>,
     /// Available physical registers for allocation
@@ -96,6 +104,8 @@ impl<'a> MirToEbpfCompiler<'a> {
             relocations: Vec::new(),
             needs_ringbuf: false,
             needs_counter_map: false,
+            needs_histogram_map: false,
+            needs_timestamp_map: false,
             event_schema: None,
             // R6-R8 are callee-saved and available for our use
             available_regs: vec![EbpfReg::R6, EbpfReg::R7, EbpfReg::R8],
@@ -133,6 +143,18 @@ impl<'a> MirToEbpfCompiler<'a> {
             maps.push(EbpfMap {
                 name: COUNTER_MAP_NAME.to_string(),
                 def: BpfMapDef::counter_hash(),
+            });
+        }
+        if self.needs_histogram_map {
+            maps.push(EbpfMap {
+                name: HISTOGRAM_MAP_NAME.to_string(),
+                def: BpfMapDef::counter_hash(), // Same structure as counter: key=bucket, value=count
+            });
+        }
+        if self.needs_timestamp_map {
+            maps.push(EbpfMap {
+                name: TIMESTAMP_MAP_NAME.to_string(),
+                def: BpfMapDef::counter_hash(), // key=tid, value=timestamp
             });
         }
 
@@ -443,6 +465,23 @@ impl<'a> MirToEbpfCompiler<'a> {
                     }
                 }
                 self.instructions.push(EbpfInsn::exit());
+            }
+
+            MirInst::Histogram { value } => {
+                self.needs_histogram_map = true;
+                let value_reg = self.ensure_reg(*value)?;
+                self.compile_histogram(value_reg)?;
+            }
+
+            MirInst::StartTimer => {
+                self.needs_timestamp_map = true;
+                self.compile_start_timer()?;
+            }
+
+            MirInst::StopTimer { dst } => {
+                self.needs_timestamp_map = true;
+                let dst_reg = self.alloc_reg(*dst)?;
+                self.compile_stop_timer(dst_reg)?;
             }
 
             // Not yet implemented
@@ -1061,6 +1100,237 @@ impl<'a> MirToEbpfCompiler<'a> {
 
         self.instructions
             .push(EbpfInsn::stxdw(EbpfReg::R10, offset, phys));
+        Ok(())
+    }
+
+    // === Histogram and Timing ===
+
+    /// Compile histogram aggregation
+    /// Computes log2 bucket of value and increments counter in histogram map
+    fn compile_histogram(&mut self, value_reg: EbpfReg) -> Result<(), CompileError> {
+        // Allocate stack for key (bucket) and value (count)
+        self.check_stack_space(16)?;
+        let key_offset = self.stack_offset - 8;
+        let value_offset = self.stack_offset - 16;
+        self.stack_offset -= 16;
+
+        // Compute log2 bucket using binary search
+        // Save value to R0 for manipulation, bucket accumulator in R1
+        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R0, value_reg));
+        self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R1, 0));
+
+        // If value <= 0, bucket = 0
+        // JLE R0, 0, skip_log2 (offset will be filled in later)
+        let skip_log2_idx = self.instructions.len();
+        self.instructions.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JSLE | opcode::BPF_K,
+            EbpfReg::R0.as_u8(), 0, 0, 0, // offset placeholder
+        ));
+
+        // Binary search for highest bit
+        // Check >= 2^32
+        self.emit_log2_check(32)?;
+        self.emit_log2_check(16)?;
+        self.emit_log2_check(8)?;
+        self.emit_log2_check(4)?;
+        self.emit_log2_check(2)?;
+        self.emit_log2_check(1)?;
+
+        // Fix up skip_log2 jump to skip past log2 computation
+        let skip_log2_offset = (self.instructions.len() - skip_log2_idx - 1) as i16;
+        self.instructions[skip_log2_idx].offset = skip_log2_offset;
+
+        // Store bucket (R1) to stack
+        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R10, key_offset, EbpfReg::R1));
+
+        // Map lookup
+        let lookup_reloc = self.instructions.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
+        self.instructions.push(insn1);
+        self.instructions.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: lookup_reloc,
+            map_name: HISTOGRAM_MAP_NAME.to_string(),
+        });
+
+        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
+        self.instructions.push(EbpfInsn::call(BpfHelper::MapLookupElem));
+
+        // If NULL, jump to init
+        let init_idx = self.instructions.len();
+        self.instructions.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JEQ | opcode::BPF_K,
+            EbpfReg::R0.as_u8(), 0, 0, 0,
+        ));
+
+        // Exists - increment in place
+        self.instructions.push(EbpfInsn::ldxdw(EbpfReg::R1, EbpfReg::R0, 0));
+        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R1, 1));
+        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R0, 0, EbpfReg::R1));
+
+        // Jump to done
+        let done_jmp_idx = self.instructions.len();
+        self.instructions.push(EbpfInsn::jump(0));
+
+        // Init path
+        let init_offset = (self.instructions.len() - init_idx - 1) as i16;
+        self.instructions[init_idx].offset = init_offset;
+
+        // Store 1 to value
+        self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R1, 1));
+        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R10, value_offset, EbpfReg::R1));
+
+        // Map update
+        let update_reloc = self.instructions.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
+        self.instructions.push(insn1);
+        self.instructions.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: update_reloc,
+            map_name: HISTOGRAM_MAP_NAME.to_string(),
+        });
+
+        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
+        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R3, EbpfReg::R10));
+        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R3, value_offset as i32));
+        self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R4, 0)); // BPF_ANY
+        self.instructions.push(EbpfInsn::call(BpfHelper::MapUpdateElem));
+
+        // Done
+        let done_offset = (self.instructions.len() - done_jmp_idx - 1) as i16;
+        self.instructions[done_jmp_idx].offset = done_offset;
+
+        Ok(())
+    }
+
+    /// Helper for log2 computation - check if value >= 2^bits
+    fn emit_log2_check(&mut self, bits: i32) -> Result<(), CompileError> {
+        if bits >= 32 {
+            // Need 64-bit compare
+            self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R2, 1));
+            self.instructions.push(EbpfInsn::lsh64_imm(EbpfReg::R2, bits));
+        }
+        // JLT R0, 2^bits, skip (2 instructions)
+        self.instructions.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_K,
+            EbpfReg::R0.as_u8(), 0, 2, 1 << bits.min(31),
+        ));
+        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R1, bits));
+        self.instructions.push(EbpfInsn::rsh64_imm(EbpfReg::R0, bits));
+        Ok(())
+    }
+
+    /// Compile start-timer: store current ktime keyed by TID
+    fn compile_start_timer(&mut self) -> Result<(), CompileError> {
+        // Allocate stack for key (pid_tgid) and value (timestamp)
+        self.check_stack_space(16)?;
+        let key_offset = self.stack_offset - 8;
+        let value_offset = self.stack_offset - 16;
+        self.stack_offset -= 16;
+
+        // Get current pid_tgid as key
+        self.instructions.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
+        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R10, key_offset, EbpfReg::R0));
+
+        // Get current time
+        self.instructions.push(EbpfInsn::call(BpfHelper::KtimeGetNs));
+        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R10, value_offset, EbpfReg::R0));
+
+        // Map update
+        let update_reloc = self.instructions.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
+        self.instructions.push(insn1);
+        self.instructions.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: update_reloc,
+            map_name: TIMESTAMP_MAP_NAME.to_string(),
+        });
+
+        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
+        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R3, EbpfReg::R10));
+        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R3, value_offset as i32));
+        self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R4, 0)); // BPF_ANY
+        self.instructions.push(EbpfInsn::call(BpfHelper::MapUpdateElem));
+
+        Ok(())
+    }
+
+    /// Compile stop-timer: lookup start time, compute delta, delete entry
+    fn compile_stop_timer(&mut self, dst_reg: EbpfReg) -> Result<(), CompileError> {
+        // Allocate stack for key (pid_tgid)
+        self.check_stack_space(8)?;
+        let key_offset = self.stack_offset - 8;
+        self.stack_offset -= 8;
+
+        // Get current pid_tgid as key
+        self.instructions.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
+        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R10, key_offset, EbpfReg::R0));
+
+        // Map lookup
+        let lookup_reloc = self.instructions.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
+        self.instructions.push(insn1);
+        self.instructions.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: lookup_reloc,
+            map_name: TIMESTAMP_MAP_NAME.to_string(),
+        });
+
+        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
+        self.instructions.push(EbpfInsn::call(BpfHelper::MapLookupElem));
+
+        // If NULL, return 0
+        let no_timer_idx = self.instructions.len();
+        self.instructions.push(EbpfInsn::new(
+            opcode::BPF_JMP | opcode::BPF_JEQ | opcode::BPF_K,
+            EbpfReg::R0.as_u8(), 0, 0, 0,
+        ));
+
+        // Load start timestamp to R6 (callee-saved)
+        self.instructions.push(EbpfInsn::ldxdw(EbpfReg::R6, EbpfReg::R0, 0));
+
+        // Get current time
+        self.instructions.push(EbpfInsn::call(BpfHelper::KtimeGetNs));
+
+        // Compute delta = current - start
+        self.instructions.push(EbpfInsn::sub64_reg(EbpfReg::R0, EbpfReg::R6));
+
+        // Save delta to dst_reg
+        if dst_reg != EbpfReg::R0 {
+            self.instructions.push(EbpfInsn::mov64_reg(dst_reg, EbpfReg::R0));
+        }
+
+        // Delete map entry
+        let delete_reloc = self.instructions.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R1);
+        self.instructions.push(insn1);
+        self.instructions.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: delete_reloc,
+            map_name: TIMESTAMP_MAP_NAME.to_string(),
+        });
+
+        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
+        self.instructions.push(EbpfInsn::call(BpfHelper::MapDeleteElem));
+
+        // Jump to done
+        let done_jmp_idx = self.instructions.len();
+        self.instructions.push(EbpfInsn::jump(0));
+
+        // No timer path - set dst to 0
+        let no_timer_offset = (self.instructions.len() - no_timer_idx - 1) as i16;
+        self.instructions[no_timer_idx].offset = no_timer_offset;
+        self.instructions.push(EbpfInsn::mov64_imm(dst_reg, 0));
+
+        // Done
+        let done_offset = (self.instructions.len() - done_jmp_idx - 1) as i16;
+        self.instructions[done_jmp_idx].offset = done_offset;
+
         Ok(())
     }
 }

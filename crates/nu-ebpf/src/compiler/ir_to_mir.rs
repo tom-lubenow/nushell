@@ -87,6 +87,10 @@ pub struct IrToMirLowering<'a> {
     pub needs_ringbuf: bool,
     /// Needs counter map
     pub needs_counter_map: bool,
+    /// Needs histogram map
+    pub needs_histogram_map: bool,
+    /// Needs timestamp map (for timing)
+    pub needs_timestamp_map: bool,
 }
 
 impl<'a> IrToMirLowering<'a> {
@@ -116,6 +120,8 @@ impl<'a> IrToMirLowering<'a> {
             pipeline_input_reg: None,
             needs_ringbuf: false,
             needs_counter_map: false,
+            needs_histogram_map: false,
+            needs_timestamp_map: false,
         }
     }
 
@@ -736,6 +742,32 @@ impl<'a> IrToMirLowering<'a> {
                     user_space: false,
                     max_len: 128,
                 });
+            }
+
+            "histogram" => {
+                self.needs_histogram_map = true;
+                let value_vreg = self.pipeline_input.unwrap_or(dst_vreg);
+                self.emit(MirInst::Histogram { value: value_vreg });
+                // Return 0 (pass-through)
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::Const(0),
+                });
+            }
+
+            "start-timer" => {
+                self.needs_timestamp_map = true;
+                self.emit(MirInst::StartTimer);
+                // Return 0 (void)
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::Const(0),
+                });
+            }
+
+            "stop-timer" => {
+                self.needs_timestamp_map = true;
+                self.emit(MirInst::StopTimer { dst: dst_vreg });
             }
 
             _ => {

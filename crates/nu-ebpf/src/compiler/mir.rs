@@ -386,6 +386,21 @@ pub enum MirInst {
         key: VReg,
     },
 
+    /// Histogram aggregation - computes log2 bucket and increments counter
+    Histogram {
+        /// Value to compute histogram bucket for
+        value: VReg,
+    },
+
+    /// Start timer - stores current ktime keyed by TID
+    StartTimer,
+
+    /// Stop timer - looks up start time, computes delta, deletes entry
+    /// Result is stored in dst (0 if no matching start)
+    StopTimer {
+        dst: VReg,
+    },
+
     /// Emit event to ring buffer
     EmitEvent {
         data: VReg,
@@ -496,6 +511,7 @@ impl MirInst {
             | MirInst::MapLookup { dst, .. }
             | MirInst::LoadCtxField { dst, .. }
             | MirInst::StrCmp { dst, .. }
+            | MirInst::StopTimer { dst, .. }
             | MirInst::LoopHeader { counter: dst, .. } => Some(*dst),
             _ => None,
         }
@@ -535,6 +551,9 @@ impl MirInst {
                 uses.push(*val);
             }
             MirInst::MapDelete { key, .. } => uses.push(*key),
+            MirInst::Histogram { value, .. } => uses.push(*value),
+            MirInst::StartTimer => {}
+            MirInst::StopTimer { .. } => {}
             MirInst::EmitEvent { data, .. } => uses.push(*data),
             MirInst::EmitRecord { fields } => {
                 for field in fields {

@@ -1409,8 +1409,8 @@ impl<'a> IrToEbpfCompiler<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nu_protocol::ast::{Math, Operator};
-    use nu_protocol::ir::{IrBlock, Literal};
+    use nu_protocol::ast::{Comparison, Math, Operator};
+    use nu_protocol::ir::{DataSlice, IrBlock, Literal};
     use std::sync::Arc;
 
     fn make_ir_block(instructions: Vec<Instruction>) -> IrBlock {
@@ -1418,6 +1418,18 @@ mod tests {
             instructions,
             spans: vec![],
             data: Arc::from([]),
+            ast: vec![],
+            comments: vec![],
+            register_count: 10,
+            file_count: 0,
+        }
+    }
+
+    fn make_ir_block_with_data(instructions: Vec<Instruction>, data: Vec<u8>) -> IrBlock {
+        IrBlock {
+            instructions,
+            spans: vec![],
+            data: Arc::from(data),
             ast: vec![],
             comments: vec![],
             register_count: 10,
@@ -1458,6 +1470,107 @@ mod tests {
             },
             Instruction::Return { src: RegId::new(0) },
         ]);
+
+        let bytecode = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
+        assert!(!bytecode.is_empty());
+    }
+
+    #[test]
+    fn test_compile_string_comparison_equal() {
+        // Create data buffer with two strings: "nginx" at offset 0, "nginx" at offset 5
+        let data = b"nginxnginx".to_vec();
+
+        let ir = make_ir_block_with_data(
+            vec![
+                // Load first string "nginx"
+                Instruction::LoadLiteral {
+                    dst: RegId::new(0),
+                    lit: Literal::String(DataSlice { start: 0, len: 5 }),
+                },
+                // Load second string "nginx"
+                Instruction::LoadLiteral {
+                    dst: RegId::new(1),
+                    lit: Literal::String(DataSlice { start: 5, len: 5 }),
+                },
+                // Compare them
+                Instruction::BinaryOp {
+                    lhs_dst: RegId::new(0),
+                    op: Operator::Comparison(Comparison::Equal),
+                    rhs: RegId::new(1),
+                },
+                Instruction::Return { src: RegId::new(0) },
+            ],
+            data,
+        );
+
+        let bytecode = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
+        // Should have bytecode for:
+        // - Store first string on stack
+        // - Store second string on stack
+        // - Compare them chunk by chunk
+        // - Return result
+        assert!(!bytecode.is_empty());
+        // String comparison generates more instructions than simple int comparison
+        // Each string needs: 64-bit load + store per chunk + pointer setup
+        // Comparison needs: load chunks + compare + jumps
+        assert!(bytecode.len() > 100, "Expected substantial bytecode for string comparison");
+    }
+
+    #[test]
+    fn test_compile_string_comparison_not_equal() {
+        // Create data buffer with two different strings
+        let data = b"nginxapache".to_vec();
+
+        let ir = make_ir_block_with_data(
+            vec![
+                Instruction::LoadLiteral {
+                    dst: RegId::new(0),
+                    lit: Literal::String(DataSlice { start: 0, len: 5 }),
+                },
+                Instruction::LoadLiteral {
+                    dst: RegId::new(1),
+                    lit: Literal::String(DataSlice { start: 5, len: 6 }),
+                },
+                Instruction::BinaryOp {
+                    lhs_dst: RegId::new(0),
+                    op: Operator::Comparison(Comparison::NotEqual),
+                    rhs: RegId::new(1),
+                },
+                Instruction::Return { src: RegId::new(0) },
+            ],
+            data,
+        );
+
+        let bytecode = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
+        assert!(!bytecode.is_empty());
+    }
+
+    #[test]
+    fn test_compile_string_comparison_different_lengths() {
+        // Test comparing strings of different lengths
+        // "nginx" (5 bytes + null = 6) vs "ng" (2 bytes + null = 3)
+        // Should compare 3 bytes (shorter), and "ngi" != "ng\0"
+        let data = b"nginxng".to_vec();
+
+        let ir = make_ir_block_with_data(
+            vec![
+                Instruction::LoadLiteral {
+                    dst: RegId::new(0),
+                    lit: Literal::String(DataSlice { start: 0, len: 5 }),
+                },
+                Instruction::LoadLiteral {
+                    dst: RegId::new(1),
+                    lit: Literal::String(DataSlice { start: 5, len: 2 }),
+                },
+                Instruction::BinaryOp {
+                    lhs_dst: RegId::new(0),
+                    op: Operator::Comparison(Comparison::Equal),
+                    rhs: RegId::new(1),
+                },
+                Instruction::Return { src: RegId::new(0) },
+            ],
+            data,
+        );
 
         let bytecode = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
         assert!(!bytecode.is_empty());

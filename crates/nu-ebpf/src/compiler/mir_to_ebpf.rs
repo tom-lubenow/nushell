@@ -28,6 +28,7 @@ use crate::compiler::mir::{
 };
 use crate::compiler::regalloc::{LinearScanAllocator, RegAllocResult};
 use crate::compiler::CompileError;
+use crate::kernel_btf::KernelBtf;
 
 /// Ring buffer map name
 pub const RINGBUF_MAP_NAME: &str = "events";
@@ -798,10 +799,58 @@ impl<'a> MirToEbpfCompiler<'a> {
                 self.compile_get_stackid(dst, USTACK_MAP_NAME, true)?;
             }
             CtxField::TracepointField(name) => {
-                return Err(CompileError::UnsupportedInstruction(format!(
-                    "Tracepoint field '{}' not yet implemented in MIR compiler",
-                    name
-                )));
+                // Get tracepoint context from probe context
+                let probe_ctx = self.probe_ctx.ok_or_else(|| {
+                    CompileError::UnsupportedInstruction(
+                        "Tracepoint field access requires probe context".into(),
+                    )
+                })?;
+
+                let (category, tp_name) = probe_ctx.tracepoint_parts().ok_or_else(|| {
+                    CompileError::TracepointContextError {
+                        category: "unknown".into(),
+                        name: probe_ctx.target.clone(),
+                        reason: "Invalid tracepoint format. Expected 'category/name'".into(),
+                    }
+                })?;
+
+                let btf = KernelBtf::get();
+                let ctx = btf.get_tracepoint_context(category, tp_name).map_err(|e| {
+                    CompileError::TracepointContextError {
+                        category: category.into(),
+                        name: tp_name.into(),
+                        reason: e.to_string(),
+                    }
+                })?;
+
+                // Look up the field in the tracepoint context
+                let field_info = ctx.get_field(name).ok_or_else(|| {
+                    CompileError::TracepointFieldNotFound {
+                        field: name.clone(),
+                        available: ctx.field_names().join(", "),
+                    }
+                })?;
+
+                // Load the field from the context struct
+                // R9 contains the saved context pointer (tracepoint context struct)
+                let offset = field_info.offset as i16;
+
+                // Choose load instruction based on field size
+                match field_info.size {
+                    1 => {
+                        self.instructions.push(EbpfInsn::ldxb(dst, EbpfReg::R9, offset));
+                    }
+                    2 => {
+                        self.instructions.push(EbpfInsn::ldxh(dst, EbpfReg::R9, offset));
+                    }
+                    4 => {
+                        self.instructions.push(EbpfInsn::ldxw(dst, EbpfReg::R9, offset));
+                    }
+                    _ => {
+                        // Default to 64-bit load for 8+ byte fields
+                        self.instructions.push(EbpfInsn::ldxdw(dst, EbpfReg::R9, offset));
+                    }
+                }
             }
         }
         Ok(())

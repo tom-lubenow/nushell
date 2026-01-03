@@ -27,6 +27,7 @@ pub mod ir_to_mir;
 pub mod mir;
 pub mod mir_to_ebpf;
 mod register_alloc;
+pub mod regalloc;
 
 pub use elf::{
     BpfFieldType, BpfMapDef, EbpfMap, EbpfProgram, EbpfProgramType, EventSchema, MapRelocation,

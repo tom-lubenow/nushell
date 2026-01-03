@@ -11,12 +11,13 @@
 //!
 //! New (MIR-based, in progress):
 //! ```text
-//! Nushell IR → [ir_to_mir] → MIR → [mir_to_ebpf] → eBPF bytecode
+//! Nushell IR → [ir_to_mir] → MIR → [cfg] → CFG analysis → [mir_to_ebpf] → eBPF bytecode
 //! ```
 //!
 //! The MIR compiler can be enabled with `--mir-compiler` flag (experimental).
 
 mod btf;
+pub mod cfg;
 mod elf;
 mod helpers;
 pub mod instruction;

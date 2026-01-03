@@ -6,9 +6,18 @@
 //! - Stack layout and spilling
 //! - Control flow (basic block linearization, jump resolution)
 //! - BPF helper calls and map operations
+//!
+//! ## Pipeline
+//!
+//! 1. Build CFG from MIR
+//! 2. Compute liveness information
+//! 3. Layout stack slots
+//! 4. Compile blocks in reverse post-order
+//! 5. Fix up jumps and emit bytecode
 
 use std::collections::HashMap;
 
+use crate::compiler::cfg::{CFG, LivenessInfo};
 use crate::compiler::elf::{BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext};
 use crate::compiler::instruction::{opcode, BpfHelper, EbpfInsn, EbpfReg};
 use crate::compiler::ir_to_ebpf::pt_regs_offsets;
@@ -160,16 +169,28 @@ impl<'a> MirToEbpfCompiler<'a> {
 
     /// Compile a MIR function
     fn compile_function(&mut self, func: &MirFunction) -> Result<(), CompileError> {
-        // Order blocks (simple: entry first, then rest)
-        let mut block_order: Vec<BlockId> = vec![func.entry];
-        for block in &func.blocks {
-            if block.id != func.entry {
-                block_order.push(block.id);
-            }
-        }
+        // Build CFG and compute analysis information
+        let cfg = CFG::build(func);
+        let _liveness = LivenessInfo::compute(func, &cfg);
 
-        // Compile each block
+        // Use reverse post-order for block layout
+        // This ensures that:
+        // 1. Dominators appear before dominated blocks
+        // 2. Loop headers appear before loop bodies
+        // 3. Better cache locality for typical execution paths
+        let block_order: Vec<BlockId> = if cfg.rpo.is_empty() {
+            // Fallback to simple ordering if CFG is empty
+            func.blocks.iter().map(|b| b.id).collect()
+        } else {
+            cfg.rpo.clone()
+        };
+
+        // Compile each block in CFG order
         for block_id in block_order {
+            // Skip unreachable blocks
+            if !cfg.reachable_blocks().contains(&block_id) {
+                continue;
+            }
             let block = func.block(block_id).clone();
             self.compile_block(&block)?;
         }

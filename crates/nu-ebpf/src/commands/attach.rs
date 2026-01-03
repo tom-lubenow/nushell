@@ -432,8 +432,7 @@ fn compile_with_mir(
         .required_positional
         .first()
         .map(|p| p.var_id)
-        .flatten()
-        .map(|vid| nu_protocol::RegId::new(vid.get() as u32));
+        .flatten();
 
     // Convert captures to (String, i64) pairs
     let captures: Vec<(String, i64)> = closure

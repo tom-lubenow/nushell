@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use nu_protocol::ast::{CellPath, PathMember, Pattern};
 use nu_protocol::engine::EngineState;
 use nu_protocol::ir::{Instruction, IrBlock};
-use nu_protocol::{DeclId, RegId, Value};
+use nu_protocol::{DeclId, RegId, Value, VarId};
 
 use super::elf::ProbeContext;
 use super::mir::{
@@ -73,8 +73,8 @@ pub struct IrToMirLowering<'a> {
     engine_state: Option<&'a EngineState>,
     /// Captured closure values to inline
     captures: &'a [(String, i64)],
-    /// Context parameter register (if any)
-    ctx_param: Option<RegId>,
+    /// Context parameter variable ID (if any)
+    ctx_param: Option<VarId>,
     /// Pipeline input register (for commands)
     pipeline_input: Option<VReg>,
     /// Needs ringbuf map
@@ -90,7 +90,7 @@ impl<'a> IrToMirLowering<'a> {
         probe_ctx: Option<&'a ProbeContext>,
         engine_state: Option<&'a EngineState>,
         captures: &'a [(String, i64)],
-        ctx_param: Option<RegId>,
+        ctx_param: Option<VarId>,
     ) -> Self {
         let mut func = MirFunction::new();
         let entry = func.alloc_block();
@@ -132,10 +132,9 @@ impl<'a> IrToMirLowering<'a> {
         self.reg_metadata.remove(&reg.get());
     }
 
-    /// Check if a register is the context parameter
+    /// Check if a register holds the context value
     fn is_context_reg(&self, reg: RegId) -> bool {
-        self.ctx_param.map(|p| p == reg).unwrap_or(false)
-            || self.get_metadata(reg).map(|m| m.is_context).unwrap_or(false)
+        self.get_metadata(reg).map(|m| m.is_context).unwrap_or(false)
     }
 
     /// Get or create a VReg for a Nushell RegId
@@ -300,6 +299,11 @@ impl<'a> IrToMirLowering<'a> {
 
             Instruction::PopErrorHandler => {
                 // No-op
+            }
+
+            Instruction::RedirectOut { mode } | Instruction::RedirectErr { mode } => {
+                // Redirection - no-op in eBPF, we don't have stdout/stderr
+                let _ = mode;
             }
 
             // === Unsupported ===
@@ -722,26 +726,27 @@ impl<'a> IrToMirLowering<'a> {
         dst: RegId,
         var_id: nu_protocol::VarId,
     ) -> Result<(), CompileError> {
+        // Check if this is the context parameter variable
+        if let Some(ctx_var) = self.ctx_param {
+            if var_id == ctx_var {
+                let dst_vreg = self.get_vreg(dst);
+                // Mark this register as holding the context
+                let meta = self.get_or_create_metadata(dst);
+                meta.is_context = true;
+                // Emit a placeholder - actual context access happens in FollowCellPath
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::Const(0), // Placeholder
+                });
+                return Ok(());
+            }
+        }
+
         // Check if this is a captured variable
         for (name, value) in self.captures {
             // We'd need the variable name to match, but we only have var_id
             // For now, check if any capture matches by trying them all
             let _ = (name, value);
-        }
-
-        // Check if this is the context parameter variable
-        // The context parameter is typically var_id 0 in the closure
-        if var_id.get() == 0 {
-            let dst_vreg = self.get_vreg(dst);
-            // Mark this register as holding the context
-            let meta = self.get_or_create_metadata(dst);
-            meta.is_context = true;
-            // Emit a placeholder - actual context access happens in FollowCellPath
-            self.emit(MirInst::Copy {
-                dst: dst_vreg,
-                src: MirValue::Const(0), // Placeholder
-            });
-            return Ok(());
         }
 
         Err(CompileError::UnsupportedInstruction(format!(
@@ -764,7 +769,7 @@ pub fn lower_ir_to_mir(
     probe_ctx: Option<&ProbeContext>,
     engine_state: Option<&EngineState>,
     captures: &[(String, i64)],
-    ctx_param: Option<RegId>,
+    ctx_param: Option<VarId>,
 ) -> Result<MirProgram, CompileError> {
     let mut lowering = IrToMirLowering::new(ir_block, probe_ctx, engine_state, captures, ctx_param);
     lowering.lower_block(ir_block)?;

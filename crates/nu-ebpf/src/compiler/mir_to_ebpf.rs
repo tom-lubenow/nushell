@@ -541,33 +541,37 @@ impl<'a> MirToEbpfCompiler<'a> {
         match field {
             CtxField::Pid => {
                 // bpf_get_current_pid_tgid() returns (tgid << 32) | pid
+                // Lower 32 bits = thread ID (what Linux calls PID)
                 self.instructions
                     .push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
                 self.instructions
                     .push(EbpfInsn::mov64_reg(dst, EbpfReg::R0));
-                // Keep lower 32 bits (pid)
-                self.instructions.push(EbpfInsn::and64_imm(dst, -1i32));
+                // Keep lower 32 bits
+                self.instructions
+                    .push(EbpfInsn::and64_imm(dst, 0x7FFFFFFF));
             }
             CtxField::Tid => {
+                // Upper 32 bits = thread group ID (what userspace calls PID)
                 self.instructions
                     .push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
+                self.instructions.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 32));
                 self.instructions
                     .push(EbpfInsn::mov64_reg(dst, EbpfReg::R0));
-                self.instructions.push(EbpfInsn::and64_imm(dst, -1i32));
             }
             CtxField::Uid => {
                 self.instructions
                     .push(EbpfInsn::call(BpfHelper::GetCurrentUidGid));
                 self.instructions
                     .push(EbpfInsn::mov64_reg(dst, EbpfReg::R0));
-                self.instructions.push(EbpfInsn::and64_imm(dst, -1i32));
+                self.instructions
+                    .push(EbpfInsn::and64_imm(dst, 0x7FFFFFFF));
             }
             CtxField::Gid => {
                 self.instructions
                     .push(EbpfInsn::call(BpfHelper::GetCurrentUidGid));
+                self.instructions.push(EbpfInsn::rsh64_imm(EbpfReg::R0, 32));
                 self.instructions
                     .push(EbpfInsn::mov64_reg(dst, EbpfReg::R0));
-                self.instructions.push(EbpfInsn::rsh64_imm(dst, 32));
             }
             CtxField::Timestamp => {
                 self.instructions
@@ -583,8 +587,9 @@ impl<'a> MirToEbpfCompiler<'a> {
             CtxField::Comm => {
                 // Allocate stack space for comm (16 bytes)
                 self.check_stack_space(16)?;
-                let comm_offset = self.stack_offset;
+                // Stack grows downward - decrement first
                 self.stack_offset -= 16;
+                let comm_offset = self.stack_offset;
 
                 // bpf_get_current_comm(buf, size)
                 self.instructions
@@ -645,8 +650,9 @@ impl<'a> MirToEbpfCompiler<'a> {
     fn compile_emit_event(&mut self, data_reg: EbpfReg, size: usize) -> Result<(), CompileError> {
         let event_size = if size > 0 { size } else { 8 };
         self.check_stack_space(event_size as i16)?;
-        let event_offset = self.stack_offset;
+        // Stack grows downward - decrement first, then use offset
         self.stack_offset -= event_size as i16;
+        let event_offset = self.stack_offset;
 
         // Store data to stack
         self.instructions
@@ -685,9 +691,10 @@ impl<'a> MirToEbpfCompiler<'a> {
     fn compile_map_update(&mut self, map_name: &str, key_reg: EbpfReg) -> Result<(), CompileError> {
         // For count: lookup key, increment, update
         self.check_stack_space(16)?;
-        let key_offset = self.stack_offset - 8;
-        let val_offset = self.stack_offset - 16;
+        // Stack grows downward - decrement first
         self.stack_offset -= 16;
+        let key_offset = self.stack_offset + 8; // key at higher address
+        let val_offset = self.stack_offset;     // value at lower address
 
         // Store key to stack
         self.instructions

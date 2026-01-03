@@ -477,52 +477,33 @@ impl<'a> IrToEbpfCompiler<'a> {
     //
     // These methods handle spilling registers to stack when we run out,
     // and reloading spilled values when they're needed again.
-
-    /// Ensure a Nushell variable's value is in an eBPF register (reload if spilled)
-    pub(crate) fn ensure_var(&mut self, var_id: VarId) -> Result<EbpfReg, CompileError> {
-        // Check if the value is spilled and needs reload
-        if let Some(stack_offset) = self.reg_alloc.var_needs_reload(var_id) {
-            // Need to reload - first get a register (may cause another spill)
-            let target_reg = self.alloc_reg_for_write_internal(ValueKey::Var(var_id.get()))?;
-            // Emit the load instruction
-            self.builder
-                .push(EbpfInsn::ldxdw(target_reg, EbpfReg::R10, stack_offset));
-            self.reg_alloc
-                .complete_reload(ValueKey::Var(var_id.get()), target_reg);
-            return Ok(target_reg);
-        }
-
-        // Value is already in a register
-        let RegAction::Ready(r) = self.reg_alloc.get_var(var_id)?;
-        Ok(r)
-    }
-
-    /// Get a register for writing to a Nushell variable (may spill another value)
-    pub(crate) fn alloc_var(&mut self, var_id: VarId) -> Result<EbpfReg, CompileError> {
-        self.alloc_reg_for_write_internal(ValueKey::Var(var_id.get()))
-    }
+    //
+    // Note: Variables are stored on stack (via var_stack_offsets), not in
+    // eBPF registers. Only Nushell IR registers use the register allocator.
 
     /// Internal helper to allocate a register for writing, handling spills
-    fn alloc_reg_for_write_internal(&mut self, key: ValueKey) -> Result<EbpfReg, CompileError> {
-        let action = match key {
-            ValueKey::Reg(id) => self.reg_alloc.get_or_alloc(RegId::new(id))?,
-            ValueKey::Var(id) => self.reg_alloc.get_or_alloc_var(VarId::new(id))?,
-        };
+    fn alloc_reg_for_write_internal(&mut self, reg: RegId) -> Result<EbpfReg, CompileError> {
+        let action = self.reg_alloc.get_or_alloc(reg)?;
 
         match action {
-            AllocAction::Free(reg) => Ok(reg),
+            AllocAction::Free(ebpf_reg) => Ok(ebpf_reg),
             AllocAction::Spill {
-                reg, victim_key, ..
+                reg: ebpf_reg,
+                victim_key,
             } => {
                 // Need to spill the victim to stack
                 let spill_offset = self.alloc_stack_internal(8)?;
                 // Emit the store instruction
                 self.builder
-                    .push(EbpfInsn::stxdw(EbpfReg::R10, spill_offset, reg));
+                    .push(EbpfInsn::stxdw(EbpfReg::R10, spill_offset, ebpf_reg));
                 // Complete the spill in the allocator
-                self.reg_alloc
-                    .complete_spill(victim_key, reg, spill_offset, key);
-                Ok(reg)
+                self.reg_alloc.complete_spill(
+                    victim_key,
+                    ebpf_reg,
+                    spill_offset,
+                    ValueKey::Reg(reg.get()),
+                );
+                Ok(ebpf_reg)
             }
         }
     }
@@ -860,7 +841,7 @@ impl<'a> IrToEbpfCompiler<'a> {
     }
 
     pub(crate) fn alloc_reg(&mut self, reg: RegId) -> Result<EbpfReg, CompileError> {
-        self.alloc_reg_for_write_internal(ValueKey::Reg(reg.get()))
+        self.alloc_reg_for_write_internal(reg)
     }
 
     pub(crate) fn alloc_stack(&mut self, size: i16) -> Result<i16, CompileError> {
@@ -876,7 +857,7 @@ impl<'a> IrToEbpfCompiler<'a> {
         // Check if the value is spilled and needs reload
         if let Some(stack_offset) = self.reg_alloc.needs_reload(reg) {
             // Need to reload - first get a register (may cause another spill)
-            let target_reg = self.alloc_reg_for_write_internal(ValueKey::Reg(reg.get()))?;
+            let target_reg = self.alloc_reg_for_write_internal(reg)?;
             // Emit the load instruction
             self.builder
                 .push(EbpfInsn::ldxdw(target_reg, EbpfReg::R10, stack_offset));
@@ -1218,7 +1199,8 @@ impl<'a> IrToEbpfCompiler<'a> {
         } else {
             // 64-bit step (rare)
             self.emit_load_64bit_imm(EbpfReg::R0, step);
-            self.builder.push(EbpfInsn::add64_reg(ebpf_dst, EbpfReg::R0));
+            self.builder
+                .push(EbpfInsn::add64_reg(ebpf_dst, EbpfReg::R0));
         }
         self.builder
             .push(EbpfInsn::stxdw(EbpfReg::R10, iter.current_offset, ebpf_dst));
@@ -1230,7 +1212,8 @@ impl<'a> IrToEbpfCompiler<'a> {
                 .push(EbpfInsn::add64_imm(ebpf_dst, -(step as i32)));
         } else {
             self.emit_load_64bit_imm(EbpfReg::R0, -step);
-            self.builder.push(EbpfInsn::add64_reg(ebpf_dst, EbpfReg::R0));
+            self.builder
+                .push(EbpfInsn::add64_reg(ebpf_dst, EbpfReg::R0));
         }
 
         Ok(())
@@ -1278,19 +1261,14 @@ impl<'a> IrToEbpfCompiler<'a> {
         val: RegId,
     ) -> Result<(), CompileError> {
         // Get the field name from the key register's literal string
-        let field_name = self
-            .get_literal_string(key)
-            .cloned()
-            .ok_or_else(|| {
-                CompileError::UnsupportedInstruction(
-                    "Record field name must be a literal string".into(),
-                )
-            })?;
+        let field_name = self.get_literal_string(key).cloned().ok_or_else(|| {
+            CompileError::UnsupportedInstruction(
+                "Record field name must be a literal string".into(),
+            )
+        })?;
 
         // Determine the field type from the value register
-        let field_type = self
-            .get_register_type(val)
-            .unwrap_or(BpfFieldType::Int);
+        let field_type = self.get_register_type(val).unwrap_or(BpfFieldType::Int);
         let field_size = field_type.size() as i16;
 
         // Get the eBPF register containing the value
@@ -1766,7 +1744,10 @@ mod tests {
         // String comparison generates more instructions than simple int comparison
         // Each string needs: 64-bit load + store per chunk + pointer setup
         // Comparison needs: load chunks + compare + jumps
-        assert!(bytecode.len() > 100, "Expected substantial bytecode for string comparison");
+        assert!(
+            bytecode.len() > 100,
+            "Expected substantial bytecode for string comparison"
+        );
     }
 
     #[test]
@@ -1894,7 +1875,10 @@ mod tests {
         // Should generate bounded loop bytecode
         assert!(!bytecode.is_empty());
         // Loop generates multiple instructions: load, compare, jump, increment, store, etc.
-        assert!(bytecode.len() > 80, "Expected loop bytecode to be substantial");
+        assert!(
+            bytecode.len() > 80,
+            "Expected loop bytecode to be substantial"
+        );
     }
 
     #[test]

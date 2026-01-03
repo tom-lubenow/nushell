@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use nu_protocol::{RegId, VarId};
+use nu_protocol::RegId;
 
 use super::CompileError;
 use super::instruction::EbpfReg;
@@ -99,19 +99,6 @@ impl RegisterAllocator {
         self.get_value(key, || format!("Register %{} not allocated", reg.get()))
     }
 
-    /// Get a register for reading a variable (may need reload from stack)
-    pub fn get_var(&mut self, var_id: VarId) -> Result<RegAction, CompileError> {
-        let key = ValueKey::Var(var_id.get());
-        self.get_value(key, || {
-            format!(
-                "Variable ${} not available in eBPF closure. eBPF closures cannot capture \
-                 variables from outer scope - use literal values instead (e.g., == 1234 \
-                 instead of == $my_var)",
-                var_id.get()
-            )
-        })
-    }
-
     fn get_value(
         &mut self,
         key: ValueKey,
@@ -144,24 +131,9 @@ impl RegisterAllocator {
         }
     }
 
-    /// Check if a variable is spilled and needs reload
-    pub fn var_needs_reload(&self, var_id: VarId) -> Option<i16> {
-        let key = ValueKey::Var(var_id.get());
-        match self.locations.get(&key) {
-            Some(ValueLocation::Spilled(offset)) => Some(*offset),
-            _ => None,
-        }
-    }
-
     /// Allocate a register for writing to a Nushell register
     pub fn get_or_alloc(&mut self, reg: RegId) -> Result<AllocAction, CompileError> {
         let key = ValueKey::Reg(reg.get());
-        self.alloc_for_write(key)
-    }
-
-    /// Allocate a register for writing to a Nushell variable
-    pub fn get_or_alloc_var(&mut self, var_id: VarId) -> Result<AllocAction, CompileError> {
-        let key = ValueKey::Var(var_id.get());
         self.alloc_for_write(key)
     }
 
@@ -224,16 +196,6 @@ impl RegisterAllocator {
     #[allow(dead_code)]
     pub fn current_register(&self, reg: RegId) -> Option<EbpfReg> {
         let key = ValueKey::Reg(reg.get());
-        match self.locations.get(&key) {
-            Some(ValueLocation::Register(r)) => Some(*r),
-            _ => None,
-        }
-    }
-
-    /// Get the current register for a variable, if it's in a register
-    #[allow(dead_code)]
-    pub fn current_var_register(&self, var_id: VarId) -> Option<EbpfReg> {
-        let key = ValueKey::Var(var_id.get());
         match self.locations.get(&key) {
             Some(ValueLocation::Register(r)) => Some(*r),
             _ => None,

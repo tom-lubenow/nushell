@@ -217,17 +217,11 @@ impl IrOps for IrToEbpfCompiler<'_> {
                 let lhs_str = lhs_str.unwrap_or_else(|| {
                     // RHS is a string but LHS is not - this is unusual but handle it
                     // by treating LHS as an 8-byte value (likely an error in the program)
-                    StackString {
-                        offset: 0,
-                        size: 8,
-                    }
+                    StackString { offset: 0, size: 8 }
                 });
                 let rhs_str = rhs_str.unwrap_or_else(|| {
                     // LHS is a string but RHS is not
-                    StackString {
-                        offset: 0,
-                        size: 8,
-                    }
+                    StackString { offset: 0, size: 8 }
                 });
 
                 // Allocate result register
@@ -468,34 +462,38 @@ impl IrOps for IrToEbpfCompiler<'_> {
             }
 
             // Compare R0 and R1
+            // Logic for Equal:
+            //   jne r0, r1, +1  -> if not equal, skip the "ja" and execute "set 0, jump to end"
+            //   ja +2          -> if equal, skip the "set 0, jump to end" and continue
+            //   mov dst, 0     -> set result = not equal
+            //   jump to end
             if is_equal {
-                // For Equal: if not equal, set result to 0 and jump to end
-                // jne r0, r1, +2 (skip the next 2 instructions if not equal)
+                // If not equal, skip the "ja +2" and land on "mov dst, 0"
                 self.builder().push(EbpfInsn::new(
                     opcode::BPF_JMP | opcode::BPF_JNE | opcode::BPF_X,
                     EbpfReg::R0.as_u8(),
                     EbpfReg::R1.as_u8(),
-                    2, // Skip 2 instructions
+                    1, // Skip 1 instruction (the ja +2)
                     0,
                 ));
-                // Skip setting to 0 and jumping if equal (fall through to next chunk)
-                self.builder().push(EbpfInsn::jump(2)); // Skip the set-to-0 and jump-to-end
+                // If equal, skip the "set 0 and jump to end" and continue to next chunk
+                self.builder().push(EbpfInsn::jump(2)); // Skip 2 instructions
 
                 // Set result to 0 (not equal)
                 self.builder().push(EbpfInsn::mov64_imm(dst_reg, 0));
                 // Jump to end
                 self.emit_jump_to_label(end_label);
             } else {
-                // For NotEqual: if not equal, set result to 1 and jump to end
+                // For NotEqual: same logic but set to 1 when not equal
                 self.builder().push(EbpfInsn::new(
                     opcode::BPF_JMP | opcode::BPF_JNE | opcode::BPF_X,
                     EbpfReg::R0.as_u8(),
                     EbpfReg::R1.as_u8(),
-                    2, // Skip 2 instructions
+                    1, // Skip 1 instruction (the ja +2)
                     0,
                 ));
-                // Skip setting to 1 and jumping if equal (fall through to next chunk)
-                self.builder().push(EbpfInsn::jump(2)); // Skip the set-to-1 and jump-to-end
+                // If equal, skip the "set 1 and jump to end" and continue to next chunk
+                self.builder().push(EbpfInsn::jump(2)); // Skip 2 instructions
 
                 // Set result to 1 (not equal)
                 self.builder().push(EbpfInsn::mov64_imm(dst_reg, 1));

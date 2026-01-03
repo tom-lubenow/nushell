@@ -7,14 +7,14 @@
 //! - Variable load/store
 //! - Logical NOT
 
-use nu_protocol::ast::{Bits, Comparison, Math, Operator};
+use nu_protocol::ast::{Bits, Comparison, Math, Operator, RangeInclusion};
 use nu_protocol::ir::Literal;
 use nu_protocol::{RegId, VarId};
 
 use crate::compiler::CompileError;
 use crate::compiler::elf::BpfFieldType;
 use crate::compiler::instruction::{EbpfInsn, EbpfReg, opcode};
-use crate::compiler::ir_to_ebpf::{IrToEbpfCompiler, RecordBuilder, StackString};
+use crate::compiler::ir_to_ebpf::{BoundedIterator, IrToEbpfCompiler, RecordBuilder, StackString};
 
 /// Extension trait for IR operation compilation
 pub trait IrOps {
@@ -49,6 +49,11 @@ pub trait IrOps {
 
 impl IrOps for IrToEbpfCompiler<'_> {
     fn compile_load_literal(&mut self, dst: RegId, lit: &Literal) -> Result<(), CompileError> {
+        // Invalidate all metadata for this register before writing a new value.
+        // This prevents stale data from previous uses affecting compilation,
+        // which was the root cause of nested loop bugs.
+        self.invalidate_register(dst);
+
         let ebpf_dst = self.alloc_reg(dst)?;
 
         match lit {
@@ -73,6 +78,7 @@ impl IrOps for IrToEbpfCompiler<'_> {
             }
             Literal::Nothing => {
                 // Nothing is represented as 0
+                // No need to clear metadata - invalidate_register() already did that
                 self.builder().push(EbpfInsn::mov64_imm(ebpf_dst, 0));
                 Ok(())
             }
@@ -120,17 +126,77 @@ impl IrOps for IrToEbpfCompiler<'_> {
                 self.builder().push(EbpfInsn::mov64_imm(ebpf_dst, 0));
                 Ok(())
             }
+            Literal::Range {
+                start,
+                step,
+                end,
+                inclusion,
+            } => {
+                // For eBPF bounded loops, we need compile-time known bounds
+                // Check if start, step, and end are all literal integers
+                let start_val = self.get_literal_value(*start).ok_or_else(|| {
+                    CompileError::UnsupportedInstruction(
+                        "Range start must be a compile-time known integer for eBPF loops".into(),
+                    )
+                })?;
+                // Step can be `nothing` (default step of 1) or an explicit integer
+                // Nushell uses `nothing` when no step is specified (e.g., 1..10)
+                let step_val = self.get_literal_value(*step).unwrap_or(1);
+                let end_val = self.get_literal_value(*end).ok_or_else(|| {
+                    CompileError::UnsupportedInstruction(
+                        "Range end must be a compile-time known integer for eBPF loops".into(),
+                    )
+                })?;
+
+                // Validate step is non-zero
+                if step_val == 0 {
+                    return Err(CompileError::UnsupportedInstruction(
+                        "Range step cannot be zero".into(),
+                    ));
+                }
+
+                // Allocate stack space for the current iterator value
+                let stack_offset = self.alloc_stack(8)?;
+
+                // Store initial value (start) on stack
+                if start_val >= i32::MIN as i64 && start_val <= i32::MAX as i64 {
+                    self.builder()
+                        .push(EbpfInsn::mov64_imm(EbpfReg::R0, start_val as i32));
+                } else {
+                    self.emit_load_64bit_imm(EbpfReg::R0, start_val);
+                }
+                self.builder()
+                    .push(EbpfInsn::stxdw(EbpfReg::R10, stack_offset, EbpfReg::R0));
+
+                // Create bounded iterator info for use by Iterate instruction
+                let iter = BoundedIterator {
+                    current_offset: stack_offset,
+                    end_value: end_val,
+                    step: step_val,
+                    inclusive: *inclusion == RangeInclusion::Inclusive,
+                };
+                self.set_bounded_iterator(dst, iter);
+
+                // Set a placeholder value in the register (actual iteration happens in Iterate)
+                self.builder().push(EbpfInsn::mov64_imm(ebpf_dst, 0));
+
+                Ok(())
+            }
             _ => Err(CompileError::UnsupportedLiteral),
         }
     }
 
     fn compile_move(&mut self, dst: RegId, src: RegId) -> Result<(), CompileError> {
+        // Save src value to scratch register before allocating dst,
+        // in case alloc_reg evicts the source register
         let ebpf_src = self.ensure_reg(src)?;
+        self.builder()
+            .push(EbpfInsn::mov64_reg(EbpfReg::R5, ebpf_src));
+
         let ebpf_dst = self.alloc_reg(dst)?;
 
-        if ebpf_src.as_u8() != ebpf_dst.as_u8() {
-            self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, ebpf_src));
-        }
+        self.builder()
+            .push(EbpfInsn::mov64_reg(ebpf_dst, EbpfReg::R5));
         Ok(())
     }
 
@@ -459,12 +525,14 @@ impl IrOps for IrToEbpfCompiler<'_> {
 
     fn compile_store_variable(&mut self, var_id: VarId, src: RegId) -> Result<(), CompileError> {
         let ebpf_src = self.ensure_reg(src)?;
-        let ebpf_var = self.alloc_var(var_id)?;
 
-        // Copy the value to the variable's register
-        if ebpf_src.as_u8() != ebpf_var.as_u8() {
-            self.builder().push(EbpfInsn::mov64_reg(ebpf_var, ebpf_src));
-        }
+        // Store variables on the stack to avoid register allocation issues with loops
+        // Get or allocate a stack slot for this variable
+        let stack_offset = self.get_or_alloc_var_stack(var_id)?;
+
+        // Store the value to the stack
+        self.builder()
+            .push(EbpfInsn::stxdw(EbpfReg::R10, stack_offset, ebpf_src));
         Ok(())
     }
 
@@ -503,13 +571,21 @@ impl IrOps for IrToEbpfCompiler<'_> {
             return Ok(());
         }
 
-        let ebpf_var = self.ensure_var(var_id)?;
+        // Load variable from stack
+        // Get the stack slot for this variable
+        let stack_offset = self.get_var_stack(var_id).ok_or_else(|| {
+            CompileError::UnsupportedInstruction(format!(
+                "Variable ${} not found. Variables must be assigned before use.",
+                var_id.get()
+            ))
+        })?;
+
+        // Allocate destination register
         let ebpf_dst = self.alloc_reg(dst)?;
 
-        // Copy from variable's register to destination
-        if ebpf_var.as_u8() != ebpf_dst.as_u8() {
-            self.builder().push(EbpfInsn::mov64_reg(ebpf_dst, ebpf_var));
-        }
+        // Load the value from the stack
+        self.builder()
+            .push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R10, stack_offset));
         Ok(())
     }
 

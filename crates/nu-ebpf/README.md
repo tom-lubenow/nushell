@@ -136,6 +136,21 @@ let id = ebpf attach 'kprobe:ksys_read' {|ctx|
 }
 ```
 
+### Bounded Loops
+
+```nushell
+# Loops with compile-time known bounds are supported (requires kernel 5.3+)
+let id = ebpf attach 'kprobe:ksys_read' {|ctx|
+    for i in 1..5 {
+        # Loop body executes 4 times (1, 2, 3, 4)
+        $i | count
+    }
+}
+```
+
+Note: Only ranges with literal integer bounds are supported (e.g., `1..10`, `1..=5`).
+Dynamic iterators and unbounded loops are not supported in eBPF.
+
 ### Latency Histogram
 
 ```nushell
@@ -207,7 +222,7 @@ The compiler:
 ## Limitations
 
 - **Linux only**: eBPF is a Linux kernel feature
-- **Limited control flow**: Complex conditionals and loops may not compile
+- **Bounded loops only**: Loops require compile-time known bounds (e.g., `for i in 1..10`). Dynamic iterators are not supported.
 - **No strings in eBPF**: String operations happen at emit time or userspace
 - **Stack limit**: eBPF programs have a 512-byte stack limit
 - **Verifier constraints**: The kernel verifier may reject some valid-looking programs

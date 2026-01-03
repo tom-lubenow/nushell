@@ -136,6 +136,49 @@ pub(crate) struct StackString {
     pub size: usize,
 }
 
+/// Tracks an iterator for bounded loops
+///
+/// Created from `Literal::Range` when all bounds are compile-time known integers.
+/// Used by `Iterate` instruction to generate bounded eBPF loops.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoundedIterator {
+    /// Current value (start) stored on stack
+    pub current_offset: i16,
+    /// End value (exclusive for half-open, inclusive for closed)
+    pub end_value: i64,
+    /// Step value
+    pub step: i64,
+    /// Whether the range is inclusive (..=) or exclusive (..)
+    pub inclusive: bool,
+}
+
+/// Centralized metadata for a Nushell register
+///
+/// This consolidates all per-register state into a single struct to ensure
+/// proper invalidation when registers are reused. When a register is written to,
+/// all its metadata is cleared to prevent stale data bugs.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RegisterMetadata {
+    /// Compile-time integer value (for constants used in Range bounds, etc.)
+    pub literal_value: Option<i64>,
+    /// Compile-time string value (for field names in records)
+    pub literal_string: Option<String>,
+    /// Record being built in this register
+    pub record_builder: Option<RecordBuilder>,
+    /// Type of value in this register (Int, Comm, String)
+    pub field_type: Option<BpfFieldType>,
+    /// Stack-based string info (for comm, string literals)
+    pub stack_string: Option<StackString>,
+    /// Whether this register holds the context parameter
+    pub is_context: bool,
+    /// Cell path literal (for field access like $ctx.pid)
+    pub cell_path: Option<CellPath>,
+    /// Bounded iterator info (for loop compilation)
+    pub bounded_iterator: Option<BoundedIterator>,
+    /// Loop header eBPF instruction index (for jump-back target)
+    pub loop_header: Option<usize>,
+}
+
 /// Compiles Nushell IR to eBPF bytecode
 pub struct IrToEbpfCompiler<'a> {
     ir_block: &'a IrBlock,
@@ -162,17 +205,9 @@ pub struct IrToEbpfCompiler<'a> {
     ctx_saved: bool,
     /// Pushed positional arguments for the next call (register IDs)
     pushed_args: Vec<RegId>,
-    /// Track literal integer values loaded into registers (for compile-time constants)
-    literal_values: HashMap<u32, i64>,
-    /// Track literal string values loaded into registers (for field names)
-    literal_strings: HashMap<u32, String>,
-    /// Track records being built (RegId -> RecordBuilder)
-    record_builders: HashMap<u32, RecordBuilder>,
-    /// Track the type of value produced by each register (for schema inference)
-    register_types: HashMap<u32, BpfFieldType>,
-    /// Track registers that point to stack-based strings (reg_id -> StackString)
-    /// For types like Comm and string literals that live on stack rather than in registers
-    stack_strings: HashMap<u32, StackString>,
+    /// Centralized per-register metadata (literal values, types, strings, etc.)
+    /// All metadata is invalidated when a register is written to, preventing stale data bugs.
+    register_metadata: HashMap<u32, RegisterMetadata>,
     /// The event schema if structured events are used
     event_schema: Option<EventSchema>,
     /// Pending internal jumps to fix up (for intra-function control flow)
@@ -184,11 +219,6 @@ pub struct IrToEbpfCompiler<'a> {
     /// The VarId of the closure's context parameter (if any)
     /// When a closure like `{|ctx| $ctx.pid }` is compiled, this tracks which VarId is `ctx`
     context_param_var_id: Option<VarId>,
-    /// Track which registers currently hold the context variable
-    /// This allows us to intercept field access like `$ctx.pid`
-    context_registers: HashMap<u32, bool>,
-    /// Track cell path literals loaded into registers
-    literal_cell_paths: HashMap<u32, CellPath>,
     /// Captured variable values from the closure (for compile-time constant inlining)
     /// When a closure captures a variable like `let pid = 1234; {|| $pid }`,
     /// we can inline the value as a constant in the eBPF bytecode.
@@ -196,6 +226,9 @@ pub struct IrToEbpfCompiler<'a> {
     /// Probe context providing information about where this program will be attached
     /// Used for auto-detecting userspace vs kernel memory reads, validating retval access, etc.
     probe_context: ProbeContext,
+    /// Track stack offsets for user variables (VarId -> stack offset)
+    /// Variables are stored on stack to avoid register allocation issues with loops
+    var_stack_offsets: HashMap<usize, i16>,
 }
 
 impl<'a> IrToEbpfCompiler<'a> {
@@ -300,20 +333,15 @@ impl<'a> IrToEbpfCompiler<'a> {
             stack_offset: -8, // Start at -8 from R10
             ctx_saved: false,
             pushed_args: Vec::new(),
-            literal_values: HashMap::new(),
-            literal_strings: HashMap::new(),
-            record_builders: HashMap::new(),
-            register_types: HashMap::new(),
-            stack_strings: HashMap::new(),
+            register_metadata: HashMap::new(),
             event_schema: None,
             pending_internal_jumps: Vec::new(),
             label_positions: HashMap::new(),
             next_label: 0,
             context_param_var_id,
-            context_registers: HashMap::new(),
-            literal_cell_paths: HashMap::new(),
             captured_values,
             probe_context,
+            var_stack_offsets: HashMap::new(),
         };
 
         // Save the context pointer (R1) to R9 at the start
@@ -544,14 +572,38 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.stack_offset -= amount;
     }
 
-    /// Set the type of a register
-    pub(crate) fn set_register_type(&mut self, reg: RegId, field_type: BpfFieldType) {
-        self.register_types.insert(reg.get(), field_type);
+    // ==================== Register Metadata Management ====================
+    //
+    // Centralized metadata management to prevent stale data bugs when registers
+    // are reused. All metadata is stored in a single HashMap and invalidated
+    // together when a register is written to.
+
+    /// Invalidate all metadata for a register
+    ///
+    /// Called when a register is about to be written to, to ensure no stale
+    /// metadata from previous uses affects compilation. This prevents bugs like
+    /// nested loops inheriting incorrect step values from outer loop registers.
+    pub(crate) fn invalidate_register(&mut self, reg: RegId) {
+        self.register_metadata.remove(&reg.get());
     }
 
-    /// Take the record builder for a register (removes it)
+    /// Get or create metadata for a register
+    fn get_or_create_metadata(&mut self, reg: RegId) -> &mut RegisterMetadata {
+        self.register_metadata
+            .entry(reg.get())
+            .or_insert_with(RegisterMetadata::default)
+    }
+
+    /// Set the type of a register
+    pub(crate) fn set_register_type(&mut self, reg: RegId, field_type: BpfFieldType) {
+        self.get_or_create_metadata(reg).field_type = Some(field_type);
+    }
+
+    /// Take the record builder for a register (removes it from metadata)
     pub(crate) fn take_record_builder(&mut self, reg: RegId) -> Option<RecordBuilder> {
-        self.record_builders.remove(&reg.get())
+        self.register_metadata
+            .get_mut(&reg.get())
+            .and_then(|m| m.record_builder.take())
     }
 
     /// Set the event schema
@@ -561,22 +613,24 @@ impl<'a> IrToEbpfCompiler<'a> {
 
     /// Set a literal value for a register
     pub(crate) fn set_literal_value(&mut self, reg: RegId, value: i64) {
-        self.literal_values.insert(reg.get(), value);
+        self.get_or_create_metadata(reg).literal_value = Some(value);
     }
 
     /// Set a literal string for a register
     pub(crate) fn set_literal_string(&mut self, reg: RegId, value: String) {
-        self.literal_strings.insert(reg.get(), value);
+        self.get_or_create_metadata(reg).literal_string = Some(value);
     }
 
     /// Set a literal cell path for a register
     pub(crate) fn set_literal_cell_path(&mut self, reg: RegId, path: CellPath) {
-        self.literal_cell_paths.insert(reg.get(), path);
+        self.get_or_create_metadata(reg).cell_path = Some(path);
     }
 
     /// Get a literal cell path for a register
     pub(crate) fn get_literal_cell_path(&self, reg: RegId) -> Option<&CellPath> {
-        self.literal_cell_paths.get(&reg.get())
+        self.register_metadata
+            .get(&reg.get())
+            .and_then(|m| m.cell_path.as_ref())
     }
 
     /// Get a captured variable value (from closure captures)
@@ -587,6 +641,53 @@ impl<'a> IrToEbpfCompiler<'a> {
         self.captured_values.get(&var_id.get()).copied()
     }
 
+    /// Get a literal value for a register (if set)
+    pub(crate) fn get_literal_value(&self, reg: RegId) -> Option<i64> {
+        self.register_metadata
+            .get(&reg.get())
+            .and_then(|m| m.literal_value)
+    }
+
+    /// Set a bounded iterator for a stream register
+    pub(crate) fn set_bounded_iterator(&mut self, reg: RegId, iter: BoundedIterator) {
+        self.get_or_create_metadata(reg).bounded_iterator = Some(iter);
+    }
+
+    /// Get a bounded iterator for a stream register
+    pub(crate) fn get_bounded_iterator(&self, reg: RegId) -> Option<BoundedIterator> {
+        self.register_metadata
+            .get(&reg.get())
+            .and_then(|m| m.bounded_iterator)
+    }
+
+    /// Set the loop header position for a stream register
+    pub(crate) fn set_loop_header(&mut self, reg: RegId, ebpf_idx: usize) {
+        self.get_or_create_metadata(reg).loop_header = Some(ebpf_idx);
+    }
+
+    /// Get the loop header position for a stream register
+    pub(crate) fn get_loop_header(&self, reg: RegId) -> Option<usize> {
+        self.register_metadata
+            .get(&reg.get())
+            .and_then(|m| m.loop_header)
+    }
+
+    /// Get or allocate a stack slot for a user variable
+    /// Variables are stored on stack to ensure they persist across loop iterations
+    pub(crate) fn get_or_alloc_var_stack(&mut self, var_id: VarId) -> Result<i16, CompileError> {
+        if let Some(&offset) = self.var_stack_offsets.get(&var_id.get()) {
+            return Ok(offset);
+        }
+        let offset = self.alloc_stack(8)?;
+        self.var_stack_offsets.insert(var_id.get(), offset);
+        Ok(offset)
+    }
+
+    /// Get the stack offset for a user variable (if already allocated)
+    pub(crate) fn get_var_stack(&self, var_id: VarId) -> Option<i16> {
+        self.var_stack_offsets.get(&var_id.get()).copied()
+    }
+
     /// Check if a VarId is the context parameter
     pub(crate) fn is_context_param(&self, var_id: VarId) -> bool {
         self.context_param_var_id == Some(var_id)
@@ -594,18 +695,14 @@ impl<'a> IrToEbpfCompiler<'a> {
 
     /// Mark a register as containing the context variable
     pub(crate) fn set_context_register(&mut self, reg: RegId, is_context: bool) {
-        if is_context {
-            self.context_registers.insert(reg.get(), true);
-        } else {
-            self.context_registers.remove(&reg.get());
-        }
+        self.get_or_create_metadata(reg).is_context = is_context;
     }
 
     /// Check if a register contains the context variable
     pub(crate) fn is_context_register(&self, reg: RegId) -> bool {
-        self.context_registers
+        self.register_metadata
             .get(&reg.get())
-            .copied()
+            .map(|m| m.is_context)
             .unwrap_or(false)
     }
 
@@ -616,17 +713,33 @@ impl<'a> IrToEbpfCompiler<'a> {
 
     /// Set a record builder for a register
     pub(crate) fn set_record_builder(&mut self, reg: RegId, builder: RecordBuilder) {
-        self.record_builders.insert(reg.get(), builder);
+        self.get_or_create_metadata(reg).record_builder = Some(builder);
     }
 
     /// Track a stack-based string for a register
     pub(crate) fn set_stack_string(&mut self, reg: RegId, stack_str: StackString) {
-        self.stack_strings.insert(reg.get(), stack_str);
+        self.get_or_create_metadata(reg).stack_string = Some(stack_str);
     }
 
     /// Get the stack string info for a register (if it's a stack-based string)
     pub(crate) fn get_stack_string(&self, reg: RegId) -> Option<StackString> {
-        self.stack_strings.get(&reg.get()).copied()
+        self.register_metadata
+            .get(&reg.get())
+            .and_then(|m| m.stack_string)
+    }
+
+    /// Get the literal string for a register (if set)
+    pub(crate) fn get_literal_string(&self, reg: RegId) -> Option<&String> {
+        self.register_metadata
+            .get(&reg.get())
+            .and_then(|m| m.literal_string.as_ref())
+    }
+
+    /// Get the field type for a register (if set)
+    pub(crate) fn get_register_type(&self, reg: RegId) -> Option<BpfFieldType> {
+        self.register_metadata
+            .get(&reg.get())
+            .and_then(|m| m.field_type)
     }
 
     /// Store a string literal on the stack and return the StackString info
@@ -831,6 +944,13 @@ impl<'a> IrToEbpfCompiler<'a> {
                 index,
             } => self.compile_match(pattern, *src, *index as usize),
 
+            // Iteration (bounded loops)
+            Instruction::Iterate {
+                dst,
+                stream,
+                end_index,
+            } => self.compile_iterate(*dst, *stream, *end_index as usize),
+
             // Command calls (dispatches to helper traits)
             Instruction::Call { decl_id, src_dst } => self.compile_call(*decl_id, *src_dst),
 
@@ -865,41 +985,37 @@ impl<'a> IrToEbpfCompiler<'a> {
 
     /// Compile conditional branch (branch if cond is truthy)
     ///
-    /// For filter-style `if` expressions (if without else), when the condition
-    /// is false we exit the eBPF program early with 0. This implements
-    /// kernel-side filtering.
+    /// This implements proper conditional jumps for if/else expressions.
+    /// The semantics are: if cond is truthy (non-zero), jump to target_ir_idx.
     ///
     /// Note: Nushell's IR uses `not` before `branch-if`, so:
-    /// - cond == 0 means the ORIGINAL condition was TRUE (execute true block)
-    /// - cond != 0 means the ORIGINAL condition was FALSE (would jump to else/skip)
+    /// - cond == 0 means the ORIGINAL condition was TRUE (continue to if-body)
+    /// - cond != 0 means the ORIGINAL condition was FALSE (jump to else/end)
     fn compile_branch_if(&mut self, cond: RegId, target_ir_idx: usize) -> Result<(), CompileError> {
         let ebpf_cond = self.ensure_reg(cond)?;
 
         // Nushell's `if` IR pattern is:
         //   compare -> not -> branch-if
         // So branch-if's cond is the INVERTED comparison result:
-        // - cond == 0: original condition TRUE, execute the if-body
-        // - cond != 0: original condition FALSE, skip to else/end
+        // - cond == 0: original condition TRUE, don't jump (execute if-body)
+        // - cond != 0: original condition FALSE, jump to target (else/end)
         //
-        // For filtering, when original condition is FALSE, we exit early.
-        // So we exit when cond != 0.
+        // We emit: JNE cond, 0, target (jump if cond != 0)
 
-        // Jump over the early exit if cond == 0 (original condition TRUE)
+        let jump_idx = self.builder.len();
         self.builder.push(EbpfInsn::new(
-            opcode::BPF_JMP | opcode::BPF_JEQ | opcode::BPF_K, // JEQ instead of JNE
+            opcode::BPF_JMP | opcode::BPF_JNE | opcode::BPF_K,
             ebpf_cond.as_u8(),
             0,
-            2, // Skip 2 instructions (mov + exit)
+            0, // Placeholder offset - will be fixed up
             0, // Compare against 0
         ));
 
-        // Early exit when cond != 0 (original condition FALSE, filter didn't match)
-        self.builder.push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
-        self.builder.push(EbpfInsn::exit());
-
-        // No pending jump needed - we've hardcoded the offset and handled the false path
-        // The true block follows immediately after the early exit
-        let _ = target_ir_idx; // Silence unused warning
+        // Record this jump for fixup
+        self.pending_jumps.push(PendingJump {
+            ebpf_insn_idx: jump_idx,
+            target_ir_idx,
+        });
 
         Ok(())
     }
@@ -982,6 +1098,144 @@ impl<'a> IrToEbpfCompiler<'a> {
         }
     }
 
+    /// Compile Iterate instruction for bounded loops
+    ///
+    /// Implements eBPF bounded loops for ranges with compile-time known bounds.
+    /// eBPF verifier requires bounded loops (kernel 5.3+), so we generate:
+    ///
+    /// ```text
+    /// loop_header:
+    ///   load current from stack
+    ///   if current >= end (or > for inclusive): jump to end_index
+    ///   store current to dst register
+    ///   increment current on stack
+    ///   ... loop body (following instructions) ...
+    ///   jump back to loop_header (via Nushell's Jump instruction)
+    /// end:
+    /// ```
+    fn compile_iterate(
+        &mut self,
+        dst: RegId,
+        stream: RegId,
+        end_index: usize,
+    ) -> Result<(), CompileError> {
+        // Get the bounded iterator info (set by compile_load_literal for Range)
+        let iter = self.get_bounded_iterator(stream).ok_or_else(|| {
+            CompileError::UnsupportedInstruction(
+                "Iterate requires a compile-time known range (e.g., 1..10). \
+                 Dynamic iterators are not supported in eBPF."
+                    .into(),
+            )
+        })?;
+
+        // Check if this is the first time we're executing this Iterate instruction
+        // (vs a subsequent iteration via jump back)
+        if self.get_loop_header(stream).is_none() {
+            // First iteration - record the loop header position
+            self.set_loop_header(stream, self.builder.len());
+        }
+
+        // Allocate destination register for the loop variable
+        let ebpf_dst = self.alloc_reg(dst)?;
+
+        // Load current value from stack
+        self.builder
+            .push(EbpfInsn::ldxdw(ebpf_dst, EbpfReg::R10, iter.current_offset));
+
+        // Compare against end value and jump to end_index if done
+        // For step > 0: current >= end (exclusive) or current > end (inclusive)
+        // For step < 0: current <= end (exclusive) or current < end (inclusive)
+        let end_val = iter.end_value;
+
+        // Load end value into R0 for comparison
+        if end_val >= i32::MIN as i64 && end_val <= i32::MAX as i64 {
+            self.builder
+                .push(EbpfInsn::mov64_imm(EbpfReg::R0, end_val as i32));
+        } else {
+            self.emit_load_64bit_imm(EbpfReg::R0, end_val);
+        }
+
+        // Emit jump to end_index if loop is complete
+        // The jump offset will be fixed up later
+        let jump_idx = self.builder.len();
+        if iter.step > 0 {
+            if iter.inclusive {
+                // For 1..=10: continue while current <= end, so jump when current > end
+                // JGT: jump if dst > R0
+                self.builder.push(EbpfInsn::new(
+                    opcode::BPF_JMP | opcode::BPF_JSGT | opcode::BPF_X,
+                    ebpf_dst.as_u8(),
+                    EbpfReg::R0.as_u8(),
+                    0, // Placeholder offset
+                    0,
+                ));
+            } else {
+                // For 1..10: continue while current < end, so jump when current >= end
+                // JSGE: jump if dst >= R0 (signed)
+                self.builder.push(EbpfInsn::new(
+                    opcode::BPF_JMP | opcode::BPF_JSGE | opcode::BPF_X,
+                    ebpf_dst.as_u8(),
+                    EbpfReg::R0.as_u8(),
+                    0, // Placeholder offset
+                    0,
+                ));
+            }
+        } else {
+            // Negative step (counting down)
+            if iter.inclusive {
+                // For 10..=1 step -1: continue while current >= end, so jump when current < end
+                self.builder.push(EbpfInsn::new(
+                    opcode::BPF_JMP | opcode::BPF_JSLT | opcode::BPF_X,
+                    ebpf_dst.as_u8(),
+                    EbpfReg::R0.as_u8(),
+                    0, // Placeholder offset
+                    0,
+                ));
+            } else {
+                // For 10..1 step -1: continue while current > end, so jump when current <= end
+                self.builder.push(EbpfInsn::new(
+                    opcode::BPF_JMP | opcode::BPF_JSLE | opcode::BPF_X,
+                    ebpf_dst.as_u8(),
+                    EbpfReg::R0.as_u8(),
+                    0, // Placeholder offset
+                    0,
+                ));
+            }
+        }
+
+        // Record this jump for fixup
+        self.pending_jumps.push(PendingJump {
+            ebpf_insn_idx: jump_idx,
+            target_ir_idx: end_index,
+        });
+
+        // Increment current value on stack for next iteration
+        // current += step
+        let step = iter.step;
+        if step >= i32::MIN as i64 && step <= i32::MAX as i64 {
+            self.builder
+                .push(EbpfInsn::add64_imm(ebpf_dst, step as i32));
+        } else {
+            // 64-bit step (rare)
+            self.emit_load_64bit_imm(EbpfReg::R0, step);
+            self.builder.push(EbpfInsn::add64_reg(ebpf_dst, EbpfReg::R0));
+        }
+        self.builder
+            .push(EbpfInsn::stxdw(EbpfReg::R10, iter.current_offset, ebpf_dst));
+
+        // Restore current value for loop body (undo the increment)
+        // The loop variable should hold the current value, not the next
+        if step >= i32::MIN as i64 && step <= i32::MAX as i64 {
+            self.builder
+                .push(EbpfInsn::add64_imm(ebpf_dst, -(step as i32)));
+        } else {
+            self.emit_load_64bit_imm(EbpfReg::R0, -step);
+            self.builder.push(EbpfInsn::add64_reg(ebpf_dst, EbpfReg::R0));
+        }
+
+        Ok(())
+    }
+
     /// Compile a command call - maps known commands to BPF helpers
     ///
     /// This dispatches to the appropriate helper trait method based on command name.
@@ -1025,8 +1279,7 @@ impl<'a> IrToEbpfCompiler<'a> {
     ) -> Result<(), CompileError> {
         // Get the field name from the key register's literal string
         let field_name = self
-            .literal_strings
-            .get(&key.get())
+            .get_literal_string(key)
             .cloned()
             .ok_or_else(|| {
                 CompileError::UnsupportedInstruction(
@@ -1036,9 +1289,7 @@ impl<'a> IrToEbpfCompiler<'a> {
 
         // Determine the field type from the value register
         let field_type = self
-            .register_types
-            .get(&val.get())
-            .copied()
+            .get_register_type(val)
             .unwrap_or(BpfFieldType::Int);
         let field_size = field_type.size() as i16;
 
@@ -1059,7 +1310,7 @@ impl<'a> IrToEbpfCompiler<'a> {
             }
             BpfFieldType::Comm => {
                 // Comm is a stack-based string - copy 16 bytes from source to destination
-                if let Some(stack_str) = self.stack_strings.get(&val.get()) {
+                if let Some(stack_str) = self.get_stack_string(val) {
                     let src_offset = stack_str.offset;
                     // Copy first 8 bytes
                     self.builder
@@ -1106,13 +1357,15 @@ impl<'a> IrToEbpfCompiler<'a> {
         }
 
         // Get or create the record builder for the destination register
-        let record = self
-            .record_builders
-            .entry(src_dst.get())
-            .or_insert_with(|| RecordBuilder {
+        // We need to work with the metadata through the accessor pattern
+        let metadata = self.get_or_create_metadata(src_dst);
+        if metadata.record_builder.is_none() {
+            metadata.record_builder = Some(RecordBuilder {
                 fields: Vec::new(),
                 base_offset: field_stack_offset, // First field determines base
             });
+        }
+        let record = metadata.record_builder.as_mut().unwrap();
 
         // Update base_offset if this is the first field
         if record.fields.is_empty() {
@@ -1378,8 +1631,8 @@ impl<'a> IrToEbpfCompiler<'a> {
                     .push(EbpfInsn::add64_imm(ebpf_dst, stack_offset as i32));
 
                 // Track that this register points to a stack string
-                self.stack_strings.insert(
-                    src_dst.get(),
+                self.set_stack_string(
+                    src_dst,
                     StackString {
                         offset: stack_offset,
                         size: 16,
@@ -1571,6 +1824,162 @@ mod tests {
             ],
             data,
         );
+
+        let bytecode = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
+        assert!(!bytecode.is_empty());
+    }
+
+    #[test]
+    fn test_compile_bounded_loop_basic() {
+        use nu_protocol::ast::RangeInclusion;
+
+        // Test basic for loop: for i in 1..5 { ... }
+        // This compiles to:
+        // 0: load-literal %1 = 1 (start)
+        // 1: load-literal %2 = 1 (step)
+        // 2: load-literal %3 = 5 (end)
+        // 3: load-literal %4 = Range(start=%1, step=%2, end=%3)
+        // 4: iterate %0, %4, end_index=7
+        // 5: ... loop body ...
+        // 6: jump 4
+        // 7: return
+        let ir = make_ir_block(vec![
+            // Load start
+            Instruction::LoadLiteral {
+                dst: RegId::new(1),
+                lit: Literal::Int(1),
+            },
+            // Load step
+            Instruction::LoadLiteral {
+                dst: RegId::new(2),
+                lit: Literal::Int(1),
+            },
+            // Load end
+            Instruction::LoadLiteral {
+                dst: RegId::new(3),
+                lit: Literal::Int(5),
+            },
+            // Load range
+            Instruction::LoadLiteral {
+                dst: RegId::new(4),
+                lit: Literal::Range {
+                    start: RegId::new(1),
+                    step: RegId::new(2),
+                    end: RegId::new(3),
+                    inclusion: RangeInclusion::RightExclusive,
+                },
+            },
+            // Iterate
+            Instruction::Iterate {
+                dst: RegId::new(0),
+                stream: RegId::new(4),
+                end_index: 7,
+            },
+            // Loop body - just add to accumulator (simplified)
+            Instruction::LoadLiteral {
+                dst: RegId::new(5),
+                lit: Literal::Int(0),
+            },
+            // Jump back to iterate
+            Instruction::Jump { index: 4 },
+            // Return
+            Instruction::LoadLiteral {
+                dst: RegId::new(0),
+                lit: Literal::Int(0),
+            },
+            Instruction::Return { src: RegId::new(0) },
+        ]);
+
+        let bytecode = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
+        // Should generate bounded loop bytecode
+        assert!(!bytecode.is_empty());
+        // Loop generates multiple instructions: load, compare, jump, increment, store, etc.
+        assert!(bytecode.len() > 80, "Expected loop bytecode to be substantial");
+    }
+
+    #[test]
+    fn test_compile_bounded_loop_inclusive() {
+        use nu_protocol::ast::RangeInclusion;
+
+        // Test inclusive range: for i in 1..=3 { ... }
+        let ir = make_ir_block(vec![
+            Instruction::LoadLiteral {
+                dst: RegId::new(1),
+                lit: Literal::Int(1),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(2),
+                lit: Literal::Int(1),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(3),
+                lit: Literal::Int(3),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(4),
+                lit: Literal::Range {
+                    start: RegId::new(1),
+                    step: RegId::new(2),
+                    end: RegId::new(3),
+                    inclusion: RangeInclusion::Inclusive,
+                },
+            },
+            Instruction::Iterate {
+                dst: RegId::new(0),
+                stream: RegId::new(4),
+                end_index: 6,
+            },
+            Instruction::Jump { index: 4 },
+            Instruction::LoadLiteral {
+                dst: RegId::new(0),
+                lit: Literal::Int(0),
+            },
+            Instruction::Return { src: RegId::new(0) },
+        ]);
+
+        let bytecode = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
+        assert!(!bytecode.is_empty());
+    }
+
+    #[test]
+    fn test_compile_bounded_loop_negative_step() {
+        use nu_protocol::ast::RangeInclusion;
+
+        // Test counting down: for i in 5..1 step -1
+        let ir = make_ir_block(vec![
+            Instruction::LoadLiteral {
+                dst: RegId::new(1),
+                lit: Literal::Int(5),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(2),
+                lit: Literal::Int(-1),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(3),
+                lit: Literal::Int(1),
+            },
+            Instruction::LoadLiteral {
+                dst: RegId::new(4),
+                lit: Literal::Range {
+                    start: RegId::new(1),
+                    step: RegId::new(2),
+                    end: RegId::new(3),
+                    inclusion: RangeInclusion::RightExclusive,
+                },
+            },
+            Instruction::Iterate {
+                dst: RegId::new(0),
+                stream: RegId::new(4),
+                end_index: 6,
+            },
+            Instruction::Jump { index: 4 },
+            Instruction::LoadLiteral {
+                dst: RegId::new(0),
+                lit: Literal::Int(0),
+            },
+            Instruction::Return { src: RegId::new(0) },
+        ]);
 
         let bytecode = IrToEbpfCompiler::compile_no_calls(&ir).unwrap();
         assert!(!bytecode.is_empty());

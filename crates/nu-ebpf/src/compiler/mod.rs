@@ -26,6 +26,7 @@ mod ir_to_ebpf;
 pub mod ir_to_mir;
 pub mod mir;
 pub mod mir_to_ebpf;
+pub mod passes;
 mod register_alloc;
 pub mod regalloc;
 

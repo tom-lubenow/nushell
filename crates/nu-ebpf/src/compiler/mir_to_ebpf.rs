@@ -37,6 +37,10 @@ pub const COUNTER_MAP_NAME: &str = "counters";
 pub const HISTOGRAM_MAP_NAME: &str = "histogram";
 /// Timestamp map name (for timing)
 pub const TIMESTAMP_MAP_NAME: &str = "timestamps";
+/// Kernel stack trace map name
+pub const KSTACK_MAP_NAME: &str = "kstacks";
+/// User stack trace map name
+pub const USTACK_MAP_NAME: &str = "ustacks";
 
 /// Result of MIR to eBPF compilation
 pub struct MirCompileResult {
@@ -80,6 +84,10 @@ pub struct MirToEbpfCompiler<'a> {
     needs_histogram_map: bool,
     /// Needs timestamp map
     needs_timestamp_map: bool,
+    /// Needs kernel stack trace map
+    needs_kstack_map: bool,
+    /// Needs user stack trace map
+    needs_ustack_map: bool,
     /// Event schema for structured output
     event_schema: Option<EventSchema>,
     /// Available physical registers for allocation
@@ -106,6 +114,8 @@ impl<'a> MirToEbpfCompiler<'a> {
             needs_counter_map: false,
             needs_histogram_map: false,
             needs_timestamp_map: false,
+            needs_kstack_map: false,
+            needs_ustack_map: false,
             event_schema: None,
             // R6-R8 are callee-saved and available for our use
             available_regs: vec![EbpfReg::R6, EbpfReg::R7, EbpfReg::R8],
@@ -155,6 +165,18 @@ impl<'a> MirToEbpfCompiler<'a> {
             maps.push(EbpfMap {
                 name: TIMESTAMP_MAP_NAME.to_string(),
                 def: BpfMapDef::counter_hash(), // key=tid, value=timestamp
+            });
+        }
+        if self.needs_kstack_map {
+            maps.push(EbpfMap {
+                name: KSTACK_MAP_NAME.to_string(),
+                def: BpfMapDef::stack_trace_map(),
+            });
+        }
+        if self.needs_ustack_map {
+            maps.push(EbpfMap {
+                name: USTACK_MAP_NAME.to_string(),
+                def: BpfMapDef::stack_trace_map(),
             });
         }
 
@@ -725,10 +747,13 @@ impl<'a> MirToEbpfCompiler<'a> {
                 self.instructions
                     .push(EbpfInsn::ldxdw(dst, EbpfReg::R9, offset));
             }
-            CtxField::KStack | CtxField::UStack => {
-                return Err(CompileError::UnsupportedInstruction(
-                    "Stack trace not yet implemented in MIR compiler".into(),
-                ));
+            CtxField::KStack => {
+                self.needs_kstack_map = true;
+                self.compile_get_stackid(dst, KSTACK_MAP_NAME, false)?;
+            }
+            CtxField::UStack => {
+                self.needs_ustack_map = true;
+                self.compile_get_stackid(dst, USTACK_MAP_NAME, true)?;
             }
             CtxField::TracepointField(name) => {
                 return Err(CompileError::UnsupportedInstruction(format!(
@@ -737,6 +762,43 @@ impl<'a> MirToEbpfCompiler<'a> {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Compile bpf_get_stackid() call to get kernel or user stack trace ID
+    fn compile_get_stackid(
+        &mut self,
+        dst: EbpfReg,
+        map_name: &str,
+        user_stack: bool,
+    ) -> Result<(), CompileError> {
+        // BPF_F_USER_STACK = 256, use 0 for kernel stack
+        let flags: i32 = if user_stack { 256 } else { 0 };
+
+        // R1 = ctx (restore from R9 where we saved it at program start)
+        self.instructions
+            .push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R9));
+
+        // R2 = map fd (will be relocated by loader)
+        let reloc_offset = self.instructions.len() * 8;
+        let [insn1, insn2] = EbpfInsn::ld_map_fd(EbpfReg::R2);
+        self.instructions.push(insn1);
+        self.instructions.push(insn2);
+        self.relocations.push(MapRelocation {
+            insn_offset: reloc_offset,
+            map_name: map_name.to_string(),
+        });
+
+        // R3 = flags
+        self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R3, flags));
+
+        // Call bpf_get_stackid
+        self.instructions.push(EbpfInsn::call(BpfHelper::GetStackId));
+
+        // Result (stack ID or negative error) is in R0, move to destination
+        self.instructions
+            .push(EbpfInsn::mov64_reg(dst, EbpfReg::R0));
+
         Ok(())
     }
 

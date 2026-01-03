@@ -125,6 +125,8 @@ pub struct IrToMirLowering<'a> {
     pub needs_timestamp_map: bool,
     /// Active loop contexts (for emitting LoopBack instead of Jump)
     loop_contexts: Vec<LoopContext>,
+    /// Mapping from IR instruction index to MIR block (for forward jumps)
+    ir_index_to_block: HashMap<usize, BlockId>,
 }
 
 impl<'a> IrToMirLowering<'a> {
@@ -157,6 +159,18 @@ impl<'a> IrToMirLowering<'a> {
             needs_histogram_map: false,
             needs_timestamp_map: false,
             loop_contexts: Vec::new(),
+            ir_index_to_block: HashMap::new(),
+        }
+    }
+
+    /// Get or create a block for an IR instruction index
+    fn get_or_create_block_for_ir(&mut self, ir_idx: usize) -> BlockId {
+        if let Some(&block) = self.ir_index_to_block.get(&ir_idx) {
+            block
+        } else {
+            let block = self.func.alloc_block();
+            self.ir_index_to_block.insert(ir_idx, block);
+            block
         }
     }
 
@@ -226,6 +240,24 @@ impl<'a> IrToMirLowering<'a> {
         instruction: &Instruction,
         ir_idx: usize,
     ) -> Result<(), CompileError> {
+        // Check if this IR index is a jump target with a pre-allocated block
+        if let Some(&target_block) = self.ir_index_to_block.get(&ir_idx) {
+            // If we have a current block without a terminator, add a jump to this block
+            if !matches!(
+                self.func.block(self.current_block).terminator,
+                MirInst::Jump { .. }
+                    | MirInst::Branch { .. }
+                    | MirInst::Return { .. }
+                    | MirInst::LoopHeader { .. }
+                    | MirInst::LoopBack { .. }
+                    | MirInst::TailCall { .. }
+            ) {
+                self.terminate(MirInst::Jump { target: target_block });
+            }
+            // Switch to the target block
+            self.current_block = target_block;
+        }
+
         match instruction {
             // === Data Movement ===
             Instruction::LoadLiteral { dst, lit } => {
@@ -300,8 +332,8 @@ impl<'a> IrToMirLowering<'a> {
                         return Ok(());
                     }
                 }
-                // Regular jump (not loop-related)
-                let target = BlockId(*index as u32);
+                // Regular jump - get or create target block
+                let target = self.get_or_create_block_for_ir(*index);
                 self.terminate(MirInst::Jump { target });
             }
 
@@ -641,8 +673,9 @@ impl<'a> IrToMirLowering<'a> {
     fn lower_branch_if(&mut self, cond: RegId, then_branch: usize) -> Result<(), CompileError> {
         let cond_vreg = self.get_vreg(cond);
 
-        // Create blocks for true and false branches
-        let true_block = BlockId(then_branch as u32);
+        // Get or create block for the true branch (jump target)
+        let true_block = self.get_or_create_block_for_ir(then_branch);
+        // Create a new block for the false (fall-through) branch
         let false_block = self.func.alloc_block();
 
         self.terminate(MirInst::Branch {
@@ -665,7 +698,7 @@ impl<'a> IrToMirLowering<'a> {
         index: usize,
     ) -> Result<(), CompileError> {
         let src_vreg = self.get_vreg(src);
-        let target_block = BlockId(index as u32);
+        let target_block = self.get_or_create_block_for_ir(index);
         let continue_block = self.func.alloc_block();
 
         match pattern {

@@ -506,6 +506,48 @@ impl<'a> MirToEbpfCompiler<'a> {
                 self.compile_stop_timer(dst_reg)?;
             }
 
+            MirInst::LoopHeader { counter, limit, body, exit } => {
+                // Bounded loop header for eBPF verifier compliance
+                // counter < limit ? jump to body : jump to exit
+                let counter_reg = self.ensure_reg(*counter)?;
+
+                // Compare counter against limit
+                // JSLT: jump if counter < limit (signed)
+                let jlt_idx = self.instructions.len();
+                self.instructions.push(EbpfInsn::new(
+                    opcode::BPF_JMP | opcode::BPF_JSLT | opcode::BPF_K,
+                    counter_reg.as_u8(),
+                    0,
+                    0, // Placeholder - will be fixed up
+                    *limit as i32,
+                ));
+                self.pending_jumps.push((jlt_idx, *body));
+
+                // Fall through to exit
+                let jmp_idx = self.instructions.len();
+                self.instructions.push(EbpfInsn::jump(0));
+                self.pending_jumps.push((jmp_idx, *exit));
+            }
+
+            MirInst::LoopBack { counter, step, header } => {
+                // Increment counter and jump back to header
+                let counter_reg = self.ensure_reg(*counter)?;
+
+                // Add step to counter
+                self.instructions.push(EbpfInsn::add64_imm(counter_reg, *step as i32));
+
+                // Jump back to loop header
+                let jmp_idx = self.instructions.len();
+                self.instructions.push(EbpfInsn::jump(0));
+                self.pending_jumps.push((jmp_idx, *header));
+            }
+
+            MirInst::TailCall { prog_map: _, index: _ } => {
+                return Err(CompileError::UnsupportedInstruction(
+                    "Tail calls not yet implemented in MIR compiler".into(),
+                ));
+            }
+
             // Not yet implemented
             _ => {
                 return Err(CompileError::UnsupportedInstruction(format!(

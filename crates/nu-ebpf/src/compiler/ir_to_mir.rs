@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use nu_protocol::ast::{CellPath, PathMember, Pattern};
+use nu_protocol::ast::{CellPath, PathMember, Pattern, RangeInclusion};
 use nu_protocol::engine::EngineState;
 use nu_protocol::ir::{Instruction, IrBlock};
 use nu_protocol::{DeclId, RegId, Value, VarId};
@@ -40,6 +40,19 @@ struct RecordField {
     ty: MirType,
 }
 
+/// Bounded iterator info for ranges
+#[derive(Debug, Clone, Copy)]
+struct BoundedRange {
+    /// Start value
+    start: i64,
+    /// Step value
+    step: i64,
+    /// End value
+    end: i64,
+    /// Whether end is inclusive
+    inclusive: bool,
+}
+
 /// Metadata tracked for each Nushell register during lowering
 #[derive(Debug, Clone, Default)]
 struct RegMetadata {
@@ -57,6 +70,8 @@ struct RegMetadata {
     record_fields: Vec<RecordField>,
     /// Type of value in this register (for context fields)
     field_type: Option<MirType>,
+    /// Bounded range for iteration
+    bounded_range: Option<BoundedRange>,
 }
 
 /// Lowering context for IR to MIR conversion
@@ -321,6 +336,63 @@ impl<'a> IrToMirLowering<'a> {
                 let _ = mode;
             }
 
+            // === Bounded Loops ===
+            Instruction::Iterate {
+                dst,
+                stream,
+                end_index,
+            } => {
+                // Get the range info from the stream register
+                let range = self.get_metadata(*stream)
+                    .and_then(|m| m.bounded_range)
+                    .ok_or_else(|| {
+                        CompileError::UnsupportedInstruction(
+                            "Iterate requires a compile-time known range (e.g., 1..10)".into(),
+                        )
+                    })?;
+
+                let dst_vreg = self.get_vreg(*dst);
+                let counter_vreg = self.get_vreg(*stream); // Use stream reg as counter
+
+                // Calculate the limit for the loop
+                let limit = if range.inclusive {
+                    range.end + range.step.signum() // Include end value
+                } else {
+                    range.end
+                };
+
+                // Create blocks: body block, exit block
+                let body_block = self.func.alloc_block();
+                let exit_block = self.func.alloc_block();
+
+                // The loop header emits the check and conditional branch
+                self.emit(MirInst::LoopHeader {
+                    counter: counter_vreg,
+                    limit,
+                    body: body_block,
+                    exit: exit_block,
+                });
+
+                // Switch to body block
+                self.current_block = body_block;
+
+                // Copy counter to destination for use in loop body
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::VReg(counter_vreg),
+                });
+
+                // Store the exit block info for the Jump instruction (which ends the loop)
+                // The end_index points to instructions after the loop
+                // We'll need to patch jumps back to header from the Jump instruction
+                // For now, store info to connect the Jump back to loop header
+                let meta = self.get_or_create_metadata(*stream);
+                meta.literal_int = Some(range.step); // Store step for LoopBack
+
+                // Note: The actual LoopBack is emitted when we see the Jump back
+                // We track that this is a loop iteration context
+            }
+
             // === Unsupported ===
             _ => {
                 return Err(CompileError::UnsupportedInstruction(format!(
@@ -409,6 +481,59 @@ impl<'a> IrToMirLowering<'a> {
                 // Initialize empty record fields in metadata
                 let meta = self.get_or_create_metadata(dst);
                 meta.record_fields = Vec::new();
+            }
+
+            Literal::Range {
+                start,
+                step,
+                end,
+                inclusion,
+            } => {
+                // For eBPF bounded loops, we need compile-time known bounds
+                let start_val = self.get_metadata(*start)
+                    .and_then(|m| m.literal_int)
+                    .ok_or_else(|| {
+                        CompileError::UnsupportedInstruction(
+                            "Range start must be a compile-time known integer for eBPF loops".into(),
+                        )
+                    })?;
+
+                // Step can be nothing (default 1) or an explicit integer
+                let step_val = self.get_metadata(*step)
+                    .and_then(|m| m.literal_int)
+                    .unwrap_or(1);
+
+                let end_val = self.get_metadata(*end)
+                    .and_then(|m| m.literal_int)
+                    .ok_or_else(|| {
+                        CompileError::UnsupportedInstruction(
+                            "Range end must be a compile-time known integer for eBPF loops".into(),
+                        )
+                    })?;
+
+                // Validate step is non-zero
+                if step_val == 0 {
+                    return Err(CompileError::UnsupportedInstruction(
+                        "Range step cannot be zero".into(),
+                    ));
+                }
+
+                // Store range info in metadata for use by Iterate
+                let range = BoundedRange {
+                    start: start_val,
+                    step: step_val,
+                    end: end_val,
+                    inclusive: *inclusion == RangeInclusion::Inclusive,
+                };
+
+                // Set a placeholder value
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::Const(start_val), // Initial value
+                });
+
+                let meta = self.get_or_create_metadata(dst);
+                meta.bounded_range = Some(range);
             }
 
             _ => {

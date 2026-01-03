@@ -1327,8 +1327,8 @@ impl<'a> IrToEbpfCompiler<'a> {
         let field_size = field_type.size() as i16;
 
         // Get the eBPF register containing the value
-        // Use alloc_reg in case the value comes from a literal that wasn't separately allocated
-        let ebpf_val = self.alloc_reg(val)?;
+        // Use ensure_reg to read the existing value (not alloc_reg which is for writing)
+        let ebpf_val = self.ensure_reg(val)?;
 
         // Allocate stack space for this field and store immediately
         self.check_stack_space(field_size)?;

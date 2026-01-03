@@ -182,8 +182,9 @@ impl OutputHelpers for IrToEbpfCompiler<'_> {
 
     /// Compile bpf-emit for a structured record
     ///
-    /// The field values are already on the stack (stored during RecordInsert).
-    /// We just need to emit them to the ring buffer.
+    /// The field values are stored on the stack during RecordInsert, but they may
+    /// not be contiguous (due to register spills between inserts). We need to copy
+    /// them to a contiguous buffer before emitting.
     fn compile_bpf_emit_record(
         &mut self,
         src_dst: RegId,
@@ -198,15 +199,12 @@ impl OutputHelpers for IrToEbpfCompiler<'_> {
             return Ok(());
         }
 
-        // Build schema from fields
-        // Fields are stored in descending stack order (later fields have lower addresses)
-        // So when we emit the buffer starting from the lowest address, we get fields in reverse order
-        // We need to reverse the schema to match the actual memory layout
+        // Build schema from fields (in insertion order)
         let mut fields_schema = Vec::new();
         let mut offset = 0usize;
+        let mut total_size = 0usize;
 
-        // Iterate in reverse to match memory layout (lowest address = last field inserted)
-        for field in record.fields.iter().rev() {
+        for field in record.fields.iter() {
             let size = field.field_type.size();
             fields_schema.push(SchemaField {
                 name: field.name.clone(),
@@ -214,9 +212,8 @@ impl OutputHelpers for IrToEbpfCompiler<'_> {
                 offset,
             });
             offset += size;
+            total_size += size;
         }
-
-        let total_size = offset;
 
         // Store the schema for the loader
         self.set_event_schema(Some(EventSchema {
@@ -224,16 +221,36 @@ impl OutputHelpers for IrToEbpfCompiler<'_> {
             total_size,
         }));
 
-        // The first field's stack offset is the start of our data
-        // Fields are stored contiguously in reverse order on stack
-        // So we need to find the lowest stack offset (most recent allocation)
-        let record_start_offset = record
-            .fields
-            .last()
-            .map(|f| f.stack_offset)
-            .unwrap_or(record.base_offset);
+        // Allocate a contiguous buffer for the record
+        self.check_stack_space(total_size as i16)?;
+        let buffer_offset = self.current_stack_offset() - total_size as i16;
+        self.advance_stack_offset(total_size as i16);
 
-        // Emit the record to ring buffer
+        // Copy each field to the contiguous buffer in order
+        let mut dest_offset = buffer_offset;
+        for field in record.fields.iter() {
+            let field_size = field.field_type.size();
+
+            // Load field value from its original location
+            // For Int (8 bytes), use a single load/store
+            // For larger types (Comm=16, String=128), copy in 8-byte chunks
+            let chunks = field_size / 8;
+            for chunk in 0..chunks {
+                let src = field.stack_offset + (chunk * 8) as i16;
+                let dst = dest_offset + (chunk * 8) as i16;
+
+                // Load from source
+                self.builder()
+                    .push(EbpfInsn::ldxdw(EbpfReg::R0, EbpfReg::R10, src));
+                // Store to destination
+                self.builder()
+                    .push(EbpfInsn::stxdw(EbpfReg::R10, dst, EbpfReg::R0));
+            }
+
+            dest_offset += field_size as i16;
+        }
+
+        // Emit the contiguous buffer to ring buffer
         // bpf_ringbuf_output(map, data, size, flags)
 
         // R1 = map (will be relocated)
@@ -246,11 +263,11 @@ impl OutputHelpers for IrToEbpfCompiler<'_> {
             map_name: RINGBUF_MAP_NAME.to_string(),
         });
 
-        // R2 = pointer to record on stack (use the first field's offset as start)
+        // R2 = pointer to contiguous buffer
         self.builder()
             .push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
         self.builder()
-            .push(EbpfInsn::add64_imm(EbpfReg::R2, record_start_offset as i32));
+            .push(EbpfInsn::add64_imm(EbpfReg::R2, buffer_offset as i32));
 
         // R3 = total record size
         self.builder()

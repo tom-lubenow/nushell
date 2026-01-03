@@ -112,6 +112,23 @@ impl BpfMapDef {
         }
     }
 
+    /// Create a ring buffer map for efficient event output
+    ///
+    /// Ring buffers are more efficient than perf event arrays:
+    /// - Single shared buffer instead of per-CPU buffers
+    /// - Lower overhead for event submission
+    /// - Variable-length records supported naturally
+    pub fn ring_buffer(size_bytes: u32) -> Self {
+        Self {
+            map_type: BpfMapType::RingBuf as u32,
+            key_size: 0,        // Not used for ring buffers
+            value_size: 0,      // Not used for ring buffers
+            max_entries: size_bytes, // Buffer size in bytes (must be power of 2)
+            map_flags: 0,
+            pinning: BpfPinningType::None,
+        }
+    }
+
     /// Enable pinning for this map (allows sharing between programs)
     pub fn with_pinning(mut self) -> Self {
         self.pinning = BpfPinningType::ByName;

@@ -29,8 +29,8 @@ pub struct CompileResult {
     pub event_schema: Option<EventSchema>,
 }
 
-/// Name of the perf event array map for output
-pub(crate) const PERF_MAP_NAME: &str = "events";
+/// Name of the ring buffer map for output
+pub(crate) const RINGBUF_MAP_NAME: &str = "events";
 
 /// Name of the counter hash map for bpf-count
 pub(crate) const COUNTER_MAP_NAME: &str = "counters";
@@ -195,8 +195,8 @@ pub struct IrToEbpfCompiler<'a> {
     ir_to_ebpf: HashMap<usize, usize>,
     /// Pending jumps to fix up
     pending_jumps: Vec<PendingJump>,
-    /// Whether the program needs a perf event map for output
-    needs_perf_map: bool,
+    /// Whether the program needs a ring buffer map for output
+    needs_ringbuf: bool,
     /// Whether the program needs a counter hash map
     needs_counter_map: bool,
     /// Whether the program needs a timestamp hash map for latency tracking
@@ -335,7 +335,7 @@ impl<'a> IrToEbpfCompiler<'a> {
             reg_alloc: RegisterAllocator::new(),
             ir_to_ebpf: HashMap::new(),
             pending_jumps: Vec::new(),
-            needs_perf_map: false,
+            needs_ringbuf: false,
             needs_counter_map: false,
             needs_timestamp_map: false,
             needs_histogram_map: false,
@@ -396,10 +396,11 @@ impl<'a> IrToEbpfCompiler<'a> {
 
         // Build the result
         let mut maps = Vec::new();
-        if compiler.needs_perf_map {
+        if compiler.needs_ringbuf {
+            // 256KB ring buffer (must be power of 2)
             maps.push(EbpfMap {
-                name: PERF_MAP_NAME.to_string(),
-                def: BpfMapDef::perf_event_array(),
+                name: RINGBUF_MAP_NAME.to_string(),
+                def: BpfMapDef::ring_buffer(256 * 1024),
             });
         }
         if compiler.needs_counter_map {
@@ -542,9 +543,9 @@ impl<'a> IrToEbpfCompiler<'a> {
         &mut self.builder
     }
 
-    /// Set that the program needs a perf event map
-    pub(crate) fn set_needs_perf_map(&mut self, value: bool) {
-        self.needs_perf_map = value;
+    /// Set that the program needs a ring buffer map
+    pub(crate) fn set_needs_ringbuf(&mut self, value: bool) {
+        self.needs_ringbuf = value;
     }
 
     /// Set that the program needs a counter map

@@ -8,11 +8,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use aya::maps::{HashMap as AyaHashMap, PerfEventArray};
+use aya::maps::{HashMap as AyaHashMap, RingBuf};
 use aya::programs::{KProbe, RawTracePoint, TracePoint, UProbe};
-use aya::util::online_cpus;
 use aya::{Ebpf, EbpfLoader};
-use bytes::BytesMut;
 use thiserror::Error;
 
 use crate::compiler::{BpfFieldType, CompileError, EbpfProgram, EbpfProgramType, EventSchema};
@@ -146,12 +144,6 @@ fn parse_offset(s: &str) -> Result<u64, LoadError> {
     }
 }
 
-/// A perf buffer for one CPU
-pub struct CpuPerfBuffer {
-    cpu_id: u32,
-    buf: aya::maps::perf::PerfEventArrayBuffer<aya::maps::MapData>,
-}
-
 /// Information about an active probe
 pub struct ActiveProbe {
     /// Unique probe ID
@@ -162,8 +154,8 @@ pub struct ActiveProbe {
     pub attached_at: Instant,
     /// The loaded eBPF object (keeps program alive)
     ebpf: Ebpf,
-    /// Whether this probe has a perf event map for output
-    has_perf_map: bool,
+    /// Whether this probe has a ring buffer map for output
+    has_ringbuf: bool,
     /// Whether this probe has a counter hash map
     has_counter_map: bool,
     /// Whether this probe has a histogram hash map
@@ -172,8 +164,8 @@ pub struct ActiveProbe {
     has_kstack_map: bool,
     /// Whether this probe has a user stack trace map
     has_ustack_map: bool,
-    /// Perf buffers for each CPU (only if has_perf_map)
-    perf_buffers: Vec<CpuPerfBuffer>,
+    /// Ring buffer for event output (only if has_ringbuf)
+    ringbuf: Option<RingBuf<aya::maps::MapData>>,
     /// Optional schema for structured events
     event_schema: Option<EventSchema>,
     /// Pin group name (if maps are pinned for sharing)
@@ -186,7 +178,7 @@ impl std::fmt::Debug for ActiveProbe {
             .field("id", &self.id)
             .field("probe_spec", &self.probe_spec)
             .field("attached_at", &self.attached_at)
-            .field("has_perf_map", &self.has_perf_map)
+            .field("has_ringbuf", &self.has_ringbuf)
             .field("has_counter_map", &self.has_counter_map)
             .field("has_histogram_map", &self.has_histogram_map)
             .field("has_kstack_map", &self.has_kstack_map)
@@ -436,37 +428,25 @@ impl EbpfState {
         }
 
         // Check for maps
-        let has_perf_map = ebpf.map("events").is_some();
+        let has_ringbuf = ebpf.map("events").is_some();
         let has_counter_map = ebpf.map("counters").is_some();
         let has_histogram_map = ebpf.map("histogram").is_some();
         let has_kstack_map = ebpf.map("kstacks").is_some();
         let has_ustack_map = ebpf.map("ustacks").is_some();
-        let mut perf_buffers = Vec::new();
 
-        // Set up perf buffers if the program uses bpf-emit
-        if has_perf_map {
-            let perf_array = ebpf
+        // Set up ring buffer if the program uses bpf-emit
+        let ringbuf = if has_ringbuf {
+            let ring_map = ebpf
                 .take_map("events")
                 .ok_or_else(|| LoadError::MapNotFound("events".to_string()))?;
 
-            let mut perf_array = PerfEventArray::try_from(perf_array)
-                .map_err(|e| LoadError::PerfBuffer(format!("Failed to convert map: {e}")))?;
+            let ringbuf = RingBuf::try_from(ring_map)
+                .map_err(|e| LoadError::PerfBuffer(format!("Failed to convert ring buffer map: {e}")))?;
 
-            // Open a buffer for each CPU
-            let cpus = online_cpus()
-                .map_err(|e| LoadError::PerfBuffer(format!("Failed to get CPUs: {e:?}")))?;
-
-            for cpu_id in cpus {
-                let buf = perf_array
-                    .open(cpu_id, Some(64)) // 64 pages per buffer
-                    .map_err(|e| {
-                        LoadError::PerfBuffer(format!(
-                            "Failed to open buffer for CPU {cpu_id}: {e}"
-                        ))
-                    })?;
-                perf_buffers.push(CpuPerfBuffer { cpu_id, buf });
-            }
-        }
+            Some(ringbuf)
+        } else {
+            None
+        };
 
         // Store the active probe
         let id = self.next_probe_id();
@@ -484,12 +464,12 @@ impl EbpfState {
             probe_spec,
             attached_at: Instant::now(),
             ebpf,
-            has_perf_map,
+            has_ringbuf,
             has_counter_map,
             has_histogram_map,
             has_kstack_map,
             has_ustack_map,
-            perf_buffers,
+            ringbuf,
             event_schema: program.event_schema.clone(),
             pin_group: pin_group_owned,
         };
@@ -499,7 +479,7 @@ impl EbpfState {
         Ok(id)
     }
 
-    /// Poll for events from a probe's perf buffer
+    /// Poll for events from a probe's ring buffer
     ///
     /// Returns events emitted by the eBPF program via bpf-emit.
     /// The timeout specifies how long to wait for events.
@@ -507,38 +487,38 @@ impl EbpfState {
         let mut probes = self.probes.lock().unwrap();
         let probe = probes.get_mut(&id).ok_or(LoadError::ProbeNotFound(id))?;
 
-        if !probe.has_perf_map || probe.perf_buffers.is_empty() {
-            // No perf map, return empty
+        if !probe.has_ringbuf {
+            // No ring buffer, return empty
             return Ok(Vec::new());
         }
+
+        let ringbuf = match &mut probe.ringbuf {
+            Some(rb) => rb,
+            None => return Ok(Vec::new()),
+        };
 
         let mut events = Vec::new();
 
         // Clone the schema for use in parsing (to avoid borrow issues)
         let schema = probe.event_schema.clone();
 
-        // Read events from each pre-opened buffer
-        let mut out_bufs: [BytesMut; 16] = std::array::from_fn(|_| BytesMut::with_capacity(256));
+        // Read events from ring buffer (non-blocking)
+        // Ring buffer returns events one at a time via next()
+        while let Some(item) = ringbuf.next() {
+            let buf: &[u8] = &item;
+            let data = if let Some(ref event_schema) = schema {
+                // We have a schema - deserialize structured event
+                Self::deserialize_structured_event(buf, event_schema)
+            } else {
+                // No schema - use legacy size-based detection
+                Self::deserialize_simple_event(buf)
+            };
 
-        for cpu_buf in &mut probe.perf_buffers {
-            // Read available events (non-blocking)
-            if let Ok(evts) = cpu_buf.buf.read_events(&mut out_bufs) {
-                for out_buf in out_bufs.iter().take(evts.read) {
-                    let data = if let Some(ref event_schema) = schema {
-                        // We have a schema - deserialize structured event
-                        Self::deserialize_structured_event(out_buf, event_schema)
-                    } else {
-                        // No schema - use legacy size-based detection
-                        Self::deserialize_simple_event(out_buf)
-                    };
-
-                    if let Some(data) = data {
-                        events.push(BpfEvent {
-                            data,
-                            cpu: cpu_buf.cpu_id,
-                        });
-                    }
-                }
+            if let Some(data) = data {
+                events.push(BpfEvent {
+                    data,
+                    cpu: 0, // Ring buffer doesn't provide CPU info directly
+                });
             }
         }
 
@@ -547,11 +527,11 @@ impl EbpfState {
 
     /// Deserialize a simple (non-structured) event based on size
     fn deserialize_simple_event(buf: &[u8]) -> Option<BpfEventData> {
-        // Perf buffer may add padding, so we use size ranges
-        // - 8-15 bytes: integer from emit
+        // Ring buffer events have exact sizes (no padding like perf buffer)
+        // - 8 bytes: integer from emit
         // - 16+ bytes: string ($ctx.comm uses 16, read-str uses 128)
-        if buf.len() >= 8 && buf.len() < 16 {
-            // 8-15 bytes = integer from emit (may have padding)
+        if buf.len() == 8 {
+            // 8 bytes = integer from emit
             let value = i64::from_le_bytes(buf[0..8].try_into().unwrap());
             Some(BpfEventData::Int(value))
         } else if buf.len() >= 16 {

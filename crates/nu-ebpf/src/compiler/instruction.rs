@@ -70,6 +70,8 @@ pub enum BpfHelper {
     PerfEventOutput = 25,
     /// long bpf_get_stackid(ctx, map, flags)
     GetStackId = 27,
+    /// void *bpf_ringbuf_output(map, data, size, flags)
+    RingbufOutput = 130,
     /// long bpf_probe_read_user_str(dst, size, unsafe_ptr)
     ProbeReadUserStr = 114,
     /// long bpf_probe_read_kernel_str(dst, size, unsafe_ptr)

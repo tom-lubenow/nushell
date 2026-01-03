@@ -223,7 +223,7 @@ ebpf attach --dry-run 'kprobe:ksys_read' {|ctx| $ctx.pid | emit } | save probe.e
                                                           │
                                                           v
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  ebpf attach -s │ <-- │  Perf Buffer     │ <-- │  Kernel (aya)   │
+│  ebpf attach -s │ <-- │  Ring Buffer     │ <-- │  Kernel (aya)   │
 │  (userspace)    │     │  (events map)    │     │  (BPF verifier) │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
 ```

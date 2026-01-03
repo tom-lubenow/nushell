@@ -604,6 +604,8 @@ impl BasicBlock {
         match &self.terminator {
             MirInst::Jump { target } => vec![*target],
             MirInst::Branch { if_true, if_false, .. } => vec![*if_true, *if_false],
+            MirInst::LoopHeader { body, exit, .. } => vec![*body, *exit],
+            MirInst::LoopBack { header, .. } => vec![*header],
             MirInst::Return { .. } | MirInst::TailCall { .. } => vec![],
             _ => panic!("Invalid terminator: {:?}", self.terminator),
         }

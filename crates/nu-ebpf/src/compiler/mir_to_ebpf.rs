@@ -1736,4 +1736,117 @@ mod tests {
             "MIR branch compile produced empty bytecode"
         );
     }
+
+    /// Test histogram instruction compiles
+    #[test]
+    fn test_mir_histogram() {
+        use crate::compiler::mir::*;
+
+        let mut func = MirFunction::new();
+        let mut entry = BasicBlock::new(BlockId(0));
+
+        // Load a value and compute histogram bucket
+        entry.instructions.push(MirInst::Copy {
+            dst: VReg(0),
+            src: MirValue::Const(42),
+        });
+        entry.instructions.push(MirInst::Histogram { value: VReg(0) });
+        entry.terminator = MirInst::Return {
+            val: Some(MirValue::Const(0)),
+        };
+
+        func.blocks.push(entry);
+        func.vreg_count = 1;
+
+        let program = MirProgram {
+            main: func,
+            subfunctions: vec![],
+        };
+
+        let result = compile_mir_to_ebpf(&program, None).unwrap();
+        assert!(!result.bytecode.is_empty());
+        // Should have histogram map
+        assert!(result.maps.iter().any(|m| m.name == HISTOGRAM_MAP_NAME));
+    }
+
+    /// Test start/stop timer instructions compile
+    #[test]
+    fn test_mir_timer() {
+        use crate::compiler::mir::*;
+
+        let mut func = MirFunction::new();
+        let mut entry = BasicBlock::new(BlockId(0));
+
+        entry.instructions.push(MirInst::StartTimer);
+        entry.instructions.push(MirInst::StopTimer { dst: VReg(0) });
+        entry.terminator = MirInst::Return {
+            val: Some(MirValue::VReg(VReg(0))),
+        };
+
+        func.blocks.push(entry);
+        func.vreg_count = 1;
+
+        let program = MirProgram {
+            main: func,
+            subfunctions: vec![],
+        };
+
+        let result = compile_mir_to_ebpf(&program, None).unwrap();
+        assert!(!result.bytecode.is_empty());
+        // Should have timestamp map
+        assert!(result.maps.iter().any(|m| m.name == TIMESTAMP_MAP_NAME));
+    }
+
+    /// Test loop header and back compile
+    #[test]
+    fn test_mir_loop() {
+        use crate::compiler::mir::*;
+
+        let mut func = MirFunction::new();
+
+        // Entry: set counter to 0
+        let mut entry = BasicBlock::new(BlockId(0));
+        entry.instructions.push(MirInst::Copy {
+            dst: VReg(0),
+            src: MirValue::Const(0),
+        });
+        entry.terminator = MirInst::Jump { target: BlockId(1) };
+
+        // Header: check if counter < 10, go to body or exit
+        let mut header = BasicBlock::new(BlockId(1));
+        header.terminator = MirInst::LoopHeader {
+            counter: VReg(0),
+            limit: 10,
+            body: BlockId(2),
+            exit: BlockId(3),
+        };
+
+        // Body: increment and loop back
+        let mut body = BasicBlock::new(BlockId(2));
+        body.terminator = MirInst::LoopBack {
+            counter: VReg(0),
+            step: 1,
+            header: BlockId(1),
+        };
+
+        // Exit: return
+        let mut exit = BasicBlock::new(BlockId(3));
+        exit.terminator = MirInst::Return {
+            val: Some(MirValue::VReg(VReg(0))),
+        };
+
+        func.blocks.push(entry);
+        func.blocks.push(header);
+        func.blocks.push(body);
+        func.blocks.push(exit);
+        func.vreg_count = 1;
+
+        let program = MirProgram {
+            main: func,
+            subfunctions: vec![],
+        };
+
+        let result = compile_mir_to_ebpf(&program, None).unwrap();
+        assert!(!result.bytecode.is_empty(), "Loop compile produced empty bytecode");
+    }
 }

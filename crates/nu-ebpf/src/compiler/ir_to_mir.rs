@@ -53,6 +53,23 @@ struct BoundedRange {
     inclusive: bool,
 }
 
+/// Loop context for tracking active loops
+#[derive(Debug, Clone)]
+struct LoopContext {
+    /// Block ID of the loop header
+    header_block: BlockId,
+    /// Block ID of the exit block
+    exit_block: BlockId,
+    /// Counter register
+    counter_vreg: VReg,
+    /// Step value for increment
+    step: i64,
+    /// IR index of the Iterate instruction (for matching Jump back)
+    iterate_ir_index: usize,
+    /// IR index where loop ends (for matching exit jumps)
+    end_ir_index: usize,
+}
+
 /// Metadata tracked for each Nushell register during lowering
 #[derive(Debug, Clone, Default)]
 struct RegMetadata {
@@ -106,6 +123,8 @@ pub struct IrToMirLowering<'a> {
     pub needs_histogram_map: bool,
     /// Needs timestamp map (for timing)
     pub needs_timestamp_map: bool,
+    /// Active loop contexts (for emitting LoopBack instead of Jump)
+    loop_contexts: Vec<LoopContext>,
 }
 
 impl<'a> IrToMirLowering<'a> {
@@ -137,6 +156,7 @@ impl<'a> IrToMirLowering<'a> {
             needs_counter_map: false,
             needs_histogram_map: false,
             needs_timestamp_map: false,
+            loop_contexts: Vec::new(),
         }
     }
 
@@ -204,7 +224,7 @@ impl<'a> IrToMirLowering<'a> {
     fn lower_instruction(
         &mut self,
         instruction: &Instruction,
-        _idx: usize,
+        ir_idx: usize,
     ) -> Result<(), CompileError> {
         match instruction {
             // === Data Movement ===
@@ -259,6 +279,28 @@ impl<'a> IrToMirLowering<'a> {
             }
 
             Instruction::Jump { index } => {
+                // Check if this Jump is a loop back-edge
+                if let Some(loop_ctx) = self.loop_contexts.last() {
+                    if *index == loop_ctx.iterate_ir_index {
+                        // This is a loop back-edge - emit LoopBack
+                        let counter = loop_ctx.counter_vreg;
+                        let step = loop_ctx.step;
+                        let header = loop_ctx.header_block;
+                        self.terminate(MirInst::LoopBack {
+                            counter,
+                            step,
+                            header,
+                        });
+                        return Ok(());
+                    } else if *index == loop_ctx.end_ir_index {
+                        // This is a loop exit - jump to exit block
+                        let exit = loop_ctx.exit_block;
+                        self.loop_contexts.pop();
+                        self.terminate(MirInst::Jump { target: exit });
+                        return Ok(());
+                    }
+                }
+                // Regular jump (not loop-related)
                 let target = BlockId(*index as u32);
                 self.terminate(MirInst::Jump { target });
             }
@@ -361,19 +403,24 @@ impl<'a> IrToMirLowering<'a> {
                     range.end
                 };
 
-                // Create blocks: body block, exit block
+                // Create blocks: header block (current becomes entry to header), body block, exit block
+                let header_block = self.func.alloc_block();
                 let body_block = self.func.alloc_block();
                 let exit_block = self.func.alloc_block();
 
-                // The loop header emits the check and conditional branch
-                self.emit(MirInst::LoopHeader {
+                // Current block jumps to header
+                self.terminate(MirInst::Jump { target: header_block });
+
+                // Set up header block with LoopHeader terminator
+                self.current_block = header_block;
+                self.terminate(MirInst::LoopHeader {
                     counter: counter_vreg,
                     limit,
                     body: body_block,
                     exit: exit_block,
                 });
 
-                // Switch to body block
+                // Switch to body block for loop body code
                 self.current_block = body_block;
 
                 // Copy counter to destination for use in loop body
@@ -382,15 +429,15 @@ impl<'a> IrToMirLowering<'a> {
                     src: MirValue::VReg(counter_vreg),
                 });
 
-                // Store the exit block info for the Jump instruction (which ends the loop)
-                // The end_index points to instructions after the loop
-                // We'll need to patch jumps back to header from the Jump instruction
-                // For now, store info to connect the Jump back to loop header
-                let meta = self.get_or_create_metadata(*stream);
-                meta.literal_int = Some(range.step); // Store step for LoopBack
-
-                // Note: The actual LoopBack is emitted when we see the Jump back
-                // We track that this is a loop iteration context
+                // Record this as a loop context so Jump can emit LoopBack
+                self.loop_contexts.push(LoopContext {
+                    header_block,
+                    exit_block,
+                    counter_vreg,
+                    step: range.step,
+                    iterate_ir_index: ir_idx,
+                    end_ir_index: *end_index,
+                });
             }
 
             // === Unsupported ===

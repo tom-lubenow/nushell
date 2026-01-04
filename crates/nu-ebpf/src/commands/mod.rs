@@ -1,7 +1,27 @@
 //! eBPF commands for Nushell
 //!
-//! These commands allow attaching Nushell closures (compiled to eBPF) to kernel
-//! probe points for tracing.
+//! ## Management Commands
+//!
+//! - [`EbpfAttach`] - Compile and attach a closure to a probe point
+//! - [`EbpfDetach`] - Detach a probe by ID
+//! - [`EbpfList`] - List active probes
+//!
+//! ## Data Commands
+//!
+//! - [`EbpfTrace`] - Stream events from `emit`
+//! - [`EbpfCounters`] - Display `count` aggregations
+//! - [`EbpfHistogram`] - Display `histogram` data
+//! - [`EbpfStacks`] - Display stack traces
+//!
+//! ## Closure Commands
+//!
+//! Used inside eBPF closures (compiled to bytecode, not executed in Nushell):
+//!
+//! - [`Emit`] - Send value to userspace
+//! - [`Count`] - Increment counter by key
+//! - [`Histogram`] - Add to log2 histogram
+//! - [`ReadStr`] / [`ReadKernelStr`] - Read strings from pointers
+//! - [`StartTimer`] / [`StopTimer`] - Latency measurement
 
 mod attach;
 mod counters;

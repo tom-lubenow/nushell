@@ -39,9 +39,11 @@ The probe specification format is `type:target`:
 
 | Type | Example | Description |
 |------|---------|-------------|
-| `kprobe` | `kprobe:do_sys_openat2` | Trace kernel function entry |
-| `kretprobe` | `kretprobe:do_sys_openat2` | Trace kernel function return |
-| `tracepoint` | `tracepoint:syscalls/sys_enter_read` | Trace static tracepoint |
+| `kprobe` | `kprobe:do_sys_openat2` | Kernel function entry |
+| `kretprobe` | `kretprobe:do_sys_openat2` | Kernel function return |
+| `tracepoint` | `tracepoint:syscalls/sys_enter_read` | Kernel tracepoint |
+| `uprobe` | `uprobe:/bin/bash:readline` | Userspace function entry |
+| `uretprobe` | `uretprobe:/bin/bash:readline` | Userspace function return |
 
 ### Context Fields
 
@@ -49,12 +51,14 @@ Access probe context via the closure parameter `{|ctx| ... }`:
 
 | Field | Description |
 |-------|-------------|
-| `$ctx.pid` | Process ID (thread group ID) |
+| `$ctx.pid` | Thread ID (what Linux calls pid) |
+| `$ctx.tgid` | Process ID (thread group ID) |
 | `$ctx.uid` | User ID |
+| `$ctx.gid` | Group ID |
 | `$ctx.ktime` | Kernel monotonic time (nanoseconds) |
-| `$ctx.comm` | Process name (16-byte string) |
-| `$ctx.arg0` - `$ctx.arg5` | Function arguments (kprobe) |
-| `$ctx.ret` | Return value (kretprobe only) |
+| `$ctx.comm` | Process name (8-byte string) |
+| `$ctx.arg0` - `$ctx.arg5` | Function arguments (kprobe/uprobe) |
+| `$ctx.retval` | Return value (kretprobe/uretprobe only) |
 | `$ctx.kstack` | Kernel stack trace ID |
 | `$ctx.ustack` | User stack trace ID |
 
@@ -142,12 +146,12 @@ ebpf attach -s 'kprobe:do_sys_openat2' {|ctx|
 ```nushell
 # Only emit events for root user (uid == 0)
 ebpf attach -s 'kprobe:do_sys_openat2' {|ctx|
-    $ctx.uid == 0 | filter | $ctx.pid | emit
+    if $ctx.uid == 0 { $ctx.pid | emit }
 } | first 10
 
-# Filter out low PIDs
+# Filter by process name
 ebpf attach -s 'kprobe:ksys_read' {|ctx|
-    $ctx.pid > 1000 | filter | { pid: $ctx.pid, comm: $ctx.comm } | emit
+    if $ctx.comm == "nginx" { { pid: $ctx.pid, comm: $ctx.comm } | emit }
 } | first 10
 ```
 
@@ -249,8 +253,8 @@ ebpf attach --dry-run 'kprobe:ksys_read' {|ctx| $ctx.pid | emit } | save probe.e
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Nushell Closure │ --> │  IR Compiler     │ --> │  eBPF Bytecode  │
-│  {|ctx| $ctx.pid}│     │  (ir_to_ebpf.rs) │     │  (ELF binary)   │
+│  Nushell Closure │ --> │  MIR Compiler    │ --> │  eBPF Bytecode  │
+│  {|ctx| $ctx.pid}│     │                  │     │  (ELF binary)   │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
                                                           │
                                                           v
@@ -260,12 +264,13 @@ ebpf attach --dry-run 'kprobe:ksys_read' {|ctx| $ctx.pid | emit } | save probe.e
 └─────────────────┘     └──────────────────┘     └─────────────────┘
 ```
 
-The compiler:
-1. Takes Nushell's IR (intermediate representation) from the closure
-2. Translates IR instructions to eBPF bytecode
-3. Recognizes context field access (`$ctx.pid`, etc.) and emits BPF helper calls
-4. Generates proper ELF with BTF (BPF Type Format) for kernel loading
-5. Uses [aya](https://github.com/aya-rs/aya) to load and attach the program
+The compiler pipeline:
+1. **IR → MIR**: Lowers Nushell IR to Mid-level IR with virtual registers
+2. **CFG Analysis**: Builds control flow graph, computes liveness
+3. **Optimization**: Dead code elimination, constant folding
+4. **Register Allocation**: Linear scan allocation to eBPF registers
+5. **Code Generation**: Emits eBPF bytecode with map relocations
+6. **Loading**: Uses [aya](https://github.com/aya-rs/aya) to load into kernel
 
 ## Limitations
 

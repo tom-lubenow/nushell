@@ -2,6 +2,7 @@
 //!
 //! This module converts MIR (Mid-Level IR) to eBPF bytecode.
 //! It handles:
+//! - Type inference and validation
 //! - Virtual register allocation to physical registers
 //! - Stack layout and spilling
 //! - Control flow (basic block linearization, jump resolution)
@@ -11,15 +12,18 @@
 //!
 //! 1. Build CFG from MIR
 //! 2. Compute liveness information
-//! 3. Layout stack slots
-//! 4. Compile blocks in reverse post-order
-//! 5. Fix up jumps and emit bytecode
+//! 3. Run type inference (validates types, catches errors early)
+//! 4. Linear scan register allocation
+//! 5. Layout stack slots
+//! 6. Compile blocks in reverse post-order
+//! 7. Fix up jumps and emit bytecode
 
 use std::collections::HashMap;
 
 use crate::compiler::cfg::{CFG, LivenessInfo};
 use crate::compiler::elf::{BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext, SchemaField};
 use crate::compiler::instruction::{opcode, BpfHelper, EbpfInsn, EbpfReg};
+use crate::compiler::type_infer::TypeInference;
 
 /// pt_regs offsets for x86_64 architecture
 /// These are the byte offsets into the pt_regs structure for accessing
@@ -82,6 +86,8 @@ pub struct MirToEbpfCompiler<'a> {
     instructions: Vec<EbpfInsn>,
     /// Virtual register to physical register mapping
     vreg_to_phys: HashMap<VReg, EbpfReg>,
+    /// Virtual registers that have been defined (written to)
+    vreg_defined: std::collections::HashSet<VReg>,
     /// Virtual registers spilled to stack
     vreg_spills: HashMap<VReg, i16>,
     /// Stack slot offsets
@@ -122,6 +128,7 @@ impl<'a> MirToEbpfCompiler<'a> {
             probe_ctx,
             instructions: Vec::new(),
             vreg_to_phys: HashMap::new(),
+            vreg_defined: std::collections::HashSet::new(),
             vreg_spills: HashMap::new(),
             slot_offsets: HashMap::new(),
             stack_offset: 0,
@@ -236,6 +243,15 @@ impl<'a> MirToEbpfCompiler<'a> {
         let cfg = CFG::build(func);
         let liveness = LivenessInfo::compute(func, &cfg);
 
+        // Run type inference to validate types and catch errors early
+        let mut type_infer = TypeInference::new(self.probe_ctx.cloned());
+        if let Err(errors) = type_infer.infer(func) {
+            // Return the first type error
+            if let Some(err) = errors.into_iter().next() {
+                return Err(crate::compiler::CompileError::TypeError(err));
+            }
+        }
+
         // Run linear scan register allocation
         let mut allocator = LinearScanAllocator::new(self.available_regs.clone());
         let alloc_result = allocator.allocate(func, &cfg, &liveness);
@@ -254,6 +270,12 @@ impl<'a> MirToEbpfCompiler<'a> {
         } else {
             cfg.rpo.clone()
         };
+
+        // Emit function prologue: save R1 (context pointer) to R9
+        // R1 contains the probe context (pt_regs for kprobe, etc.)
+        // We save it to R9 which is callee-saved and not used by our register allocator
+        self.instructions
+            .push(EbpfInsn::mov64_reg(EbpfReg::R9, EbpfReg::R1));
 
         // Compile each block in CFG order
         for block_id in block_order {
@@ -308,7 +330,7 @@ impl<'a> MirToEbpfCompiler<'a> {
     fn compile_instruction(&mut self, inst: &MirInst) -> Result<(), CompileError> {
         match inst {
             MirInst::Copy { dst, src } => {
-                let dst_reg = self.alloc_reg(*dst)?;
+                let dst_reg = self.alloc_dst_reg(*dst)?;
                 match src {
                     MirValue::VReg(v) => {
                         let src_reg = self.ensure_reg(*v)?;
@@ -344,7 +366,7 @@ impl<'a> MirToEbpfCompiler<'a> {
             }
 
             MirInst::BinOp { dst, op, lhs, rhs } => {
-                let dst_reg = self.alloc_reg(*dst)?;
+                let dst_reg = self.alloc_dst_reg(*dst)?;
 
                 // Load LHS into dst
                 match lhs {
@@ -383,7 +405,7 @@ impl<'a> MirToEbpfCompiler<'a> {
             }
 
             MirInst::UnaryOp { dst, op, src } => {
-                let dst_reg = self.alloc_reg(*dst)?;
+                let dst_reg = self.alloc_dst_reg(*dst)?;
                 match src {
                     MirValue::VReg(v) => {
                         let src_reg = self.ensure_reg(*v)?;
@@ -418,7 +440,7 @@ impl<'a> MirToEbpfCompiler<'a> {
             }
 
             MirInst::LoadCtxField { dst, field } => {
-                let dst_reg = self.alloc_reg(*dst)?;
+                let dst_reg = self.alloc_dst_reg(*dst)?;
                 self.compile_load_ctx_field(dst_reg, field)?;
             }
 
@@ -520,7 +542,7 @@ impl<'a> MirToEbpfCompiler<'a> {
 
             MirInst::StopTimer { dst } => {
                 self.needs_timestamp_map = true;
-                let dst_reg = self.alloc_reg(*dst)?;
+                let dst_reg = self.alloc_dst_reg(*dst)?;
                 self.compile_stop_timer(dst_reg)?;
             }
 
@@ -1232,7 +1254,7 @@ impl<'a> MirToEbpfCompiler<'a> {
         let phys = self.available_regs[self.next_lru % self.available_regs.len()];
         self.next_lru += 1;
 
-        // Spill if needed
+        // Spill if needed - but only if the vreg was actually defined
         let to_spill: Option<VReg> = self
             .vreg_to_phys
             .iter()
@@ -1240,11 +1262,27 @@ impl<'a> MirToEbpfCompiler<'a> {
             .map(|(v, _)| *v);
 
         if let Some(old_vreg) = to_spill {
-            self.spill_vreg(old_vreg, phys)?;
+            // Only spill if this vreg was actually written to
+            // Otherwise, we'd be saving an uninitialized register
+            if self.vreg_defined.contains(&old_vreg) {
+                self.spill_vreg(old_vreg, phys)?;
+            }
             self.vreg_to_phys.remove(&old_vreg);
         }
 
         self.vreg_to_phys.insert(vreg, phys);
+        Ok(phys)
+    }
+
+    /// Mark a virtual register as defined (has been written to)
+    fn mark_defined(&mut self, vreg: VReg) {
+        self.vreg_defined.insert(vreg);
+    }
+
+    /// Allocate a register for a destination vreg and mark it as defined
+    fn alloc_dst_reg(&mut self, vreg: VReg) -> Result<EbpfReg, CompileError> {
+        let phys = self.alloc_reg(vreg)?;
+        self.mark_defined(vreg);
         Ok(phys)
     }
 
@@ -1258,6 +1296,8 @@ impl<'a> MirToEbpfCompiler<'a> {
             let phys = self.alloc_reg(vreg)?;
             self.instructions
                 .push(EbpfInsn::ldxdw(phys, EbpfReg::R10, offset));
+            // After reload, the vreg is defined in this physical register
+            self.mark_defined(vreg);
             return Ok(phys);
         }
 

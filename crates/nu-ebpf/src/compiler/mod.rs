@@ -5,11 +5,15 @@
 //! ## Compilation Pipeline
 //!
 //! ```text
-//! Nushell IR → [ir_to_mir] → MIR → [cfg] → CFG analysis → [mir_to_ebpf] → eBPF bytecode
-//!                                     ↓
+//! Nushell IR → [ir_to_mir] → MIR → [type_infer] → typed MIR
+//!                                       ↓
+//!                                 [cfg] → CFG analysis
+//!                                       ↓
 //!                              [passes/*] optimizations
-//!                                     ↓
+//!                                       ↓
 //!                              [regalloc] register allocation
+//!                                       ↓
+//!                              [mir_to_ebpf] → eBPF bytecode
 //! ```
 
 mod btf;
@@ -21,6 +25,7 @@ pub mod mir;
 pub mod mir_to_ebpf;
 pub mod passes;
 pub mod regalloc;
+pub mod type_infer;
 
 pub use elf::{
     BpfFieldType, BpfMapDef, EbpfMap, EbpfProgram, EbpfProgramType, EventSchema, MapRelocation,
@@ -28,6 +33,7 @@ pub use elf::{
 };
 pub use instruction::{BpfHelper, EbpfInsn, EbpfReg};
 pub use mir_to_ebpf::{compile_mir_to_ebpf, MirCompileResult};
+pub use type_infer::{TypeError, TypeInference};
 
 use thiserror::Error;
 
@@ -64,4 +70,7 @@ pub enum CompileError {
         name: String,
         reason: String,
     },
+
+    #[error("Type error: {0}")]
+    TypeError(#[from] TypeError),
 }

@@ -252,12 +252,16 @@ impl<'a> MirToEbpfCompiler<'a> {
             }
         }
 
-        // Run linear scan register allocation
+        // Run linear scan register allocation for spill slot planning
+        // Note: We don't pre-populate vreg_to_phys because linear scan assigns
+        // registers for non-overlapping live ranges to reuse the same register.
+        // The runtime LRU allocation handles this correctly by spilling when needed.
         let mut allocator = LinearScanAllocator::new(self.available_regs.clone());
         let alloc_result = allocator.allocate(func, &cfg, &liveness);
 
-        // Pre-populate vreg assignments from linear scan
-        self.apply_register_allocation(&alloc_result)?;
+        // Only apply spill slot allocations (not register assignments)
+        // The LRU allocator will handle register assignment dynamically
+        self.apply_spill_slots(&alloc_result)?;
 
         // Use reverse post-order for block layout
         // This ensures that:
@@ -291,20 +295,22 @@ impl<'a> MirToEbpfCompiler<'a> {
     }
 
     /// Apply register allocation results from linear scan
-    fn apply_register_allocation(&mut self, result: &RegAllocResult) -> Result<(), CompileError> {
-        // Pre-populate register assignments
-        for (&vreg, &phys) in &result.assignments {
-            self.vreg_to_phys.insert(vreg, phys);
-        }
-
-        // Allocate spill slots for spilled vregs
+    fn apply_spill_slots(&mut self, result: &RegAllocResult) -> Result<(), CompileError> {
+        // Only allocate spill slots - don't pre-populate register assignments
+        // The LRU allocator will handle register assignment dynamically, which
+        // correctly handles the case where multiple vregs share a register
+        // (because their live ranges don't overlap)
         for (&vreg, &slot) in &result.spills {
             // Allocate stack space for spill slot
             self.check_stack_space(8)?;
             self.stack_offset -= 8;
-            self.vreg_spills.insert(vreg, self.stack_offset);
+            // Note: we don't add to vreg_spills here - the LRU allocator will
+            // populate it when it actually needs to spill a register
             // Map the slot ID to our stack offset (for later reference)
             self.slot_offsets.insert(slot, self.stack_offset);
+            // Reserve this stack space by recording the vreg might need it
+            // (but don't mark as spilled yet - that happens at runtime)
+            let _ = (vreg, slot); // Acknowledge we saw this info
         }
 
         Ok(())

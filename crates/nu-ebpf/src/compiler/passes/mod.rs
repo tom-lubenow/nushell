@@ -9,11 +9,13 @@
 //! - **ConstFold** (Constant Folding): Evaluates constant expressions at compile time
 //! - **StrengthReduce**: Converts expensive operations to cheaper equivalents
 
-mod dce;
 mod const_fold;
+mod dce;
+mod strength;
 
-pub use dce::DeadCodeElimination;
 pub use const_fold::ConstantFolding;
+pub use dce::DeadCodeElimination;
+pub use strength::StrengthReduction;
 
 use super::cfg::CFG;
 use super::mir::MirFunction;
@@ -108,7 +110,9 @@ impl Default for PassManager {
 /// Create a default set of optimization passes
 pub fn default_passes() -> PassManager {
     let mut pm = PassManager::new();
+    // Order matters: fold constants first, then reduce strength, then eliminate dead code
     pm.add_pass(ConstantFolding);
+    pm.add_pass(StrengthReduction);
     pm.add_pass(DeadCodeElimination);
     pm
 }

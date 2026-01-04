@@ -871,6 +871,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "btf"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9ebf9944d71035d52dc2f525873623da0a6ed9187d42d2aa52a02e8f2d32129"
+dependencies = [
+ "byteorder",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "buf-trait"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4304,6 +4314,7 @@ name = "nu-ebpf"
 version = "0.109.2"
 dependencies = [
  "aya",
+ "btf",
  "bytes",
  "libc",
  "nu-engine",

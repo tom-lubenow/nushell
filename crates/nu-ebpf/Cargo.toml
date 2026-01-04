@@ -24,6 +24,7 @@ thiserror.workspace = true
 bytes.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+btf = "0.5.1"
 libc.workspace = true
 
 [lints]

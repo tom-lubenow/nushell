@@ -8,9 +8,11 @@
 //! - Function existence validation
 
 mod service;
+mod pt_regs;
 mod tracepoint;
 mod types;
 
 pub use service::{FunctionCheckResult, KernelBtf};
+pub use pt_regs::{PtRegsError, PtRegsOffsets};
 pub use tracepoint::TracepointContext;
 pub use types::{FieldInfo, TypeInfo};

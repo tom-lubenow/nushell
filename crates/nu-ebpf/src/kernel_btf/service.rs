@@ -11,6 +11,9 @@ use std::fs;
 use std::path::Path;
 use std::sync::{OnceLock, RwLock};
 
+use btf::Btf;
+
+use super::pt_regs::{fallback_offsets, offsets_from_btf, PtRegsError, PtRegsOffsets};
 use super::tracepoint::TracepointContext;
 use super::types::{FieldInfo, TypeInfo};
 
@@ -87,6 +90,8 @@ pub struct KernelBtf {
     tracepoint_cache: RwLock<HashMap<String, TracepointContext>>,
     /// Cached function list result (lazy loaded)
     function_cache: RwLock<Option<FunctionListResult>>,
+    /// Cached pt_regs offsets (lazy loaded)
+    pt_regs_cache: RwLock<Option<Result<PtRegsOffsets, PtRegsError>>>,
 }
 
 impl KernelBtf {
@@ -102,6 +107,7 @@ impl KernelBtf {
                 available_filter_functions_path: filter_funcs_path,
                 tracepoint_cache: RwLock::new(HashMap::new()),
                 function_cache: RwLock::new(None),
+                pt_regs_cache: RwLock::new(None),
             }
         })
     }
@@ -147,6 +153,47 @@ impl KernelBtf {
     /// Check if function validation is available
     pub fn has_function_list(&self) -> bool {
         self.available_filter_functions_path.is_some()
+    }
+
+    /// Resolve pt_regs argument/return offsets from kernel BTF, with fallback support.
+    pub fn pt_regs_offsets(&self) -> Result<PtRegsOffsets, PtRegsError> {
+        {
+            let cache = self.pt_regs_cache.read().unwrap();
+            if let Some(ref cached) = *cache {
+                return cached.clone();
+            }
+        }
+
+        let resolved = self.resolve_pt_regs_offsets();
+
+        {
+            let mut cache = self.pt_regs_cache.write().unwrap();
+            *cache = Some(resolved.clone());
+        }
+
+        resolved
+    }
+
+    fn resolve_pt_regs_offsets(&self) -> Result<PtRegsOffsets, PtRegsError> {
+        let offsets = self
+            .load_kernel_btf()
+            .and_then(|btf| offsets_from_btf(&btf));
+
+        match offsets {
+            Ok(offsets) => Ok(offsets),
+            Err(err) => match fallback_offsets() {
+                Some(fallback) => Ok(fallback),
+                None => Err(PtRegsError::new(format!(
+                    "{err}; no fallback offsets for this architecture"
+                ))),
+            },
+        }
+    }
+
+    fn load_kernel_btf(&self) -> Result<Btf, PtRegsError> {
+        let path = "/sys/kernel/btf/vmlinux";
+        Btf::from_file(path)
+            .map_err(|e| PtRegsError::new(format!("failed to parse {path}: {e}")))
     }
 
     /// Load the list of available kernel functions (lazy, cached)
@@ -582,6 +629,7 @@ mod tests {
             available_filter_functions_path: None,
             tracepoint_cache: RwLock::new(HashMap::new()),
             function_cache: RwLock::new(None),
+            pt_regs_cache: RwLock::new(None),
         }
     }
 

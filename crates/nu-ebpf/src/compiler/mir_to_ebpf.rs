@@ -24,52 +24,6 @@ use crate::compiler::cfg::CFG;
 use crate::compiler::elf::{BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext, SchemaField};
 use crate::compiler::instruction::{opcode, BpfHelper, EbpfInsn, EbpfReg};
 use crate::compiler::type_infer::TypeInference;
-
-/// pt_regs offsets for supported architectures.
-/// These are byte offsets into struct pt_regs for accessing arguments/retval.
-#[cfg(target_arch = "x86_64")]
-mod pt_regs_offsets {
-    /// Offsets for function arguments (arg0-arg5) in pt_regs on x86_64
-    /// Arguments are passed in: rdi, rsi, rdx, rcx, r8, r9
-    pub const ARG_OFFSETS: [i16; 6] = [
-        112, // rdi (arg0)
-        104, // rsi (arg1)
-        96,  // rdx (arg2)
-        88,  // rcx (arg3)
-        72,  // r8 (arg4)
-        64,  // r9 (arg5)
-    ];
-
-    /// Offset for return value (rax) in pt_regs on x86_64
-    pub const RETVAL_OFFSET: i16 = 80;
-
-    pub const SUPPORTED: bool = true;
-}
-
-#[cfg(target_arch = "aarch64")]
-mod pt_regs_offsets {
-    /// Offsets for function arguments (x0-x5) in pt_regs on aarch64
-    pub const ARG_OFFSETS: [i16; 6] = [
-        0,  // x0 (arg0)
-        8,  // x1 (arg1)
-        16, // x2 (arg2)
-        24, // x3 (arg3)
-        32, // x4 (arg4)
-        40, // x5 (arg5)
-    ];
-
-    /// Offset for return value (x0) in pt_regs on aarch64
-    pub const RETVAL_OFFSET: i16 = 0;
-
-    pub const SUPPORTED: bool = true;
-}
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod pt_regs_offsets {
-    pub const ARG_OFFSETS: [i16; 6] = [0; 6];
-    pub const RETVAL_OFFSET: i16 = 0;
-    pub const SUPPORTED: bool = false;
-}
 use crate::compiler::mir::{
     BasicBlock, BinOpKind, BlockId, CtxField, MirFunction, MirInst, MirProgram, MirType, MirValue,
     RecordFieldDef, StackSlotId, UnaryOpKind, VReg,
@@ -825,19 +779,19 @@ impl<'a> MirToEbpfCompiler<'a> {
                     .push(EbpfInsn::add64_imm(dst, comm_offset as i32));
             }
             CtxField::Arg(n) => {
-                if !pt_regs_offsets::SUPPORTED {
-                    return Err(CompileError::UnsupportedInstruction(
-                        "pt_regs argument access is not supported on this architecture".into(),
-                    ));
-                }
                 let n = *n as usize;
-                if n >= pt_regs_offsets::ARG_OFFSETS.len() {
+                if n >= 6 {
                     return Err(CompileError::UnsupportedInstruction(format!(
                         "Argument index {} out of range",
                         n
                     )));
                 }
-                let offset = pt_regs_offsets::ARG_OFFSETS[n];
+                let offsets = KernelBtf::get().pt_regs_offsets().map_err(|e| {
+                    CompileError::UnsupportedInstruction(format!(
+                        "pt_regs argument access unavailable: {e}"
+                    ))
+                })?;
+                let offset = offsets.arg_offsets[n];
                 // R1 contains pointer to pt_regs on entry
                 // We need to save it in R9 at start of function for later use
                 // For now, assume R9 has the context pointer
@@ -845,17 +799,17 @@ impl<'a> MirToEbpfCompiler<'a> {
                     .push(EbpfInsn::ldxdw(dst, EbpfReg::R9, offset));
             }
             CtxField::RetVal => {
-                if !pt_regs_offsets::SUPPORTED {
-                    return Err(CompileError::UnsupportedInstruction(
-                        "pt_regs return value access is not supported on this architecture".into(),
-                    ));
-                }
                 if let Some(ctx) = self.probe_ctx {
                     if !ctx.is_return_probe() {
                         return Err(CompileError::RetvalOnNonReturnProbe);
                     }
                 }
-                let offset = pt_regs_offsets::RETVAL_OFFSET;
+                let offsets = KernelBtf::get().pt_regs_offsets().map_err(|e| {
+                    CompileError::UnsupportedInstruction(format!(
+                        "pt_regs return value access unavailable: {e}"
+                    ))
+                })?;
+                let offset = offsets.retval_offset;
                 self.instructions
                     .push(EbpfInsn::ldxdw(dst, EbpfReg::R9, offset));
             }

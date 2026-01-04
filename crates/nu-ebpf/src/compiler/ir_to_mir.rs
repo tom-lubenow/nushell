@@ -870,11 +870,27 @@ impl<'a> IrToMirLowering<'a> {
                         .collect();
                     self.emit(MirInst::EmitRecord { fields });
                 } else {
+                    let field_type = self
+                        .pipeline_input_reg
+                        .and_then(|reg| self.get_metadata(reg))
+                        .and_then(|m| m.field_type.clone())
+                        .or_else(|| {
+                            self.get_metadata(src_dst)
+                                .and_then(|m| m.field_type.clone())
+                        });
+                    let size = match field_type {
+                        Some(MirType::Array { elem, len })
+                            if matches!(elem.as_ref(), MirType::U8) =>
+                        {
+                            len
+                        }
+                        _ => 8,
+                    };
                     // Emit a single value
                     let data_vreg = self.pipeline_input.unwrap_or(dst_vreg);
                     self.emit(MirInst::EmitEvent {
                         data: data_vreg,
-                        size: 8, // Default to 8 bytes
+                        size,
                     });
                 }
                 // Set result to 0
@@ -887,9 +903,28 @@ impl<'a> IrToMirLowering<'a> {
             "count" => {
                 self.needs_counter_map = true;
                 let key_vreg = self.pipeline_input.unwrap_or(dst_vreg);
+                let key_type = self
+                    .pipeline_input_reg
+                    .and_then(|reg| self.get_metadata(reg))
+                    .and_then(|m| m.field_type.clone())
+                    .or_else(|| self.get_metadata(src_dst).and_then(|m| m.field_type.clone()));
+                let map_name = match key_type {
+                    Some(MirType::Array { elem, len })
+                        if matches!(elem.as_ref(), MirType::U8) =>
+                    {
+                        if len == 16 {
+                            "str_counters"
+                        } else {
+                            return Err(CompileError::UnsupportedInstruction(
+                                "count only supports 16-byte strings (e.g., $ctx.comm)".into(),
+                            ));
+                        }
+                    }
+                    _ => "counters",
+                };
                 self.emit(MirInst::MapUpdate {
                     map: MapRef {
-                        name: "counters".to_string(),
+                        name: map_name.to_string(),
                         kind: MapKind::Hash,
                     },
                     key: key_vreg,
@@ -941,6 +976,16 @@ impl<'a> IrToMirLowering<'a> {
                     user_space: true,
                     max_len: 128,
                 });
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::StackSlot(slot),
+                });
+                let meta = self.get_or_create_metadata(src_dst);
+                meta.string_slot = Some(slot);
+                meta.field_type = Some(MirType::Array {
+                    elem: Box::new(MirType::U8),
+                    len: 128,
+                });
             }
 
             "read-kernel-str" => {
@@ -951,6 +996,16 @@ impl<'a> IrToMirLowering<'a> {
                     ptr: ptr_vreg,
                     user_space: false,
                     max_len: 128,
+                });
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::StackSlot(slot),
+                });
+                let meta = self.get_or_create_metadata(src_dst);
+                meta.string_slot = Some(slot);
+                meta.field_type = Some(MirType::Array {
+                    elem: Box::new(MirType::U8),
+                    len: 128,
                 });
             }
 

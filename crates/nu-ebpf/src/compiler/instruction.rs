@@ -60,6 +60,8 @@ pub enum BpfHelper {
     KtimeGetNs = 5,
     /// int bpf_trace_printk(fmt, fmt_size, ...)
     TracePrintk = 6,
+    /// u32 bpf_get_smp_processor_id(void)
+    GetSmpProcessorId = 8,
     /// u64 bpf_get_current_pid_tgid(void)
     GetCurrentPidTgid = 14,
     /// u64 bpf_get_current_uid_gid(void)
@@ -283,6 +285,11 @@ impl EbpfInsn {
     /// AND64 dst, imm - Bitwise AND register with immediate
     pub const fn and64_imm(dst: EbpfReg, imm: i32) -> Self {
         Self::new(opcode::AND64_IMM, dst.as_u8(), 0, 0, imm)
+    }
+
+    /// AND32 dst, imm - Bitwise AND lower 32 bits with immediate (zeros upper bits)
+    pub const fn and32_imm(dst: EbpfReg, imm: i32) -> Self {
+        Self::new(opcode::BPF_ALU | opcode::BPF_AND | opcode::BPF_K, dst.as_u8(), 0, 0, imm)
     }
 
     /// AND64 dst, src - Bitwise AND register with register

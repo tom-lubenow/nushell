@@ -98,7 +98,9 @@ fn extract_regs_array(member: &StructMember, btf: &Btf) -> Result<PtRegsArray, P
 
     let elem_bits = elem_type.bits;
     if elem_bits == 0 {
-        return Err(PtRegsError::new("pt_regs.regs element has zero size".to_string()));
+        return Err(PtRegsError::new(
+            "pt_regs.regs element has zero size".to_string(),
+        ));
     }
     let elem_size_bytes = elem_bits.div_ceil(8);
 
@@ -130,17 +132,23 @@ fn compute_pt_regs_offsets(
     ];
     let ret_names = ["ax", "rax"];
 
-    if let (Some(retval_bits), Some(arg0_bits), Some(arg1_bits), Some(arg2_bits), Some(arg3_bits), Some(arg4_bits), Some(arg5_bits)) =
-        (
-            lookup(&ret_names),
-            lookup(x86_names[0]),
-            lookup(x86_names[1]),
-            lookup(x86_names[2]),
-            lookup(x86_names[3]),
-            lookup(x86_names[4]),
-            lookup(x86_names[5]),
-        )
-    {
+    if let (
+        Some(retval_bits),
+        Some(arg0_bits),
+        Some(arg1_bits),
+        Some(arg2_bits),
+        Some(arg3_bits),
+        Some(arg4_bits),
+        Some(arg5_bits),
+    ) = (
+        lookup(&ret_names),
+        lookup(x86_names[0]),
+        lookup(x86_names[1]),
+        lookup(x86_names[2]),
+        lookup(x86_names[3]),
+        lookup(x86_names[4]),
+        lookup(x86_names[5]),
+    ) {
         return Ok(PtRegsOffsets {
             arg_offsets: [
                 bits_to_i16(arg0_bits, "arg0")?,
@@ -187,9 +195,8 @@ fn compute_pt_regs_offsets(
 
 fn bits_to_i16(bits: u32, label: &str) -> Result<i16, PtRegsError> {
     let bytes = bits_to_i32(bits, label)?;
-    i16::try_from(bytes).map_err(|_| {
-        PtRegsError::new(format!("pt_regs {label} offset out of range"))
-    })
+    i16::try_from(bytes)
+        .map_err(|_| PtRegsError::new(format!("pt_regs {label} offset out of range")))
 }
 
 fn bits_to_i32(bits: u32, label: &str) -> Result<i32, PtRegsError> {

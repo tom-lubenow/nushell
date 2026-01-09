@@ -211,9 +211,9 @@ fn run_attach(
     call: &Call,
 ) -> Result<PipelineData, ShellError> {
     use crate::compiler::{
-        compile_mir_to_ebpf, ir_to_mir::lower_ir_to_mir, EbpfProgram, ProbeContext,
+        EbpfProgram, ProbeContext, compile_mir_to_ebpf, ir_to_mir::lower_ir_to_mir,
     };
-    use crate::loader::{get_state, parse_probe_spec, LoadError};
+    use crate::loader::{LoadError, get_state, parse_probe_spec};
 
     let probe_spec: String = call.req(engine_state, stack, 0)?;
     let closure: Closure = call.req(engine_state, stack, 1)?;
@@ -271,13 +271,16 @@ fn run_attach(
 
     // Get block and IR
     let block = engine_state.get_block(closure.block_id);
-    let ir_block = block.ir_block.as_ref().ok_or_else(|| ShellError::GenericError {
-        error: "No IR available for closure".into(),
-        msg: "The closure could not be compiled to IR".into(),
-        span: Some(call.head),
-        help: Some("Ensure the closure is a simple expression".into()),
-        inner: vec![],
-    })?;
+    let ir_block = block
+        .ir_block
+        .as_ref()
+        .ok_or_else(|| ShellError::GenericError {
+            error: "No IR available for closure".into(),
+            msg: "The closure could not be compiled to IR".into(),
+            span: Some(call.head),
+            help: Some("Ensure the closure is a simple expression".into()),
+            inner: vec![],
+        })?;
 
     // Extract context parameter VarId
     let ctx_param = block
@@ -300,15 +303,20 @@ fn run_attach(
         .collect();
 
     // Lower IR to MIR
-    let mir_program =
-        lower_ir_to_mir(ir_block, Some(&probe_context), Some(engine_state), &captures, ctx_param)
-            .map_err(|e| ShellError::GenericError {
-                error: "eBPF compilation failed".into(),
-                msg: e.to_string(),
-                span: Some(call.head),
-                help: Some("The closure may use unsupported operations".into()),
-                inner: vec![],
-            })?;
+    let mir_program = lower_ir_to_mir(
+        ir_block,
+        Some(&probe_context),
+        Some(engine_state),
+        &captures,
+        ctx_param,
+    )
+    .map_err(|e| ShellError::GenericError {
+        error: "eBPF compilation failed".into(),
+        msg: e.to_string(),
+        span: Some(call.head),
+        help: Some("The closure may use unsupported operations".into()),
+        inner: vec![],
+    })?;
 
     // Compile MIR to eBPF
     let compile_result = compile_mir_to_ebpf(&mir_program, Some(&probe_context)).map_err(|e| {

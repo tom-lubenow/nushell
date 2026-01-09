@@ -7,9 +7,9 @@
 
 use std::collections::HashMap;
 
+use super::MirPass;
 use crate::compiler::cfg::CFG;
 use crate::compiler::mir::{BinOpKind, MirFunction, MirInst, MirValue, UnaryOpKind, VReg};
-use super::MirPass;
 
 /// Constant Folding pass
 pub struct ConstantFolding;
@@ -46,20 +46,22 @@ impl MirPass for ConstantFolding {
 
 impl ConstantFolding {
     /// Try to fold a single instruction
-    fn fold_instruction(
-        &self,
-        inst: &mut MirInst,
-        constants: &mut HashMap<VReg, i64>,
-    ) -> bool {
+    fn fold_instruction(&self, inst: &mut MirInst, constants: &mut HashMap<VReg, i64>) -> bool {
         match inst {
             // Copy of constant - track it
-            MirInst::Copy { dst, src: MirValue::Const(c) } => {
+            MirInst::Copy {
+                dst,
+                src: MirValue::Const(c),
+            } => {
                 constants.insert(*dst, *c);
                 false // No change to the instruction itself
             }
 
             // Copy of known constant vreg - replace with constant
-            MirInst::Copy { dst, src: MirValue::VReg(v) } => {
+            MirInst::Copy {
+                dst,
+                src: MirValue::VReg(v),
+            } => {
                 if let Some(&c) = constants.get(v) {
                     constants.insert(*dst, c);
                     *inst = MirInst::Copy {
@@ -127,13 +129,13 @@ impl ConstantFolding {
     }
 
     /// Try to simplify a terminator with constant condition
-    fn fold_terminator(
-        &self,
-        term: &mut MirInst,
-        constants: &HashMap<VReg, i64>,
-    ) -> bool {
+    fn fold_terminator(&self, term: &mut MirInst, constants: &HashMap<VReg, i64>) -> bool {
         match term {
-            MirInst::Branch { cond, if_true, if_false } => {
+            MirInst::Branch {
+                cond,
+                if_true,
+                if_false,
+            } => {
                 if let Some(&c) = constants.get(cond) {
                     // Condition is known at compile time
                     let target = if c != 0 { *if_true } else { *if_false };
@@ -285,7 +287,10 @@ mod tests {
         // The third instruction should now be: v2 = 5
         let block = func.block(func.entry);
         match &block.instructions[2] {
-            MirInst::Copy { dst: _, src: MirValue::Const(5) } => {}
+            MirInst::Copy {
+                dst: _,
+                src: MirValue::Const(5),
+            } => {}
             other => panic!("Expected Copy with const 5, got {:?}", other),
         }
     }

@@ -7,9 +7,9 @@
 
 use std::collections::HashSet;
 
+use super::MirPass;
 use crate::compiler::cfg::CFG;
 use crate::compiler::mir::{MirFunction, MirInst, VReg};
-use super::MirPass;
 
 /// Dead Code Elimination pass
 pub struct DeadCodeElimination;

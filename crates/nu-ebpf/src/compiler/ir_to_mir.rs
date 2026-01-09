@@ -10,12 +10,12 @@ use nu_protocol::engine::EngineState;
 use nu_protocol::ir::{Instruction, IrBlock};
 use nu_protocol::{DeclId, RegId, Value, VarId};
 
+use super::CompileError;
 use super::elf::ProbeContext;
 use super::mir::{
     BasicBlock, BinOpKind, BlockId, CtxField, MapKind, MapRef, MirFunction, MirInst, MirProgram,
     MirType, MirValue, RecordFieldDef, StackSlotId, StackSlotKind, VReg,
 };
-use super::CompileError;
 
 /// Command types we recognize for eBPF
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +201,9 @@ impl<'a> IrToMirLowering<'a> {
 
     /// Check if a register holds the context value
     fn is_context_reg(&self, reg: RegId) -> bool {
-        self.get_metadata(reg).map(|m| m.is_context).unwrap_or(false)
+        self.get_metadata(reg)
+            .map(|m| m.is_context)
+            .unwrap_or(false)
     }
 
     /// Get or create a VReg for a Nushell RegId
@@ -257,7 +259,9 @@ impl<'a> IrToMirLowering<'a> {
                     | MirInst::LoopBack { .. }
                     | MirInst::TailCall { .. }
             ) {
-                self.terminate(MirInst::Jump { target: target_block });
+                self.terminate(MirInst::Jump {
+                    target: target_block,
+                });
             }
             // Switch to the target block
             self.current_block = target_block;
@@ -342,7 +346,11 @@ impl<'a> IrToMirLowering<'a> {
                 self.terminate(MirInst::Jump { target });
             }
 
-            Instruction::Match { pattern, src, index } => {
+            Instruction::Match {
+                pattern,
+                src,
+                index,
+            } => {
                 // Match is used for short-circuit boolean evaluation
                 self.lower_match(pattern, *src, *index)?;
             }
@@ -422,7 +430,8 @@ impl<'a> IrToMirLowering<'a> {
                 end_index,
             } => {
                 // Get the range info from the stream register
-                let range = self.get_metadata(*stream)
+                let range = self
+                    .get_metadata(*stream)
                     .and_then(|m| m.bounded_range)
                     .ok_or_else(|| {
                         CompileError::UnsupportedInstruction(
@@ -446,7 +455,9 @@ impl<'a> IrToMirLowering<'a> {
                 let exit_block = self.func.alloc_block();
 
                 // Current block jumps to header
-                self.terminate(MirInst::Jump { target: header_block });
+                self.terminate(MirInst::Jump {
+                    target: header_block,
+                });
 
                 // Set up header block with LoopHeader terminator
                 self.current_block = header_block;
@@ -574,20 +585,24 @@ impl<'a> IrToMirLowering<'a> {
                 inclusion,
             } => {
                 // For eBPF bounded loops, we need compile-time known bounds
-                let start_val = self.get_metadata(*start)
+                let start_val = self
+                    .get_metadata(*start)
                     .and_then(|m| m.literal_int)
                     .ok_or_else(|| {
                         CompileError::UnsupportedInstruction(
-                            "Range start must be a compile-time known integer for eBPF loops".into(),
+                            "Range start must be a compile-time known integer for eBPF loops"
+                                .into(),
                         )
                     })?;
 
                 // Step can be nothing (default 1) or an explicit integer
-                let step_val = self.get_metadata(*step)
+                let step_val = self
+                    .get_metadata(*step)
                     .and_then(|m| m.literal_int)
                     .unwrap_or(1);
 
-                let end_val = self.get_metadata(*end)
+                let end_val = self
+                    .get_metadata(*end)
                     .and_then(|m| m.literal_int)
                     .ok_or_else(|| {
                         CompileError::UnsupportedInstruction(
@@ -907,11 +922,12 @@ impl<'a> IrToMirLowering<'a> {
                     .pipeline_input_reg
                     .and_then(|reg| self.get_metadata(reg))
                     .and_then(|m| m.field_type.clone())
-                    .or_else(|| self.get_metadata(src_dst).and_then(|m| m.field_type.clone()));
+                    .or_else(|| {
+                        self.get_metadata(src_dst)
+                            .and_then(|m| m.field_type.clone())
+                    });
                 let map_name = match key_type {
-                    Some(MirType::Array { elem, len })
-                        if matches!(elem.as_ref(), MirType::U8) =>
-                    {
+                    Some(MirType::Array { elem, len }) if matches!(elem.as_ref(), MirType::U8) => {
                         if len == 16 {
                             "str_counters"
                         } else {
@@ -969,7 +985,9 @@ impl<'a> IrToMirLowering<'a> {
 
             "read-str" => {
                 let ptr_vreg = self.pipeline_input.unwrap_or(dst_vreg);
-                let slot = self.func.alloc_stack_slot(128, 8, StackSlotKind::StringBuffer);
+                let slot = self
+                    .func
+                    .alloc_stack_slot(128, 8, StackSlotKind::StringBuffer);
                 self.emit(MirInst::ReadStr {
                     dst: slot,
                     ptr: ptr_vreg,
@@ -990,7 +1008,9 @@ impl<'a> IrToMirLowering<'a> {
 
             "read-kernel-str" => {
                 let ptr_vreg = self.pipeline_input.unwrap_or(dst_vreg);
-                let slot = self.func.alloc_stack_slot(128, 8, StackSlotKind::StringBuffer);
+                let slot = self
+                    .func
+                    .alloc_stack_slot(128, 8, StackSlotKind::StringBuffer);
                 self.emit(MirInst::ReadStr {
                     dst: slot,
                     ptr: ptr_vreg,
@@ -1101,7 +1121,9 @@ impl<'a> IrToMirLowering<'a> {
         var_id: nu_protocol::VarId,
     ) -> Result<(), CompileError> {
         // Check if this is the context parameter variable
-        if let Some(ctx_var) = self.ctx_param && var_id == ctx_var {
+        if let Some(ctx_var) = self.ctx_param
+            && var_id == ctx_var
+        {
             let dst_vreg = self.get_vreg(dst);
             // Mark this register as holding the context
             let meta = self.get_or_create_metadata(dst);

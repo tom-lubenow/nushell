@@ -103,11 +103,9 @@ impl MirType {
             MirType::I64 | MirType::U64 => 8,
             MirType::Ptr { .. } => 8,
             MirType::Array { elem, len } => elem.size() * len,
-            MirType::Struct { fields, .. } => {
-                fields.iter().map(|f| f.ty.size()).sum()
-            }
+            MirType::Struct { fields, .. } => fields.iter().map(|f| f.ty.size()).sum(),
             MirType::MapRef { .. } => 8, // Map FD
-            MirType::Unknown => 8, // Default to 64-bit
+            MirType::Unknown => 8,       // Default to 64-bit
         }
     }
 
@@ -304,10 +302,7 @@ pub enum CtxField {
 pub enum MirInst {
     // Data movement
     /// Copy value to virtual register
-    Copy {
-        dst: VReg,
-        src: MirValue,
-    },
+    Copy { dst: VReg, src: MirValue },
 
     /// Load from memory (stack or via pointer)
     Load {
@@ -366,11 +361,7 @@ pub enum MirInst {
     },
 
     /// Map lookup
-    MapLookup {
-        dst: VReg,
-        map: MapRef,
-        key: VReg,
-    },
+    MapLookup { dst: VReg, map: MapRef, key: VReg },
 
     /// Map update
     MapUpdate {
@@ -381,10 +372,7 @@ pub enum MirInst {
     },
 
     /// Map delete
-    MapDelete {
-        map: MapRef,
-        key: VReg,
-    },
+    MapDelete { map: MapRef, key: VReg },
 
     /// Histogram aggregation - computes log2 bucket and increments counter
     Histogram {
@@ -397,15 +385,10 @@ pub enum MirInst {
 
     /// Stop timer - looks up start time, computes delta, deletes entry
     /// Result is stored in dst (0 if no matching start)
-    StopTimer {
-        dst: VReg,
-    },
+    StopTimer { dst: VReg },
 
     /// Emit event to ring buffer
-    EmitEvent {
-        data: VReg,
-        size: usize,
-    },
+    EmitEvent { data: VReg, size: usize },
 
     /// Emit structured record to ring buffer
     EmitRecord {
@@ -415,10 +398,7 @@ pub enum MirInst {
 
     // Context access
     /// Load context field
-    LoadCtxField {
-        dst: VReg,
-        field: CtxField,
-    },
+    LoadCtxField { dst: VReg, field: CtxField },
 
     // String operations
     /// Read string from user/kernel memory
@@ -448,9 +428,7 @@ pub enum MirInst {
 
     // Control flow (terminators - must be last in block)
     /// Unconditional jump
-    Jump {
-        target: BlockId,
-    },
+    Jump { target: BlockId },
 
     /// Conditional branch
     Branch {
@@ -460,15 +438,10 @@ pub enum MirInst {
     },
 
     /// Return from program
-    Return {
-        val: Option<MirValue>,
-    },
+    Return { val: Option<MirValue> },
 
     /// Tail call to another program
-    TailCall {
-        prog_map: MapRef,
-        index: MirValue,
-    },
+    TailCall { prog_map: MapRef, index: MirValue },
 
     // Pseudo-instructions (expanded during lowering)
     /// Bounded loop header (eBPF verifier requirement)
@@ -603,7 +576,9 @@ impl BasicBlock {
     pub fn successors(&self) -> Vec<BlockId> {
         match &self.terminator {
             MirInst::Jump { target } => vec![*target],
-            MirInst::Branch { if_true, if_false, .. } => vec![*if_true, *if_false],
+            MirInst::Branch {
+                if_true, if_false, ..
+            } => vec![*if_true, *if_false],
             MirInst::LoopHeader { body, exit, .. } => vec![*body, *exit],
             MirInst::LoopBack { header, .. } => vec![*header],
             MirInst::Return { .. } | MirInst::TailCall { .. } => vec![],
@@ -647,7 +622,12 @@ impl MirFunction {
     }
 
     /// Allocate a new stack slot
-    pub fn alloc_stack_slot(&mut self, size: usize, align: usize, kind: StackSlotKind) -> StackSlotId {
+    pub fn alloc_stack_slot(
+        &mut self,
+        size: usize,
+        align: usize,
+        kind: StackSlotKind,
+    ) -> StackSlotId {
         let id = StackSlotId(self.stack_slots.len() as u32);
         self.stack_slots.push(StackSlot {
             id,

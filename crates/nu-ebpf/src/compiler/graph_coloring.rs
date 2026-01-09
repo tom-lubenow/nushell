@@ -29,7 +29,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use super::cfg::{LivenessInfo, LoopInfo, CFG};
+use super::cfg::{CFG, LivenessInfo, LoopInfo};
 use super::instruction::EbpfReg;
 use super::mir::{MirFunction, MirInst, MirValue, StackSlot, StackSlotId, StackSlotKind, VReg};
 
@@ -238,7 +238,12 @@ impl GraphColoringAllocator {
     }
 
     /// Run the full allocation algorithm
-    pub fn allocate(&mut self, func: &MirFunction, cfg: &CFG, liveness: &LivenessInfo) -> ColoringResult {
+    pub fn allocate(
+        &mut self,
+        func: &MirFunction,
+        cfg: &CFG,
+        liveness: &LivenessInfo,
+    ) -> ColoringResult {
         // Build interference graph
         self.build(func, cfg, liveness);
 
@@ -267,7 +272,8 @@ impl GraphColoringAllocator {
         self.assign_colors();
 
         // Count coalesced moves
-        let coalesced_moves = self.move_state
+        let coalesced_moves = self
+            .move_state
             .values()
             .filter(|&&s| s == MoveState::Coalesced)
             .count();
@@ -328,7 +334,11 @@ impl GraphColoringAllocator {
                 self.process_instruction_liveness(inst, &mut live, inst_idx);
 
                 // Check for move instructions that could be coalesced
-                if let MirInst::Copy { dst, src: MirValue::VReg(src) } = inst {
+                if let MirInst::Copy {
+                    dst,
+                    src: MirValue::VReg(src),
+                } = inst
+                {
                     self.graph.add_move(*src, *dst);
                 }
 
@@ -341,7 +351,12 @@ impl GraphColoringAllocator {
     }
 
     /// Build interference edges from liveness analysis
-    fn build_interference_from_liveness(&mut self, func: &MirFunction, cfg: &CFG, liveness: &LivenessInfo) {
+    fn build_interference_from_liveness(
+        &mut self,
+        func: &MirFunction,
+        cfg: &CFG,
+        liveness: &LivenessInfo,
+    ) {
         let block_order = &cfg.rpo;
 
         for &block_id in block_order {
@@ -372,7 +387,11 @@ impl GraphColoringAllocator {
         if let Some(def) = self.get_def(inst) {
             // The defined vreg interferes with all live vregs (except itself)
             // Special case for moves: don't add interference between src and dst
-            let move_src = if let MirInst::Copy { src: MirValue::VReg(src), .. } = inst {
+            let move_src = if let MirInst::Copy {
+                src: MirValue::VReg(src),
+                ..
+            } = inst
+            {
                 Some(*src)
             } else {
                 None
@@ -400,7 +419,12 @@ impl GraphColoringAllocator {
     }
 
     /// Process instruction for liveness (used during initial build)
-    fn process_instruction_liveness(&mut self, inst: &MirInst, live: &mut HashSet<VReg>, _inst_idx: usize) {
+    fn process_instruction_liveness(
+        &mut self,
+        inst: &MirInst,
+        live: &mut HashSet<VReg>,
+        _inst_idx: usize,
+    ) {
         // Add interference between all live vregs
         let live_vec: Vec<VReg> = live.iter().copied().collect();
         for i in 0..live_vec.len() {
@@ -816,7 +840,10 @@ impl GraphColoringAllocator {
             }
 
             // Find an available color
-            let available = self.available_regs.iter().find(|r| !used_colors.contains(r));
+            let available = self
+                .available_regs
+                .iter()
+                .find(|r| !used_colors.contains(r));
 
             if let Some(&reg) = available {
                 self.color.insert(vreg, reg);
@@ -841,10 +868,7 @@ impl GraphColoringAllocator {
 }
 
 /// Convenience function to perform graph coloring allocation
-pub fn allocate_registers(
-    func: &MirFunction,
-    available_regs: Vec<EbpfReg>,
-) -> ColoringResult {
+pub fn allocate_registers(func: &MirFunction, available_regs: Vec<EbpfReg>) -> ColoringResult {
     let cfg = CFG::build(func);
     let liveness = LivenessInfo::compute(func, &cfg);
     let mut allocator = GraphColoringAllocator::new(available_regs);
@@ -998,7 +1022,10 @@ mod tests {
         let result = allocate_registers(&func, available);
 
         // Should coalesce v0 and v1 to the same register
-        assert!(result.coalesced_moves > 0, "Should have coalesced at least one move");
+        assert!(
+            result.coalesced_moves > 0,
+            "Should have coalesced at least one move"
+        );
 
         // v0 and v1 should have the same color
         let v0_color = result.coloring.get(&VReg(0));

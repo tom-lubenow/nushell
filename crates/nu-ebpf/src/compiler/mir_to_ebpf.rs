@@ -20,16 +20,18 @@
 
 use std::collections::HashMap;
 
-use crate::compiler::cfg::{LivenessInfo, CFG};
-use crate::compiler::elf::{BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext, SchemaField};
+use crate::compiler::CompileError;
+use crate::compiler::cfg::{CFG, LivenessInfo};
+use crate::compiler::elf::{
+    BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext, SchemaField,
+};
 use crate::compiler::graph_coloring::GraphColoringAllocator;
-use crate::compiler::instruction::{opcode, BpfHelper, EbpfInsn, EbpfReg};
-use crate::compiler::type_infer::TypeInference;
+use crate::compiler::instruction::{BpfHelper, EbpfInsn, EbpfReg, opcode};
 use crate::compiler::mir::{
     BasicBlock, BinOpKind, BlockId, CtxField, MirFunction, MirInst, MirProgram, MirType, MirValue,
     RecordFieldDef, StackSlot, StackSlotId, StackSlotKind, UnaryOpKind, VReg,
 };
-use crate::compiler::CompileError;
+use crate::compiler::type_infer::TypeInference;
 use crate::kernel_btf::KernelBtf;
 
 /// Ring buffer map name
@@ -327,7 +329,8 @@ impl<'a> MirToEbpfCompiler<'a> {
                     MirValue::VReg(v) => {
                         let src_reg = self.ensure_reg(*v)?;
                         if dst_reg != src_reg {
-                            self.instructions.push(EbpfInsn::mov64_reg(dst_reg, src_reg));
+                            self.instructions
+                                .push(EbpfInsn::mov64_reg(dst_reg, src_reg));
                         }
                     }
                     MirValue::Const(c) => {
@@ -340,7 +343,8 @@ impl<'a> MirToEbpfCompiler<'a> {
                             let high = (*c >> 32) as i32;
                             self.instructions.push(EbpfInsn::mov64_imm(dst_reg, low));
                             if high != 0 {
-                                self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R0, high));
+                                self.instructions
+                                    .push(EbpfInsn::mov64_imm(EbpfReg::R0, high));
                                 self.instructions.push(EbpfInsn::lsh64_imm(EbpfReg::R0, 32));
                                 self.instructions
                                     .push(EbpfInsn::or64_reg(dst_reg, EbpfReg::R0));
@@ -402,7 +406,8 @@ impl<'a> MirToEbpfCompiler<'a> {
                     MirValue::VReg(v) => {
                         let src_reg = self.ensure_reg(*v)?;
                         if dst_reg != src_reg {
-                            self.instructions.push(EbpfInsn::mov64_reg(dst_reg, src_reg));
+                            self.instructions
+                                .push(EbpfInsn::mov64_reg(dst_reg, src_reg));
                         }
                     }
                     MirValue::Const(c) => {
@@ -504,7 +509,8 @@ impl<'a> MirToEbpfCompiler<'a> {
                     Some(MirValue::VReg(v)) => {
                         let src = self.ensure_reg(*v)?;
                         if src != EbpfReg::R0 {
-                            self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R0, src));
+                            self.instructions
+                                .push(EbpfInsn::mov64_reg(EbpfReg::R0, src));
                         }
                     }
                     Some(MirValue::Const(c)) => {
@@ -540,7 +546,12 @@ impl<'a> MirToEbpfCompiler<'a> {
                 self.compile_stop_timer(dst_reg)?;
             }
 
-            MirInst::LoopHeader { counter, limit, body, exit } => {
+            MirInst::LoopHeader {
+                counter,
+                limit,
+                body,
+                exit,
+            } => {
                 // Bounded loop header for eBPF verifier compliance
                 // counter < limit ? jump to body : jump to exit
                 let counter_reg = self.ensure_reg(*counter)?;
@@ -563,12 +574,17 @@ impl<'a> MirToEbpfCompiler<'a> {
                 self.pending_jumps.push((jmp_idx, *exit));
             }
 
-            MirInst::LoopBack { counter, step, header } => {
+            MirInst::LoopBack {
+                counter,
+                step,
+                header,
+            } => {
                 // Increment counter and jump back to header
                 let counter_reg = self.ensure_reg(*counter)?;
 
                 // Add step to counter
-                self.instructions.push(EbpfInsn::add64_imm(counter_reg, *step as i32));
+                self.instructions
+                    .push(EbpfInsn::add64_imm(counter_reg, *step as i32));
 
                 // Jump back to loop header
                 let jmp_idx = self.instructions.len();
@@ -576,7 +592,10 @@ impl<'a> MirToEbpfCompiler<'a> {
                 self.pending_jumps.push((jmp_idx, *header));
             }
 
-            MirInst::TailCall { prog_map: _, index: _ } => {
+            MirInst::TailCall {
+                prog_map: _,
+                index: _,
+            } => {
                 return Err(CompileError::UnsupportedInstruction(
                     "Tail calls not yet implemented in MIR compiler".into(),
                 ));
@@ -826,7 +845,9 @@ impl<'a> MirToEbpfCompiler<'a> {
                     .push(EbpfInsn::ldxdw(dst, EbpfReg::R9, offset));
             }
             CtxField::RetVal => {
-                if let Some(ctx) = self.probe_ctx && !ctx.is_return_probe() {
+                if let Some(ctx) = self.probe_ctx
+                    && !ctx.is_return_probe()
+                {
                     return Err(CompileError::RetvalOnNonReturnProbe);
                 }
                 let offsets = KernelBtf::get().pt_regs_offsets().map_err(|e| {
@@ -872,12 +893,12 @@ impl<'a> MirToEbpfCompiler<'a> {
                 })?;
 
                 // Look up the field in the tracepoint context
-                let field_info = ctx.get_field(name).ok_or_else(|| {
-                    CompileError::TracepointFieldNotFound {
-                        field: name.clone(),
-                        available: ctx.field_names().join(", "),
-                    }
-                })?;
+                let field_info =
+                    ctx.get_field(name)
+                        .ok_or_else(|| CompileError::TracepointFieldNotFound {
+                            field: name.clone(),
+                            available: ctx.field_names().join(", "),
+                        })?;
 
                 // Load the field from the context struct
                 // R9 contains the saved context pointer (tracepoint context struct)
@@ -886,17 +907,21 @@ impl<'a> MirToEbpfCompiler<'a> {
                 // Choose load instruction based on field size
                 match field_info.size {
                     1 => {
-                        self.instructions.push(EbpfInsn::ldxb(dst, EbpfReg::R9, offset));
+                        self.instructions
+                            .push(EbpfInsn::ldxb(dst, EbpfReg::R9, offset));
                     }
                     2 => {
-                        self.instructions.push(EbpfInsn::ldxh(dst, EbpfReg::R9, offset));
+                        self.instructions
+                            .push(EbpfInsn::ldxh(dst, EbpfReg::R9, offset));
                     }
                     4 => {
-                        self.instructions.push(EbpfInsn::ldxw(dst, EbpfReg::R9, offset));
+                        self.instructions
+                            .push(EbpfInsn::ldxw(dst, EbpfReg::R9, offset));
                     }
                     _ => {
                         // Default to 64-bit load for 8+ byte fields
-                        self.instructions.push(EbpfInsn::ldxdw(dst, EbpfReg::R9, offset));
+                        self.instructions
+                            .push(EbpfInsn::ldxdw(dst, EbpfReg::R9, offset));
                     }
                 }
             }
@@ -929,10 +954,12 @@ impl<'a> MirToEbpfCompiler<'a> {
         });
 
         // R3 = flags
-        self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R3, flags));
+        self.instructions
+            .push(EbpfInsn::mov64_imm(EbpfReg::R3, flags));
 
         // Call bpf_get_stackid
-        self.instructions.push(EbpfInsn::call(BpfHelper::GetStackId));
+        self.instructions
+            .push(EbpfInsn::call(BpfHelper::GetStackId));
 
         // Result (stack ID or negative error) is in R0, move to destination
         self.instructions
@@ -1124,7 +1151,11 @@ impl<'a> MirToEbpfCompiler<'a> {
     /// Compile map update (for count operation)
     fn compile_map_update(&mut self, map_name: &str, key_reg: EbpfReg) -> Result<(), CompileError> {
         // For count: lookup key, increment, update
-        let key_size = if map_name == STRING_COUNTER_MAP_NAME { 16 } else { 8 };
+        let key_size = if map_name == STRING_COUNTER_MAP_NAME {
+            16
+        } else {
+            8
+        };
         let total_size = key_size + 8; // key + value
         self.check_stack_space(total_size as i16)?;
         // Stack grows downward - decrement first
@@ -1169,8 +1200,7 @@ impl<'a> MirToEbpfCompiler<'a> {
 
         // If null, initialize to 0; else load and increment
         let jmp_to_init = self.instructions.len();
-        self.instructions
-            .push(EbpfInsn::jeq_imm(EbpfReg::R0, 0, 0)); // Placeholder
+        self.instructions.push(EbpfInsn::jeq_imm(EbpfReg::R0, 0, 0)); // Placeholder
 
         // Load current value, increment
         self.instructions
@@ -1187,8 +1217,7 @@ impl<'a> MirToEbpfCompiler<'a> {
 
         // update:
         let update_idx = self.instructions.len();
-        self.instructions[jmp_to_update] =
-            EbpfInsn::jump((update_idx - jmp_to_update - 1) as i16);
+        self.instructions[jmp_to_update] = EbpfInsn::jump((update_idx - jmp_to_update - 1) as i16);
 
         // Store new value to stack
         self.instructions
@@ -1357,7 +1386,8 @@ impl<'a> MirToEbpfCompiler<'a> {
 
         // Compute log2 bucket using binary search
         // Save value to R0 for manipulation, bucket accumulator in R1
-        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R0, value_reg));
+        self.instructions
+            .push(EbpfInsn::mov64_reg(EbpfReg::R0, value_reg));
         self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R1, 0));
 
         // If value <= 0, bucket = 0
@@ -1365,7 +1395,10 @@ impl<'a> MirToEbpfCompiler<'a> {
         let skip_log2_idx = self.instructions.len();
         self.instructions.push(EbpfInsn::new(
             opcode::BPF_JMP | opcode::BPF_JSLE | opcode::BPF_K,
-            EbpfReg::R0.as_u8(), 0, 0, 0, // offset placeholder
+            EbpfReg::R0.as_u8(),
+            0,
+            0,
+            0, // offset placeholder
         ));
 
         // Binary search for highest bit
@@ -1382,7 +1415,8 @@ impl<'a> MirToEbpfCompiler<'a> {
         self.instructions[skip_log2_idx].offset = skip_log2_offset;
 
         // Store bucket (R1) to stack
-        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R10, key_offset, EbpfReg::R1));
+        self.instructions
+            .push(EbpfInsn::stxdw(EbpfReg::R10, key_offset, EbpfReg::R1));
 
         // Map lookup
         let lookup_reloc = self.instructions.len() * 8;
@@ -1394,21 +1428,29 @@ impl<'a> MirToEbpfCompiler<'a> {
             map_name: HISTOGRAM_MAP_NAME.to_string(),
         });
 
-        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
-        self.instructions.push(EbpfInsn::call(BpfHelper::MapLookupElem));
+        self.instructions
+            .push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.instructions
+            .push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
+        self.instructions
+            .push(EbpfInsn::call(BpfHelper::MapLookupElem));
 
         // If NULL, jump to init
         let init_idx = self.instructions.len();
         self.instructions.push(EbpfInsn::new(
             opcode::BPF_JMP | opcode::BPF_JEQ | opcode::BPF_K,
-            EbpfReg::R0.as_u8(), 0, 0, 0,
+            EbpfReg::R0.as_u8(),
+            0,
+            0,
+            0,
         ));
 
         // Exists - increment in place
-        self.instructions.push(EbpfInsn::ldxdw(EbpfReg::R1, EbpfReg::R0, 0));
+        self.instructions
+            .push(EbpfInsn::ldxdw(EbpfReg::R1, EbpfReg::R0, 0));
         self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R1, 1));
-        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R0, 0, EbpfReg::R1));
+        self.instructions
+            .push(EbpfInsn::stxdw(EbpfReg::R0, 0, EbpfReg::R1));
 
         // Jump to done
         let done_jmp_idx = self.instructions.len();
@@ -1420,7 +1462,8 @@ impl<'a> MirToEbpfCompiler<'a> {
 
         // Store 1 to value
         self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R1, 1));
-        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R10, value_offset, EbpfReg::R1));
+        self.instructions
+            .push(EbpfInsn::stxdw(EbpfReg::R10, value_offset, EbpfReg::R1));
 
         // Map update
         let update_reloc = self.instructions.len() * 8;
@@ -1432,12 +1475,17 @@ impl<'a> MirToEbpfCompiler<'a> {
             map_name: HISTOGRAM_MAP_NAME.to_string(),
         });
 
-        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
-        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R3, EbpfReg::R10));
-        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R3, value_offset as i32));
+        self.instructions
+            .push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.instructions
+            .push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
+        self.instructions
+            .push(EbpfInsn::mov64_reg(EbpfReg::R3, EbpfReg::R10));
+        self.instructions
+            .push(EbpfInsn::add64_imm(EbpfReg::R3, value_offset as i32));
         self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R4, 0)); // BPF_ANY
-        self.instructions.push(EbpfInsn::call(BpfHelper::MapUpdateElem));
+        self.instructions
+            .push(EbpfInsn::call(BpfHelper::MapUpdateElem));
 
         // Done
         let done_offset = (self.instructions.len() - done_jmp_idx - 1) as i16;
@@ -1451,7 +1499,8 @@ impl<'a> MirToEbpfCompiler<'a> {
         if bits >= 32 {
             // Need 64-bit compare against a register
             self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R2, 1));
-            self.instructions.push(EbpfInsn::lsh64_imm(EbpfReg::R2, bits));
+            self.instructions
+                .push(EbpfInsn::lsh64_imm(EbpfReg::R2, bits));
             self.instructions.push(EbpfInsn::new(
                 opcode::BPF_JMP | opcode::BPF_JLT | opcode::BPF_X,
                 EbpfReg::R0.as_u8(),
@@ -1469,8 +1518,10 @@ impl<'a> MirToEbpfCompiler<'a> {
                 1 << bits,
             ));
         }
-        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R1, bits));
-        self.instructions.push(EbpfInsn::rsh64_imm(EbpfReg::R0, bits));
+        self.instructions
+            .push(EbpfInsn::add64_imm(EbpfReg::R1, bits));
+        self.instructions
+            .push(EbpfInsn::rsh64_imm(EbpfReg::R0, bits));
         Ok(())
     }
 
@@ -1483,12 +1534,16 @@ impl<'a> MirToEbpfCompiler<'a> {
         self.stack_offset -= 16;
 
         // Get current pid_tgid as key
-        self.instructions.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
-        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R10, key_offset, EbpfReg::R0));
+        self.instructions
+            .push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
+        self.instructions
+            .push(EbpfInsn::stxdw(EbpfReg::R10, key_offset, EbpfReg::R0));
 
         // Get current time
-        self.instructions.push(EbpfInsn::call(BpfHelper::KtimeGetNs));
-        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R10, value_offset, EbpfReg::R0));
+        self.instructions
+            .push(EbpfInsn::call(BpfHelper::KtimeGetNs));
+        self.instructions
+            .push(EbpfInsn::stxdw(EbpfReg::R10, value_offset, EbpfReg::R0));
 
         // Map update
         let update_reloc = self.instructions.len() * 8;
@@ -1500,12 +1555,17 @@ impl<'a> MirToEbpfCompiler<'a> {
             map_name: TIMESTAMP_MAP_NAME.to_string(),
         });
 
-        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
-        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R3, EbpfReg::R10));
-        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R3, value_offset as i32));
+        self.instructions
+            .push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.instructions
+            .push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
+        self.instructions
+            .push(EbpfInsn::mov64_reg(EbpfReg::R3, EbpfReg::R10));
+        self.instructions
+            .push(EbpfInsn::add64_imm(EbpfReg::R3, value_offset as i32));
         self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R4, 0)); // BPF_ANY
-        self.instructions.push(EbpfInsn::call(BpfHelper::MapUpdateElem));
+        self.instructions
+            .push(EbpfInsn::call(BpfHelper::MapUpdateElem));
 
         Ok(())
     }
@@ -1519,8 +1579,10 @@ impl<'a> MirToEbpfCompiler<'a> {
         self.stack_offset -= 16;
 
         // Get current pid_tgid as key
-        self.instructions.push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
-        self.instructions.push(EbpfInsn::stxdw(EbpfReg::R10, key_offset, EbpfReg::R0));
+        self.instructions
+            .push(EbpfInsn::call(BpfHelper::GetCurrentPidTgid));
+        self.instructions
+            .push(EbpfInsn::stxdw(EbpfReg::R10, key_offset, EbpfReg::R0));
 
         // Map lookup
         let lookup_reloc = self.instructions.len() * 8;
@@ -1532,15 +1594,21 @@ impl<'a> MirToEbpfCompiler<'a> {
             map_name: TIMESTAMP_MAP_NAME.to_string(),
         });
 
-        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
-        self.instructions.push(EbpfInsn::call(BpfHelper::MapLookupElem));
+        self.instructions
+            .push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.instructions
+            .push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
+        self.instructions
+            .push(EbpfInsn::call(BpfHelper::MapLookupElem));
 
         // If NULL, return 0
         let no_timer_idx = self.instructions.len();
         self.instructions.push(EbpfInsn::new(
             opcode::BPF_JMP | opcode::BPF_JEQ | opcode::BPF_K,
-            EbpfReg::R0.as_u8(), 0, 0, 0,
+            EbpfReg::R0.as_u8(),
+            0,
+            0,
+            0,
         ));
 
         // Load start timestamp and store it on stack
@@ -1550,16 +1618,19 @@ impl<'a> MirToEbpfCompiler<'a> {
             .push(EbpfInsn::stxdw(EbpfReg::R10, start_offset, EbpfReg::R1));
 
         // Get current time
-        self.instructions.push(EbpfInsn::call(BpfHelper::KtimeGetNs));
+        self.instructions
+            .push(EbpfInsn::call(BpfHelper::KtimeGetNs));
 
         // Reload start timestamp and compute delta = current - start
         self.instructions
             .push(EbpfInsn::ldxdw(EbpfReg::R1, EbpfReg::R10, start_offset));
-        self.instructions.push(EbpfInsn::sub64_reg(EbpfReg::R0, EbpfReg::R1));
+        self.instructions
+            .push(EbpfInsn::sub64_reg(EbpfReg::R0, EbpfReg::R1));
 
         // Save delta to dst_reg
         if dst_reg != EbpfReg::R0 {
-            self.instructions.push(EbpfInsn::mov64_reg(dst_reg, EbpfReg::R0));
+            self.instructions
+                .push(EbpfInsn::mov64_reg(dst_reg, EbpfReg::R0));
         }
 
         // Delete map entry
@@ -1572,9 +1643,12 @@ impl<'a> MirToEbpfCompiler<'a> {
             map_name: TIMESTAMP_MAP_NAME.to_string(),
         });
 
-        self.instructions.push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
-        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
-        self.instructions.push(EbpfInsn::call(BpfHelper::MapDeleteElem));
+        self.instructions
+            .push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+        self.instructions
+            .push(EbpfInsn::add64_imm(EbpfReg::R2, key_offset as i32));
+        self.instructions
+            .push(EbpfInsn::call(BpfHelper::MapDeleteElem));
 
         // Jump to done
         let done_jmp_idx = self.instructions.len();
@@ -1606,9 +1680,9 @@ pub fn compile_mir_to_ebpf(
 mod tests {
     use super::*;
     use crate::compiler::ir_to_mir::lower_ir_to_mir;
-    use nu_protocol::ast::{Math, Operator};
-    use nu_protocol::ir::{IrBlock, Instruction, Literal};
     use nu_protocol::RegId;
+    use nu_protocol::ast::{Math, Operator};
+    use nu_protocol::ir::{Instruction, IrBlock, Literal};
     use std::sync::Arc;
 
     fn make_ir_block(instructions: Vec<Instruction>) -> IrBlock {
@@ -1637,7 +1711,11 @@ mod tests {
         let mir_program = lower_ir_to_mir(&ir, None, None, &[], None).unwrap();
         let mir_result = compile_mir_to_ebpf(&mir_program, None).unwrap();
         assert!(!mir_result.bytecode.is_empty(), "Should produce bytecode");
-        assert_eq!(mir_result.bytecode.len() % 8, 0, "Bytecode should be aligned to 8 bytes");
+        assert_eq!(
+            mir_result.bytecode.len() % 8,
+            0,
+            "Bytecode should be aligned to 8 bytes"
+        );
     }
 
     /// Test valid bytecode for addition
@@ -1817,7 +1895,9 @@ mod tests {
             dst: VReg(0),
             src: MirValue::Const(42),
         });
-        entry.instructions.push(MirInst::Histogram { value: VReg(0) });
+        entry
+            .instructions
+            .push(MirInst::Histogram { value: VReg(0) });
         entry.terminator = MirInst::Return {
             val: Some(MirValue::Const(0)),
         };
@@ -1914,7 +1994,10 @@ mod tests {
         };
 
         let result = compile_mir_to_ebpf(&program, None).unwrap();
-        assert!(!result.bytecode.is_empty(), "Loop compile produced empty bytecode");
+        assert!(
+            !result.bytecode.is_empty(),
+            "Loop compile produced empty bytecode"
+        );
     }
 
     // ==================== Additional Parity Tests ====================
@@ -2506,10 +2589,9 @@ mod tests {
             dst: v0,
             src: MirValue::StackSlot(slot),
         });
-        func.block_mut(entry).instructions.push(MirInst::EmitEvent {
-            data: v0,
-            size: 16,
-        });
+        func.block_mut(entry)
+            .instructions
+            .push(MirInst::EmitEvent { data: v0, size: 16 });
         func.block_mut(entry).terminator = MirInst::Return {
             val: Some(MirValue::Const(0)),
         };
@@ -2526,7 +2608,10 @@ mod tests {
         compiler.fixup_jumps().unwrap();
 
         // After graph coloring, VReg(0) should be assigned a register
-        let data_reg = compiler.vreg_to_phys.get(&VReg(0)).copied()
+        let data_reg = compiler
+            .vreg_to_phys
+            .get(&VReg(0))
+            .copied()
             .expect("VReg(0) should be assigned a physical register by graph coloring");
         let saw_copy = compiler.instructions.iter().any(|insn| {
             insn.opcode == (opcode::BPF_LDX | opcode::BPF_DW | opcode::BPF_MEM)

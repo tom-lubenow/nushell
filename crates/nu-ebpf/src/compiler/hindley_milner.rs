@@ -439,7 +439,9 @@ pub fn unify(t1: &HMType, t2: &HMType) -> Result<Substitution, UnifyError> {
         // Type variable unification
         (HMType::Var(v), ty) | (ty, HMType::Var(v)) => {
             // Same variable unifies with itself
-            if let HMType::Var(v2) = ty && v == v2 {
+            if let HMType::Var(v2) = ty
+                && v == v2
+            {
                 return Ok(Substitution::new());
             }
             // Occurs check: prevent infinite types like α = α → β
@@ -488,10 +490,7 @@ pub fn unify(t1: &HMType, t2: &HMType) -> Result<Substitution, UnifyError> {
         }
 
         // Array unification
-        (
-            HMType::Array { elem: e1, len: l1 },
-            HMType::Array { elem: e2, len: l2 },
-        ) => {
+        (HMType::Array { elem: e1, len: l1 }, HMType::Array { elem: e2, len: l2 }) => {
             if l1 != l2 {
                 return Err(UnifyError::new(
                     t1.clone(),
@@ -517,10 +516,7 @@ pub fn unify(t1: &HMType, t2: &HMType) -> Result<Substitution, UnifyError> {
                 return Err(UnifyError::new(
                     t1.clone(),
                     t2.clone(),
-                    format!(
-                        "struct names don't match: {:?} vs {:?}",
-                        n1, n2
-                    ),
+                    format!("struct names don't match: {:?} vs {:?}", n1, n2),
                 ));
             }
             if f1.len() != f2.len() {
@@ -562,16 +558,7 @@ pub fn unify(t1: &HMType, t2: &HMType) -> Result<Substitution, UnifyError> {
         }
 
         // Function type unification
-        (
-            HMType::Fn {
-                args: a1,
-                ret: r1,
-            },
-            HMType::Fn {
-                args: a2,
-                ret: r2,
-            },
-        ) => {
+        (HMType::Fn { args: a1, ret: r1 }, HMType::Fn { args: a2, ret: r2 }) => {
             if a1.len() != a2.len() {
                 return Err(UnifyError::new(
                     t1.clone(),
@@ -593,11 +580,7 @@ pub fn unify(t1: &HMType, t2: &HMType) -> Result<Substitution, UnifyError> {
         }
 
         // Types don't match
-        _ => Err(UnifyError::new(
-            t1.clone(),
-            t2.clone(),
-            "types don't match",
-        )),
+        _ => Err(UnifyError::new(t1.clone(), t2.clone(), "types don't match")),
     }
 }
 

@@ -33,7 +33,7 @@ pub use elf::{
     ProbeContext, SchemaField,
 };
 pub use instruction::{BpfHelper, EbpfInsn, EbpfReg};
-pub use mir_to_ebpf::{compile_mir_to_ebpf, MirCompileResult};
+pub use mir_to_ebpf::{MirCompileResult, compile_mir_to_ebpf};
 pub use type_infer::{TypeError, TypeInference};
 
 use thiserror::Error;

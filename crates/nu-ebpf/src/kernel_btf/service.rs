@@ -13,7 +13,7 @@ use std::sync::{OnceLock, RwLock};
 
 use btf::Btf;
 
-use super::pt_regs::{fallback_offsets, offsets_from_btf, PtRegsError, PtRegsOffsets};
+use super::pt_regs::{PtRegsError, PtRegsOffsets, fallback_offsets, offsets_from_btf};
 use super::tracepoint::TracepointContext;
 use super::types::{FieldInfo, TypeInfo};
 
@@ -192,8 +192,7 @@ impl KernelBtf {
 
     fn load_kernel_btf(&self) -> Result<Btf, PtRegsError> {
         let path = "/sys/kernel/btf/vmlinux";
-        Btf::from_file(path)
-            .map_err(|e| PtRegsError::new(format!("failed to parse {path}: {e}")))
+        Btf::from_file(path).map_err(|e| PtRegsError::new(format!("failed to parse {path}: {e}")))
     }
 
     /// Load the list of available kernel functions (lazy, cached)

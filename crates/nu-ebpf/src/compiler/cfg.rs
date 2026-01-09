@@ -52,10 +52,7 @@ impl CFG {
 
             // Add this block as predecessor to each successor
             for succ in succs {
-                cfg.predecessors
-                    .entry(succ)
-                    .or_default()
-                    .push(block.id);
+                cfg.predecessors.entry(succ).or_default().push(block.id);
             }
         }
 
@@ -111,12 +108,8 @@ impl CFG {
         }
 
         // Map block IDs to RPO indices
-        let rpo_index: HashMap<BlockId, usize> = self
-            .rpo
-            .iter()
-            .enumerate()
-            .map(|(i, &b)| (b, i))
-            .collect();
+        let rpo_index: HashMap<BlockId, usize> =
+            self.rpo.iter().enumerate().map(|(i, &b)| (b, i)).collect();
 
         // Initialize: entry dominates itself
         let mut doms: HashMap<BlockId, Option<BlockId>> = HashMap::new();
@@ -136,7 +129,11 @@ impl CFG {
                 }
 
                 // Find first processed predecessor
-                let preds = self.predecessors.get(&block_id).cloned().unwrap_or_default();
+                let preds = self
+                    .predecessors
+                    .get(&block_id)
+                    .cloned()
+                    .unwrap_or_default();
                 let mut new_idom = None;
 
                 for &pred in &preds {
@@ -167,7 +164,9 @@ impl CFG {
 
         // Store results
         for (block_id, dom) in doms {
-            if let Some(idom) = dom && block_id != idom {
+            if let Some(idom) = dom
+                && block_id != idom
+            {
                 self.idom.insert(block_id, idom);
             }
         }
@@ -338,7 +337,13 @@ impl LivenessInfo {
     }
 
     /// Check if a virtual register is live at a specific point
-    pub fn is_live_at(&self, vreg: VReg, block: BlockId, inst_idx: usize, func: &MirFunction) -> bool {
+    pub fn is_live_at(
+        &self,
+        vreg: VReg,
+        block: BlockId,
+        inst_idx: usize,
+        func: &MirFunction,
+    ) -> bool {
         // A vreg is live at a point if:
         // 1. It's used after this point in the same block, OR
         // 2. It's in live_out of this block
@@ -384,7 +389,11 @@ impl LiveInterval {
 }
 
 /// Compute live intervals from liveness info (for linear scan register allocation)
-pub fn compute_live_intervals(func: &MirFunction, cfg: &CFG, liveness: &LivenessInfo) -> Vec<LiveInterval> {
+pub fn compute_live_intervals(
+    func: &MirFunction,
+    cfg: &CFG,
+    liveness: &LivenessInfo,
+) -> Vec<LiveInterval> {
     // Linearize the program: assign a global index to each instruction
     let mut inst_index: HashMap<(BlockId, usize), usize> = HashMap::new();
     let mut current_idx = 0;
@@ -513,10 +522,7 @@ impl LoopInfo {
             }
 
             // Merge with existing loop for this header (loops can have multiple back edges)
-            info.loops
-                .entry(header)
-                .or_default()
-                .extend(loop_blocks);
+            info.loops.entry(header).or_default().extend(loop_blocks);
         }
 
         // Compute loop depths
@@ -638,11 +644,29 @@ mod tests {
         let liveness = LivenessInfo::compute(&func, &cfg);
 
         // v0 should be live in bb1 and bb2 (used there)
-        assert!(liveness.live_in.get(&BlockId(1)).unwrap().contains(&VReg(0)));
-        assert!(liveness.live_in.get(&BlockId(2)).unwrap().contains(&VReg(0)));
+        assert!(
+            liveness
+                .live_in
+                .get(&BlockId(1))
+                .unwrap()
+                .contains(&VReg(0))
+        );
+        assert!(
+            liveness
+                .live_in
+                .get(&BlockId(2))
+                .unwrap()
+                .contains(&VReg(0))
+        );
 
         // v1 should be live in bb3 (used in return)
-        assert!(liveness.live_in.get(&BlockId(3)).unwrap().contains(&VReg(1)));
+        assert!(
+            liveness
+                .live_in
+                .get(&BlockId(3))
+                .unwrap()
+                .contains(&VReg(1))
+        );
     }
 
     #[test]

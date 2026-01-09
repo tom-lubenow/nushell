@@ -40,9 +40,7 @@ impl StrengthReduction {
     /// Try to reduce an instruction to a cheaper form
     fn reduce(&self, inst: &MirInst) -> Option<MirInst> {
         match inst {
-            MirInst::BinOp { dst, op, lhs, rhs } => {
-                self.reduce_binop(*dst, *op, lhs, rhs)
-            }
+            MirInst::BinOp { dst, op, lhs, rhs } => self.reduce_binop(*dst, *op, lhs, rhs),
             _ => None,
         }
     }
@@ -297,7 +295,11 @@ mod tests {
 
         let reduced = sr.reduce(&inst).unwrap();
         match reduced {
-            MirInst::BinOp { op: BinOpKind::Shl, rhs: MirValue::Const(3), .. } => {}
+            MirInst::BinOp {
+                op: BinOpKind::Shl,
+                rhs: MirValue::Const(3),
+                ..
+            } => {}
             _ => panic!("Expected shift left by 3, got {:?}", reduced),
         }
     }
@@ -318,7 +320,11 @@ mod tests {
 
         let reduced = sr.reduce(&inst).unwrap();
         match reduced {
-            MirInst::BinOp { op: BinOpKind::Shr, rhs: MirValue::Const(4), .. } => {}
+            MirInst::BinOp {
+                op: BinOpKind::Shr,
+                rhs: MirValue::Const(4),
+                ..
+            } => {}
             _ => panic!("Expected shift right by 4, got {:?}", reduced),
         }
     }
@@ -339,7 +345,11 @@ mod tests {
 
         let reduced = sr.reduce(&inst).unwrap();
         match reduced {
-            MirInst::BinOp { op: BinOpKind::And, rhs: MirValue::Const(7), .. } => {}
+            MirInst::BinOp {
+                op: BinOpKind::And,
+                rhs: MirValue::Const(7),
+                ..
+            } => {}
             _ => panic!("Expected AND with 7, got {:?}", reduced),
         }
     }
@@ -360,7 +370,10 @@ mod tests {
 
         let reduced = sr.reduce(&inst).unwrap();
         match reduced {
-            MirInst::Copy { src: MirValue::Const(0), .. } => {}
+            MirInst::Copy {
+                src: MirValue::Const(0),
+                ..
+            } => {}
             _ => panic!("Expected copy of 0, got {:?}", reduced),
         }
     }

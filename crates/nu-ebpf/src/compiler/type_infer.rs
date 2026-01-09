@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use super::elf::{EbpfProgramType, ProbeContext};
 use super::hindley_milner::{
-    unify, Constraint, HMType, Substitution, TypeVar, TypeVarGenerator, UnifyError,
+    Constraint, HMType, Substitution, TypeVar, TypeVarGenerator, UnifyError, unify,
 };
 use super::mir::{
     AddressSpace, BasicBlock, BinOpKind, CtxField, MirFunction, MirInst, MirType, MirValue,
@@ -286,7 +286,8 @@ impl TypeInference {
 
     /// Add a constraint
     fn constrain(&mut self, expected: HMType, actual: HMType, context: impl Into<String>) {
-        self.constraints.push(Constraint::new(expected, actual, context));
+        self.constraints
+            .push(Constraint::new(expected, actual, context));
     }
 
     /// Get the type of a context field based on probe type
@@ -367,13 +368,9 @@ impl TypeInference {
                 Ok(self.promote_numeric(lhs, rhs))
             }
 
-            BinOpKind::Mul | BinOpKind::Div | BinOpKind::Mod => {
-                Ok(self.promote_numeric(lhs, rhs))
-            }
+            BinOpKind::Mul | BinOpKind::Div | BinOpKind::Mod => Ok(self.promote_numeric(lhs, rhs)),
 
-            BinOpKind::And | BinOpKind::Or | BinOpKind::Xor => {
-                Ok(self.promote_numeric(lhs, rhs))
-            }
+            BinOpKind::And | BinOpKind::Or | BinOpKind::Xor => Ok(self.promote_numeric(lhs, rhs)),
 
             BinOpKind::Shl | BinOpKind::Shr => {
                 // Shift result type is lhs type

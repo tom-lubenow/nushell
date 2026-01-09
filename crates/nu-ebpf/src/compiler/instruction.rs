@@ -289,7 +289,13 @@ impl EbpfInsn {
 
     /// AND32 dst, imm - Bitwise AND lower 32 bits with immediate (zeros upper bits)
     pub const fn and32_imm(dst: EbpfReg, imm: i32) -> Self {
-        Self::new(opcode::BPF_ALU | opcode::BPF_AND | opcode::BPF_K, dst.as_u8(), 0, 0, imm)
+        Self::new(
+            opcode::BPF_ALU | opcode::BPF_AND | opcode::BPF_K,
+            dst.as_u8(),
+            0,
+            0,
+            imm,
+        )
     }
 
     /// AND64 dst, src - Bitwise AND register with register

@@ -289,7 +289,7 @@ impl KernelBtf {
                 let dist = Self::edit_distance(name, f);
                 // Only consider functions within a reasonable edit distance
                 // Allow more distance for longer function names
-                let max_dist = (name.len() / 3).max(2).min(5);
+                let max_dist = (name.len() / 3).clamp(2, 5);
                 if dist <= max_dist {
                     Some((f.clone(), dist))
                 } else {
@@ -548,7 +548,7 @@ impl KernelBtf {
 
         // Handle array types (detected by looking at size vs typical sizes)
         // For syscall args: unsigned long args[6] has size 48
-        if type_str.contains('[') || (size > 8 && size % 8 == 0) {
+        if type_str.contains('[') || (size > 8 && size.is_multiple_of(8)) {
             let elem_size = 8; // Assume 64-bit elements
             let len = size / elem_size;
             return TypeInfo::Array {
@@ -605,10 +605,10 @@ impl KernelBtf {
             let category_path = format!("{}/{}", events_path, category);
             if let Ok(entries) = fs::read_dir(&category_path) {
                 for entry in entries.flatten() {
-                    if entry.path().is_dir() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            tracepoints.push(name.to_string());
-                        }
+                    if entry.path().is_dir()
+                        && let Some(name) = entry.file_name().to_str()
+                    {
+                        tracepoints.push(name.to_string());
                     }
                 }
             }

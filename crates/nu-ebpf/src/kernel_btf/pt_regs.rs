@@ -100,7 +100,7 @@ fn extract_regs_array(member: &StructMember, btf: &Btf) -> Result<PtRegsArray, P
     if elem_bits == 0 {
         return Err(PtRegsError::new("pt_regs.regs element has zero size".to_string()));
     }
-    let elem_size_bytes = (elem_bits + 7) / 8;
+    let elem_size_bytes = elem_bits.div_ceil(8);
 
     Ok(PtRegsArray {
         offset_bits: member.offset,
@@ -193,7 +193,7 @@ fn bits_to_i16(bits: u32, label: &str) -> Result<i16, PtRegsError> {
 }
 
 fn bits_to_i32(bits: u32, label: &str) -> Result<i32, PtRegsError> {
-    if bits % 8 != 0 {
+    if !bits.is_multiple_of(8) {
         return Err(PtRegsError::new(format!(
             "pt_regs {label} offset not byte-aligned"
         )));

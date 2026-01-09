@@ -109,15 +109,15 @@ impl ConstantFolding {
             MirInst::UnaryOp { dst, op, src } => {
                 let src_val = self.get_const_value(src, constants);
 
-                if let Some(s) = src_val {
-                    if let Some(result) = self.eval_unaryop(*op, s) {
-                        constants.insert(*dst, result);
-                        *inst = MirInst::Copy {
-                            dst: *dst,
-                            src: MirValue::Const(result),
-                        };
-                        return true;
-                    }
+                if let Some(s) = src_val
+                    && let Some(result) = self.eval_unaryop(*op, s)
+                {
+                    constants.insert(*dst, result);
+                    *inst = MirInst::Copy {
+                        dst: *dst,
+                        src: MirValue::Const(result),
+                    };
+                    return true;
                 }
                 false
             }

@@ -636,10 +636,8 @@ impl EbpfState {
                 LoadError::MapNotFound(format!("Failed to convert {map_name} map: {e}"))
             })?;
 
-            for item in hash_map.iter() {
-                if let Ok((key, value)) = item {
-                    entries.push((key, value));
-                }
+            for (key, value) in hash_map.iter().filter_map(|item| item.ok()) {
+                entries.push((key, value));
             }
         }
 
@@ -678,15 +676,13 @@ impl EbpfState {
                     LoadError::MapNotFound(format!("Failed to convert str_counters map: {e}"))
                 })?;
 
-            for item in hash_map.iter() {
-                if let Ok((key_bytes, count)) = item {
-                    // Convert the key bytes to a string (null-terminated)
-                    let key = std::str::from_utf8(&key_bytes)
-                        .unwrap_or("")
-                        .trim_end_matches('\0')
-                        .to_string();
-                    entries.push(StringCounterEntry { key, count });
-                }
+            for (key_bytes, count) in hash_map.iter().filter_map(|item| item.ok()) {
+                // Convert the key bytes to a string (null-terminated)
+                let key = std::str::from_utf8(&key_bytes)
+                    .unwrap_or("")
+                    .trim_end_matches('\0')
+                    .to_string();
+                entries.push(StringCounterEntry { key, count });
             }
         }
 
@@ -749,22 +745,20 @@ impl EbpfState {
                     LoadError::MapNotFound(format!("Failed to access {}: {}", map_name, e))
                 })?;
 
-            for item in stack_map.iter() {
-                if let Ok((stack_id, trace)) = item {
-                    // Extract instruction pointers from the trace, filtering zeros
-                    let frames: Vec<u64> = trace
-                        .frames()
-                        .iter()
-                        .map(|f| f.ip)
-                        .filter(|&ip| ip != 0)
-                        .collect();
+            for (stack_id, trace) in stack_map.iter().filter_map(|item| item.ok()) {
+                // Extract instruction pointers from the trace, filtering zeros
+                let frames: Vec<u64> = trace
+                    .frames()
+                    .iter()
+                    .map(|f| f.ip)
+                    .filter(|&ip| ip != 0)
+                    .collect();
 
-                    if !frames.is_empty() {
-                        stacks.push(StackTrace {
-                            id: stack_id as i64,
-                            frames,
-                        });
-                    }
+                if !frames.is_empty() {
+                    stacks.push(StackTrace {
+                        id: stack_id as i64,
+                        frames,
+                    });
                 }
             }
         }

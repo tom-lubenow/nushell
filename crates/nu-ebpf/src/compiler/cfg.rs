@@ -167,10 +167,8 @@ impl CFG {
 
         // Store results
         for (block_id, dom) in doms {
-            if let Some(idom) = dom {
-                if block_id != idom {
-                    self.idom.insert(block_id, idom);
-                }
+            if let Some(idom) = dom && block_id != idom {
+                self.idom.insert(block_id, idom);
             }
         }
     }
@@ -517,12 +515,12 @@ impl LoopInfo {
             // Merge with existing loop for this header (loops can have multiple back edges)
             info.loops
                 .entry(header)
-                .or_insert_with(HashSet::new)
+                .or_default()
                 .extend(loop_blocks);
         }
 
         // Compute loop depths
-        for (_, blocks) in &info.loops {
+        for blocks in info.loops.values() {
             for &block in blocks {
                 *info.loop_depth.entry(block).or_insert(0) += 1;
             }

@@ -1101,19 +1101,17 @@ impl<'a> IrToMirLowering<'a> {
         var_id: nu_protocol::VarId,
     ) -> Result<(), CompileError> {
         // Check if this is the context parameter variable
-        if let Some(ctx_var) = self.ctx_param {
-            if var_id == ctx_var {
-                let dst_vreg = self.get_vreg(dst);
-                // Mark this register as holding the context
-                let meta = self.get_or_create_metadata(dst);
-                meta.is_context = true;
-                // Emit a placeholder - actual context access happens in FollowCellPath
-                self.emit(MirInst::Copy {
-                    dst: dst_vreg,
-                    src: MirValue::Const(0), // Placeholder
-                });
-                return Ok(());
-            }
+        if let Some(ctx_var) = self.ctx_param && var_id == ctx_var {
+            let dst_vreg = self.get_vreg(dst);
+            // Mark this register as holding the context
+            let meta = self.get_or_create_metadata(dst);
+            meta.is_context = true;
+            // Emit a placeholder - actual context access happens in FollowCellPath
+            self.emit(MirInst::Copy {
+                dst: dst_vreg,
+                src: MirValue::Const(0), // Placeholder
+            });
+            return Ok(());
         }
 
         // Check if this is a captured variable

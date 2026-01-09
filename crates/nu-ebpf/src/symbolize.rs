@@ -40,14 +40,13 @@ impl KernelSymbols {
             // Format: "address type name [module]"
             // Example: "ffffffff81000000 T _text"
             let parts: Vec<&str> = line.splitn(4, ' ').collect();
-            if parts.len() >= 3 {
-                if let Ok(addr) = u64::from_str_radix(parts[0], 16) {
-                    // Skip zero addresses (restricted kallsyms)
-                    if addr != 0 {
-                        let name = parts[2].to_string();
-                        symbols.push((addr, name));
-                    }
-                }
+            if parts.len() >= 3
+                && let Ok(addr) = u64::from_str_radix(parts[0], 16)
+                && addr != 0
+            {
+                // Skip zero addresses (restricted kallsyms)
+                let name = parts[2].to_string();
+                symbols.push((addr, name));
             }
         }
 
@@ -119,10 +118,10 @@ pub fn symbolize_kernel_stack(frames: &[u64]) -> Vec<ResolvedSymbol> {
     frames
         .iter()
         .map(|&addr| {
-            if let Ok(syms) = ksyms {
-                if let Some(resolved) = syms.resolve(addr) {
-                    return resolved;
-                }
+            if let Ok(syms) = ksyms
+                && let Some(resolved) = syms.resolve(addr)
+            {
+                return resolved;
             }
             // Fallback: return hex address as the "name"
             ResolvedSymbol {

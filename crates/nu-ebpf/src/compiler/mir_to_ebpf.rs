@@ -214,7 +214,7 @@ impl<'a> MirToEbpfCompiler<'a> {
 
         for slot in slots {
             // Align the offset
-            let aligned_size = ((slot.size + slot.align - 1) / slot.align) * slot.align;
+            let aligned_size = slot.size.div_ceil(slot.align) * slot.align;
             self.stack_offset -= aligned_size as i16;
 
             // Check for stack overflow
@@ -799,10 +799,8 @@ impl<'a> MirToEbpfCompiler<'a> {
                     .push(EbpfInsn::ldxdw(dst, EbpfReg::R9, offset));
             }
             CtxField::RetVal => {
-                if let Some(ctx) = self.probe_ctx {
-                    if !ctx.is_return_probe() {
-                        return Err(CompileError::RetvalOnNonReturnProbe);
-                    }
+                if let Some(ctx) = self.probe_ctx && !ctx.is_return_probe() {
+                    return Err(CompileError::RetvalOnNonReturnProbe);
                 }
                 let offsets = KernelBtf::get().pt_regs_offsets().map_err(|e| {
                     CompileError::UnsupportedInstruction(format!(

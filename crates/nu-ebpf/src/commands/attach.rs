@@ -284,8 +284,7 @@ fn run_attach(
         .signature
         .required_positional
         .first()
-        .map(|p| p.var_id)
-        .flatten();
+        .and_then(|p| p.var_id);
 
     // Convert captures to (String, i64) pairs for integer captures
     let captures: Vec<(String, i64)> = closure

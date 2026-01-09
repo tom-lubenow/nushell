@@ -40,7 +40,7 @@ impl MirPass for SsaDestruction {
         }
 
         // Insert copies in predecessor blocks
-        for (block_id, phis) in &phi_info {
+        for (_block_id, phis) in &phi_info {
             for phi in phis {
                 for &(pred_id, src_vreg) in &phi.args {
                     // Insert copy at end of predecessor (before terminator)

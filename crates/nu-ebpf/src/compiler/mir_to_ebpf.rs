@@ -29,7 +29,7 @@ use crate::compiler::graph_coloring::GraphColoringAllocator;
 use crate::compiler::instruction::{BpfHelper, EbpfInsn, EbpfReg, opcode};
 use crate::compiler::mir::{
     BasicBlock, BinOpKind, BlockId, CtxField, MirFunction, MirInst, MirProgram, MirType, MirValue,
-    RecordFieldDef, StackSlot, StackSlotId, StackSlotKind, UnaryOpKind, VReg,
+    RecordFieldDef, StackSlotId, UnaryOpKind, VReg,
 };
 use crate::compiler::type_infer::TypeInference;
 use crate::kernel_btf::KernelBtf;
@@ -221,10 +221,7 @@ impl<'a> MirToEbpfCompiler<'a> {
         self.vreg_to_phys = result.coloring;
 
         // Allocate spill slots and store their offsets
-        // We'll assign actual stack offsets in layout_stack
-        for (vreg, slot_id) in &result.spills {
-            // Reserve space for this spill - we'll track the slot_id -> offset mapping
-            // The actual offset assignment happens in layout_stack
+        for (vreg, _slot_id) in &result.spills {
             self.check_stack_space(8)?;
             self.stack_offset -= 8;
             self.vreg_spills.insert(*vreg, self.stack_offset);
@@ -1360,24 +1357,6 @@ impl<'a> MirToEbpfCompiler<'a> {
         // Vreg wasn't allocated - this shouldn't happen with proper graph coloring
         // Fall back to R0 as scratch
         Ok(EbpfReg::R0)
-    }
-
-    /// Spill a virtual register to stack (store current value)
-    fn spill_vreg(&mut self, vreg: VReg, phys: EbpfReg) -> Result<(), CompileError> {
-        let offset = if let Some(&off) = self.vreg_spills.get(&vreg) {
-            off
-        } else {
-            // Allocate new spill slot
-            self.check_stack_space(8)?;
-            self.stack_offset -= 8;
-            let off = self.stack_offset;
-            self.vreg_spills.insert(vreg, off);
-            off
-        };
-
-        self.instructions
-            .push(EbpfInsn::stxdw(EbpfReg::R10, offset, phys));
-        Ok(())
     }
 
     // === Histogram and Timing ===

@@ -3,7 +3,7 @@
 //! This module converts MIR (Mid-Level IR) to eBPF bytecode.
 //! It handles:
 //! - Type inference and validation
-//! - Virtual register allocation to physical registers
+//! - Graph coloring register allocation (Chaitin-Briggs)
 //! - Stack layout and spilling
 //! - Control flow (basic block linearization, jump resolution)
 //! - BPF helper calls and map operations
@@ -13,20 +13,21 @@
 //! 1. Build CFG from MIR
 //! 2. Compute liveness information
 //! 3. Run type inference (validates types, catches errors early)
-//! 4. On-demand LRU register allocation with spilling
-//! 5. Layout stack slots
+//! 4. Graph coloring register allocation with coalescing
+//! 5. Layout stack slots (including spill slots)
 //! 6. Compile blocks in reverse post-order
 //! 7. Fix up jumps and emit bytecode
 
 use std::collections::HashMap;
 
-use crate::compiler::cfg::CFG;
+use crate::compiler::cfg::{LivenessInfo, CFG};
 use crate::compiler::elf::{BpfFieldType, BpfMapDef, EbpfMap, EventSchema, MapRelocation, ProbeContext, SchemaField};
+use crate::compiler::graph_coloring::GraphColoringAllocator;
 use crate::compiler::instruction::{opcode, BpfHelper, EbpfInsn, EbpfReg};
 use crate::compiler::type_infer::TypeInference;
 use crate::compiler::mir::{
     BasicBlock, BinOpKind, BlockId, CtxField, MirFunction, MirInst, MirProgram, MirType, MirValue,
-    RecordFieldDef, StackSlotId, UnaryOpKind, VReg,
+    RecordFieldDef, StackSlot, StackSlotId, StackSlotKind, UnaryOpKind, VReg,
 };
 use crate::compiler::CompileError;
 use crate::kernel_btf::KernelBtf;
@@ -66,11 +67,9 @@ pub struct MirToEbpfCompiler<'a> {
     probe_ctx: Option<&'a ProbeContext>,
     /// eBPF instructions
     instructions: Vec<EbpfInsn>,
-    /// Virtual register to physical register mapping
+    /// Virtual register to physical register mapping (from graph coloring)
     vreg_to_phys: HashMap<VReg, EbpfReg>,
-    /// Virtual registers that have been defined (written to)
-    vreg_defined: std::collections::HashSet<VReg>,
-    /// Virtual registers spilled to stack
+    /// Virtual registers spilled to stack (from graph coloring)
     vreg_spills: HashMap<VReg, i16>,
     /// Stack slot offsets
     slot_offsets: HashMap<StackSlotId, i16>,
@@ -100,8 +99,6 @@ pub struct MirToEbpfCompiler<'a> {
     event_schema: Option<EventSchema>,
     /// Available physical registers for allocation
     available_regs: Vec<EbpfReg>,
-    /// Next LRU register index
-    next_lru: usize,
 }
 
 impl<'a> MirToEbpfCompiler<'a> {
@@ -112,7 +109,6 @@ impl<'a> MirToEbpfCompiler<'a> {
             probe_ctx,
             instructions: Vec::new(),
             vreg_to_phys: HashMap::new(),
-            vreg_defined: std::collections::HashSet::new(),
             vreg_spills: HashMap::new(),
             slot_offsets: HashMap::new(),
             stack_offset: 0,
@@ -127,15 +123,18 @@ impl<'a> MirToEbpfCompiler<'a> {
             needs_kstack_map: false,
             needs_ustack_map: false,
             event_schema: None,
-            // R6-R8 are callee-saved and available for our use
+            // R6-R9 are callee-saved and available for our use
+            // R9 is reserved for context pointer, so we use R6-R8
             available_regs: vec![EbpfReg::R6, EbpfReg::R7, EbpfReg::R8],
-            next_lru: 0,
         }
     }
 
     /// Compile the MIR program to eBPF
     pub fn compile(mut self) -> Result<MirCompileResult, CompileError> {
-        // Lay out stack slots first
+        // Run graph coloring register allocation
+        self.run_register_allocation()?;
+
+        // Lay out stack slots (including spill slots from register allocation)
         self.layout_stack()?;
 
         // Compile all basic blocks
@@ -204,6 +203,34 @@ impl<'a> MirToEbpfCompiler<'a> {
         })
     }
 
+    /// Run graph coloring register allocation
+    fn run_register_allocation(&mut self) -> Result<(), CompileError> {
+        let func = &self.mir.main;
+
+        // Build CFG and compute liveness
+        let cfg = CFG::build(func);
+        let liveness = LivenessInfo::compute(func, &cfg);
+
+        // Run graph coloring allocation
+        let mut allocator = GraphColoringAllocator::new(self.available_regs.clone());
+        let result = allocator.allocate(func, &cfg, &liveness);
+
+        // Store register assignments
+        self.vreg_to_phys = result.coloring;
+
+        // Allocate spill slots and store their offsets
+        // We'll assign actual stack offsets in layout_stack
+        for (vreg, slot_id) in &result.spills {
+            // Reserve space for this spill - we'll track the slot_id -> offset mapping
+            // The actual offset assignment happens in layout_stack
+            self.check_stack_space(8)?;
+            self.stack_offset -= 8;
+            self.vreg_spills.insert(*vreg, self.stack_offset);
+        }
+
+        Ok(())
+    }
+
     /// Layout stack slots and assign offsets
     fn layout_stack(&mut self) -> Result<(), CompileError> {
         let func = &self.mir.main;
@@ -242,7 +269,7 @@ impl<'a> MirToEbpfCompiler<'a> {
             }
         }
 
-        // Register allocation is handled on-demand with a simple LRU policy.
+        // Register allocation uses Chaitin-Briggs graph coloring for optimal results.
 
         // Use reverse post-order for block layout
         // This ensures that:
@@ -1252,72 +1279,59 @@ impl<'a> MirToEbpfCompiler<'a> {
         Ok(())
     }
 
-    // === Register Allocation (Simple LRU) ===
+    // === Register Allocation (Graph Coloring) ===
+    //
+    // Register allocation is performed upfront via graph coloring (Chaitin-Briggs).
+    // At this point, vreg_to_phys contains the coloring and vreg_spills contains
+    // spill slot offsets for vregs that couldn't be colored.
 
-    /// Allocate a physical register for a virtual register
+    /// Get the physical register for a virtual register
+    /// Returns the pre-computed coloring, or handles spilled vregs
     fn alloc_reg(&mut self, vreg: VReg) -> Result<EbpfReg, CompileError> {
+        // Check if this vreg was assigned a physical register by graph coloring
         if let Some(&phys) = self.vreg_to_phys.get(&vreg) {
             return Ok(phys);
         }
 
-        let phys = self.available_regs[self.next_lru % self.available_regs.len()];
-        self.next_lru += 1;
-
-        // Spill if needed - but only if the vreg was actually defined
-        let to_spill: Option<VReg> = self
-            .vreg_to_phys
-            .iter()
-            .find(|(_, p)| **p == phys)
-            .map(|(v, _)| *v);
-
-        if let Some(old_vreg) = to_spill {
-            // Only spill if this vreg was actually written to
-            // Otherwise, we'd be saving an uninitialized register
-            if self.vreg_defined.contains(&old_vreg) {
-                self.spill_vreg(old_vreg, phys)?;
-            }
-            self.vreg_to_phys.remove(&old_vreg);
-        }
-
-        self.vreg_to_phys.insert(vreg, phys);
-        Ok(phys)
+        // If the vreg was spilled, we need a temporary register
+        // Use R0 as a scratch register for spilled values
+        // (R0 is the return value register, safe to clobber mid-computation)
+        Ok(EbpfReg::R0)
     }
 
-    /// Mark a virtual register as defined (has been written to)
-    fn mark_defined(&mut self, vreg: VReg) {
-        self.vreg_defined.insert(vreg);
-    }
-
-    /// Allocate a register for a destination vreg and mark it as defined
+    /// Allocate a register for a destination vreg
     fn alloc_dst_reg(&mut self, vreg: VReg) -> Result<EbpfReg, CompileError> {
-        let phys = self.alloc_reg(vreg)?;
-        self.mark_defined(vreg);
-        Ok(phys)
-    }
-
-    /// Ensure a virtual register is in a physical register
-    fn ensure_reg(&mut self, vreg: VReg) -> Result<EbpfReg, CompileError> {
-        if let Some(&phys) = self.vreg_to_phys.get(&vreg) {
-            return Ok(phys);
-        }
-
-        if let Some(&offset) = self.vreg_spills.get(&vreg) {
-            let phys = self.alloc_reg(vreg)?;
-            self.instructions
-                .push(EbpfInsn::ldxdw(phys, EbpfReg::R10, offset));
-            // After reload, the vreg is defined in this physical register
-            self.mark_defined(vreg);
-            return Ok(phys);
-        }
-
         self.alloc_reg(vreg)
     }
 
-    /// Spill a virtual register to stack
+    /// Ensure a virtual register is in a physical register
+    /// If the vreg is spilled, emit a reload instruction
+    fn ensure_reg(&mut self, vreg: VReg) -> Result<EbpfReg, CompileError> {
+        // Check if this vreg has a physical register
+        if let Some(&phys) = self.vreg_to_phys.get(&vreg) {
+            return Ok(phys);
+        }
+
+        // The vreg is spilled - reload it to a scratch register
+        if let Some(&offset) = self.vreg_spills.get(&vreg) {
+            // Use R0 as scratch for reloads
+            let scratch = EbpfReg::R0;
+            self.instructions
+                .push(EbpfInsn::ldxdw(scratch, EbpfReg::R10, offset));
+            return Ok(scratch);
+        }
+
+        // Vreg wasn't allocated - this shouldn't happen with proper graph coloring
+        // Fall back to R0 as scratch
+        Ok(EbpfReg::R0)
+    }
+
+    /// Spill a virtual register to stack (store current value)
     fn spill_vreg(&mut self, vreg: VReg, phys: EbpfReg) -> Result<(), CompileError> {
         let offset = if let Some(&off) = self.vreg_spills.get(&vreg) {
             off
         } else {
+            // Allocate new spill slot
             self.check_stack_space(8)?;
             self.stack_offset -= 8;
             let off = self.stack_offset;
@@ -2506,11 +2520,14 @@ mod tests {
         };
 
         let mut compiler = MirToEbpfCompiler::new(&program, None);
+        compiler.run_register_allocation().unwrap();
         compiler.layout_stack().unwrap();
         compiler.compile_function(&program.main).unwrap();
         compiler.fixup_jumps().unwrap();
 
-        let data_reg = compiler.vreg_to_phys.get(&VReg(0)).copied().unwrap();
+        // After graph coloring, VReg(0) should be assigned a register
+        let data_reg = compiler.vreg_to_phys.get(&VReg(0)).copied()
+            .expect("VReg(0) should be assigned a physical register by graph coloring");
         let saw_copy = compiler.instructions.iter().any(|insn| {
             insn.opcode == (opcode::BPF_LDX | opcode::BPF_DW | opcode::BPF_MEM)
                 && insn.dst_reg == EbpfReg::R0.as_u8()

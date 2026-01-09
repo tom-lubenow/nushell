@@ -11,7 +11,7 @@
 //!                                       ↓
 //!                              [passes/*] optimizations
 //!                                       ↓
-//!                              [regalloc] register allocation
+//!                         [graph_coloring] register allocation
 //!                                       ↓
 //!                              [mir_to_ebpf] → eBPF bytecode
 //! ```
@@ -19,13 +19,13 @@
 mod btf;
 pub mod cfg;
 mod elf;
+pub mod graph_coloring;
 pub mod hindley_milner;
 pub mod instruction;
 pub mod ir_to_mir;
 pub mod mir;
 pub mod mir_to_ebpf;
 pub mod passes;
-pub mod regalloc;
 pub mod type_infer;
 
 pub use elf::{

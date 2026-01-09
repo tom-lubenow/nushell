@@ -9,14 +9,17 @@
 //! - **DCE** (Dead Code Elimination): Removes unused instructions and unreachable blocks
 //! - **ConstFold** (Constant Folding): Evaluates constant expressions at compile time
 //! - **StrengthReduce**: Converts expensive operations to cheaper equivalents
+//! - **CopyProp** (Copy Propagation): Replaces uses of copy destinations with sources
 
 mod const_fold;
+mod copy_prop;
 mod dce;
 mod ssa;
 mod ssa_destruct;
 mod strength;
 
 pub use const_fold::ConstantFolding;
+pub use copy_prop::CopyPropagation;
 pub use dce::DeadCodeElimination;
 pub use ssa::SsaConstruction;
 pub use ssa_destruct::SsaDestruction;
@@ -133,9 +136,14 @@ impl Default for PassManager {
 /// Create a default set of optimization passes (non-SSA)
 pub fn default_passes() -> PassManager {
     let mut pm = PassManager::new();
-    // Order matters: fold constants first, then reduce strength, then eliminate dead code
+    // Order matters:
+    // 1. Fold constants first (evaluates constant expressions)
+    // 2. Reduce strength (simplifies operations)
+    // 3. Propagate copies (eliminates intermediate copies)
+    // 4. Eliminate dead code last (cleans up unused definitions)
     pm.add_pass(ConstantFolding);
     pm.add_pass(StrengthReduction);
+    pm.add_pass(CopyPropagation);
     pm.add_pass(DeadCodeElimination);
     pm
 }

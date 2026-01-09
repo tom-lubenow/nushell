@@ -470,6 +470,16 @@ impl GraphColoringAllocator {
                 uses.push(*val);
             }
             MirInst::EmitEvent { data, .. } => uses.push(*data),
+            MirInst::EmitRecord { fields } => {
+                for field in fields {
+                    uses.push(field.value);
+                }
+            }
+            MirInst::StoreSlot { val, .. } => add_value(&mut uses, val),
+            MirInst::MapDelete { key, .. } => uses.push(*key),
+            MirInst::Histogram { value } => uses.push(*value),
+            MirInst::ReadStr { ptr, .. } => uses.push(*ptr),
+            MirInst::RecordStore { val, .. } => add_value(&mut uses, val),
             _ => {}
         }
 

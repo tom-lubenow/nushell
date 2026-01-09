@@ -10,7 +10,9 @@
 //! - **ConstFold** (Constant Folding): Evaluates constant expressions at compile time
 //! - **StrengthReduce**: Converts expensive operations to cheaper equivalents
 //! - **CopyProp** (Copy Propagation): Replaces uses of copy destinations with sources
+//! - **BranchOpt** (Branch Optimization): Simplifies control flow (jump threading, same-target branches)
 
+mod branch_opt;
 mod const_fold;
 mod copy_prop;
 mod dce;
@@ -18,6 +20,7 @@ mod ssa;
 mod ssa_destruct;
 mod strength;
 
+pub use branch_opt::BranchOptimization;
 pub use const_fold::ConstantFolding;
 pub use copy_prop::CopyPropagation;
 pub use dce::DeadCodeElimination;
@@ -137,13 +140,15 @@ impl Default for PassManager {
 pub fn default_passes() -> PassManager {
     let mut pm = PassManager::new();
     // Order matters:
-    // 1. Fold constants first (evaluates constant expressions)
-    // 2. Reduce strength (simplifies operations)
+    // 1. Fold constants first (evaluates constant expressions, may simplify branches)
+    // 2. Reduce strength (simplifies operations, algebraic identities)
     // 3. Propagate copies (eliminates intermediate copies)
-    // 4. Eliminate dead code last (cleans up unused definitions)
+    // 4. Optimize branches (jump threading, same-target branches)
+    // 5. Eliminate dead code last (cleans up unused definitions and unreachable blocks)
     pm.add_pass(ConstantFolding);
     pm.add_pass(StrengthReduction);
     pm.add_pass(CopyPropagation);
+    pm.add_pass(BranchOptimization);
     pm.add_pass(DeadCodeElimination);
     pm
 }

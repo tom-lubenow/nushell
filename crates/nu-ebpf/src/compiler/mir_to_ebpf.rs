@@ -601,6 +601,13 @@ impl<'a> MirToEbpfCompiler<'a> {
                 ));
             }
 
+            // Phi nodes should be eliminated before codegen via SSA destruction
+            MirInst::Phi { .. } => {
+                return Err(CompileError::UnsupportedInstruction(
+                    "Phi nodes must be eliminated before codegen (SSA destruction)".into(),
+                ));
+            }
+
             // Instructions reserved for future features
             MirInst::Load { .. }
             | MirInst::Store { .. }

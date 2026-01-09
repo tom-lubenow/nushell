@@ -242,6 +242,15 @@ impl TypeInference {
                 self.constrain(counter_ty, HMType::I64, "loop_counter");
             }
 
+            MirInst::Phi { dst, args } => {
+                // Phi destination has same type as all its arguments
+                let dst_ty = self.vreg_type(*dst);
+                for (_, arg_vreg) in args {
+                    let arg_ty = self.vreg_type(*arg_vreg);
+                    self.constrain(dst_ty.clone(), arg_ty, "phi");
+                }
+            }
+
             // Instructions that don't define a vreg - no constraints needed
             MirInst::Store { .. }
             | MirInst::StoreSlot { .. }

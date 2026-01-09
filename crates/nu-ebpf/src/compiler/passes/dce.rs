@@ -106,7 +106,8 @@ fn has_side_effects(inst: &MirInst) -> bool {
         | MirInst::UnaryOp { .. }
         | MirInst::Load { .. }
         | MirInst::LoadSlot { .. }
-        | MirInst::LoadCtxField { .. } => false,
+        | MirInst::LoadCtxField { .. }
+        | MirInst::Phi { .. } => false,
 
         // Side effects - cannot be removed
         MirInst::Store { .. }

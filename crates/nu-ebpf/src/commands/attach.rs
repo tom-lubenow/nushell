@@ -212,6 +212,7 @@ fn run_attach(
 ) -> Result<PipelineData, ShellError> {
     use crate::compiler::{
         EbpfProgram, ProbeContext, compile_mir_to_ebpf, ir_to_mir::lower_ir_to_mir,
+        passes::optimize_with_ssa,
     };
     use crate::loader::{LoadError, get_state, parse_probe_spec};
 
@@ -303,7 +304,7 @@ fn run_attach(
         .collect();
 
     // Lower IR to MIR
-    let mir_program = lower_ir_to_mir(
+    let mut mir_program = lower_ir_to_mir(
         ir_block,
         Some(&probe_context),
         Some(engine_state),
@@ -317,6 +318,12 @@ fn run_attach(
         help: Some("The closure may use unsupported operations".into()),
         inner: vec![],
     })?;
+
+    // Run SSA-based optimizations (constant folding, dead code elimination, etc.)
+    optimize_with_ssa(&mut mir_program.main);
+    for subfn in &mut mir_program.subfunctions {
+        optimize_with_ssa(subfn);
+    }
 
     // Compile MIR to eBPF
     let compile_result = compile_mir_to_ebpf(&mir_program, Some(&probe_context)).map_err(|e| {

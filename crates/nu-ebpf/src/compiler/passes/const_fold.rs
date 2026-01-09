@@ -94,14 +94,22 @@ impl ConstantFolding {
                         }
                     }
                     (Some(l), None) => {
-                        // LHS is constant - propagate
-                        *lhs = MirValue::Const(l);
-                        true
+                        // LHS is constant - propagate only if not already a constant
+                        if !matches!(lhs, MirValue::Const(_)) {
+                            *lhs = MirValue::Const(l);
+                            true
+                        } else {
+                            false
+                        }
                     }
                     (None, Some(r)) => {
-                        // RHS is constant - propagate
-                        *rhs = MirValue::Const(r);
-                        true
+                        // RHS is constant - propagate only if not already a constant
+                        if !matches!(rhs, MirValue::Const(_)) {
+                            *rhs = MirValue::Const(r);
+                            true
+                        } else {
+                            false
+                        }
                     }
                     (None, None) => false,
                 }

@@ -454,7 +454,8 @@ impl GraphColoringAllocator {
             | MirInst::CallHelper { dst, .. }
             | MirInst::MapLookup { dst, .. }
             | MirInst::StopTimer { dst, .. }
-            | MirInst::StrCmp { dst, .. } => Some(*dst),
+            | MirInst::StrCmp { dst, .. }
+            | MirInst::Phi { dst, .. } => Some(*dst),
             _ => None,
         }
     }
@@ -504,6 +505,11 @@ impl GraphColoringAllocator {
             MirInst::Histogram { value } => uses.push(*value),
             MirInst::ReadStr { ptr, .. } => uses.push(*ptr),
             MirInst::RecordStore { val, .. } => add_value(&mut uses, val),
+            MirInst::Phi { args, .. } => {
+                for (_, vreg) in args {
+                    uses.push(*vreg);
+                }
+            }
             _ => {}
         }
 

@@ -426,6 +426,15 @@ pub enum MirInst {
         ty: MirType,
     },
 
+    // SSA phi function
+    /// Phi node for SSA form - selects value based on incoming edge
+    /// Must appear at the start of a block, before any non-phi instructions
+    Phi {
+        dst: VReg,
+        /// (predecessor block, value from that predecessor)
+        args: Vec<(BlockId, VReg)>,
+    },
+
     // Control flow (terminators - must be last in block)
     /// Unconditional jump
     Jump { target: BlockId },
@@ -485,7 +494,8 @@ impl MirInst {
             | MirInst::LoadCtxField { dst, .. }
             | MirInst::StrCmp { dst, .. }
             | MirInst::StopTimer { dst, .. }
-            | MirInst::LoopHeader { counter: dst, .. } => Some(*dst),
+            | MirInst::LoopHeader { counter: dst, .. }
+            | MirInst::Phi { dst, .. } => Some(*dst),
             _ => None,
         }
     }
@@ -547,6 +557,11 @@ impl MirInst {
             MirInst::TailCall { index, .. } => add_value(&mut uses, index),
             MirInst::LoopHeader { counter, .. } => uses.push(*counter),
             MirInst::LoopBack { counter, .. } => uses.push(*counter),
+            MirInst::Phi { args, .. } => {
+                for (_, vreg) in args {
+                    uses.push(*vreg);
+                }
+            }
         }
         uses
     }
@@ -648,12 +663,23 @@ impl MirFunction {
 
     /// Get a mutable reference to a block
     pub fn block_mut(&mut self, id: BlockId) -> &mut BasicBlock {
-        &mut self.blocks[id.0 as usize]
+        self.blocks
+            .iter_mut()
+            .find(|b| b.id == id)
+            .unwrap_or_else(|| panic!("Block {:?} not found", id))
     }
 
     /// Get a reference to a block
     pub fn block(&self, id: BlockId) -> &BasicBlock {
-        &self.blocks[id.0 as usize]
+        self.blocks
+            .iter()
+            .find(|b| b.id == id)
+            .unwrap_or_else(|| panic!("Block {:?} not found", id))
+    }
+
+    /// Check if a block exists
+    pub fn has_block(&self, id: BlockId) -> bool {
+        self.blocks.iter().any(|b| b.id == id)
     }
 }
 

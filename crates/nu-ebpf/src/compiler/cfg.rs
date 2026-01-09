@@ -25,6 +25,8 @@ pub struct CFG {
     pub rpo: Vec<BlockId>,
     /// Post-order traversal
     pub post_order: Vec<BlockId>,
+    /// Dominance frontiers for each block (used in SSA construction)
+    pub dominance_frontiers: HashMap<BlockId, HashSet<BlockId>>,
 }
 
 impl CFG {
@@ -37,6 +39,7 @@ impl CFG {
             idom: HashMap::new(),
             rpo: Vec::new(),
             post_order: Vec::new(),
+            dominance_frontiers: HashMap::new(),
         };
 
         // Initialize empty predecessor/successor lists for all blocks
@@ -62,6 +65,9 @@ impl CFG {
         // Compute dominators
         cfg.compute_dominators(func);
 
+        // Compute dominance frontiers (needed for SSA construction)
+        cfg.compute_dominance_frontiers(func);
+
         cfg
     }
 
@@ -85,7 +91,8 @@ impl CFG {
             // Visit successors first
             if let Some(succs) = cfg.successors.get(&block_id) {
                 for &succ in succs {
-                    if (succ.0 as usize) < func.blocks.len() {
+                    // Use has_block() to check existence - block IDs may not match indices after DCE
+                    if func.has_block(succ) {
                         dfs(succ, func, cfg, visited, post_order);
                     }
                 }
@@ -170,6 +177,67 @@ impl CFG {
                 self.idom.insert(block_id, idom);
             }
         }
+    }
+
+    /// Compute dominance frontiers using the Cooper-Harvey-Kennedy algorithm
+    ///
+    /// The dominance frontier of a block N is the set of all blocks M where:
+    /// - N dominates a predecessor of M, but
+    /// - N does not strictly dominate M
+    ///
+    /// In other words, it's where N's dominance "ends" - the points where
+    /// control flow from paths not dominated by N can join.
+    fn compute_dominance_frontiers(&mut self, func: &MirFunction) {
+        // Initialize empty frontiers for all blocks
+        for block in &func.blocks {
+            self.dominance_frontiers.insert(block.id, HashSet::new());
+        }
+
+        // For each block with multiple predecessors (join points)
+        for block in &func.blocks {
+            let preds = self
+                .predecessors
+                .get(&block.id)
+                .cloned()
+                .unwrap_or_default();
+
+            if preds.len() >= 2 {
+                // For each predecessor, walk up the dominator tree
+                for pred in &preds {
+                    let mut runner = *pred;
+
+                    // Walk up until we reach the immediate dominator of the join point
+                    // The immediate dominator strictly dominates the join point,
+                    // so it's not in the frontier
+                    //
+                    // For entry block, idom is not set (or is itself), so we also check
+                    // if we've reached the entry
+                    let idom_of_block = self.idom.get(&block.id).copied();
+
+                    while Some(runner) != idom_of_block {
+                        // This block is in the dominance frontier of runner
+                        self.dominance_frontiers
+                            .entry(runner)
+                            .or_default()
+                            .insert(block.id);
+
+                        // Move up to the immediate dominator
+                        match self.idom.get(&runner) {
+                            Some(&idom) if idom != runner => runner = idom,
+                            _ => break, // Reached entry or cycle
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Get the dominance frontier of a block
+    pub fn dominance_frontier(&self, block: BlockId) -> HashSet<BlockId> {
+        self.dominance_frontiers
+            .get(&block)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Find common dominator (intersection in dominator tree)
@@ -635,6 +703,23 @@ mod tests {
         // bb1 and bb2 don't dominate bb3 (both paths lead to bb3)
         assert!(!cfg.dominates(BlockId(1), BlockId(3)));
         assert!(!cfg.dominates(BlockId(2), BlockId(3)));
+    }
+
+    #[test]
+    fn test_dominance_frontiers() {
+        let func = make_test_function();
+        let cfg = CFG::build(&func);
+
+        // In a diamond CFG (bb0 branches to bb1/bb2, both jump to bb3):
+        // - DF(bb0) = {} (entry dominates everything)
+        // - DF(bb1) = {bb3} (bb1 dominates itself, but at bb3 control can come from bb2)
+        // - DF(bb2) = {bb3} (bb2 dominates itself, but at bb3 control can come from bb1)
+        // - DF(bb3) = {} (bb3 has no successors)
+
+        assert!(cfg.dominance_frontier(BlockId(0)).is_empty());
+        assert!(cfg.dominance_frontier(BlockId(1)).contains(&BlockId(3)));
+        assert!(cfg.dominance_frontier(BlockId(2)).contains(&BlockId(3)));
+        assert!(cfg.dominance_frontier(BlockId(3)).is_empty());
     }
 
     #[test]

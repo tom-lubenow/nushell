@@ -19,6 +19,7 @@
 mod btf;
 pub mod cfg;
 mod elf;
+pub mod hindley_milner;
 pub mod instruction;
 pub mod ir_to_mir;
 pub mod mir;

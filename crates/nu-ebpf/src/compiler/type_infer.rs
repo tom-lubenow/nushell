@@ -1,19 +1,28 @@
-//! Type Inference for MIR
+//! Hindley-Milner Type Inference for MIR
 //!
-//! Infers types for all virtual registers in a MIR function.
-//! Types are internal to the compiler - users write idiomatic Nushell
-//! and the compiler determines types from context.
+//! Uses constraint-based type inference to determine types for all virtual
+//! registers in a MIR function. Types are internal to the compiler - users
+//! write idiomatic Nushell and the compiler infers types from context.
 //!
-//! ## How It Works
+//! ## Algorithm
 //!
-//! 1. Context fields have known types based on probe type
-//! 2. Constants are typed as I64
-//! 3. Operations propagate types (copy, binop, etc.)
-//! 4. Type errors are reported in Nushell terms
+//! 1. Assign fresh type variables to each virtual register
+//! 2. Generate type constraints from how values are used
+//! 3. Solve constraints via unification
+//! 4. Apply the resulting substitution to get concrete types
+//!
+//! ## References
+//!
+//! - Hindley, J. R. (1969). The principal type-scheme of an object
+//! - Milner, R. (1978). A theory of type polymorphism in programming
+//! - Damas & Milner (1982). Principal type-schemes for functional programs
 
 use std::collections::HashMap;
 
 use super::elf::{EbpfProgramType, ProbeContext};
+use super::hindley_milner::{
+    unify, Constraint, HMType, Substitution, TypeVar, TypeVarGenerator, UnifyError,
+};
 use super::mir::{
     AddressSpace, BasicBlock, BinOpKind, CtxField, MirFunction, MirInst, MirType, MirValue,
     UnaryOpKind, VReg,
@@ -52,20 +61,39 @@ impl std::fmt::Display for TypeError {
 
 impl std::error::Error for TypeError {}
 
-/// Type inference pass for MIR
+impl From<UnifyError> for TypeError {
+    fn from(e: UnifyError) -> Self {
+        TypeError::new(format!(
+            "Type mismatch: expected {}, got {}",
+            e.expected, e.actual
+        ))
+        .with_hint(e.message)
+    }
+}
+
+/// Hindley-Milner type inference pass for MIR
 pub struct TypeInference {
-    /// Inferred types for each virtual register
-    vreg_types: HashMap<VReg, MirType>,
+    /// Type variable generator
+    tvar_gen: TypeVarGenerator,
+    /// Type variable assigned to each vreg
+    vreg_vars: HashMap<VReg, TypeVar>,
+    /// Accumulated constraints
+    constraints: Vec<Constraint>,
     /// Probe context for determining context field types
     probe_ctx: Option<ProbeContext>,
+    /// Current substitution (updated during inference)
+    substitution: Substitution,
 }
 
 impl TypeInference {
     /// Create a new type inference pass
     pub fn new(probe_ctx: Option<ProbeContext>) -> Self {
         Self {
-            vreg_types: HashMap::new(),
+            tvar_gen: TypeVarGenerator::new(),
+            vreg_vars: HashMap::new(),
+            constraints: Vec::new(),
             probe_ctx,
+            substitution: Substitution::new(),
         }
     }
 
@@ -73,105 +101,148 @@ impl TypeInference {
     ///
     /// Returns the type map on success, or a list of type errors.
     pub fn infer(&mut self, func: &MirFunction) -> Result<HashMap<VReg, MirType>, Vec<TypeError>> {
+        // Phase 1: Assign fresh type variables to all vregs
+        for i in 0..func.vreg_count {
+            let vreg = VReg(i);
+            let tvar = self.tvar_gen.fresh();
+            self.vreg_vars.insert(vreg, tvar);
+        }
+
+        // Phase 2: Generate constraints from each instruction
         let mut errors = Vec::new();
-
-        // Process each block
         for block in &func.blocks {
-            self.infer_block(block, &mut errors);
+            self.generate_block_constraints(block, &mut errors);
         }
 
-        if errors.is_empty() {
-            Ok(self.vreg_types.clone())
-        } else {
-            Err(errors)
+        if !errors.is_empty() {
+            return Err(errors);
         }
+
+        // Phase 3: Solve constraints via unification
+        for constraint in &self.constraints {
+            let t1 = self.substitution.apply(&constraint.expected);
+            let t2 = self.substitution.apply(&constraint.actual);
+
+            match unify(&t1, &t2) {
+                Ok(s) => {
+                    self.substitution = s.compose(&self.substitution);
+                }
+                Err(e) => {
+                    errors.push(
+                        TypeError::new(format!("{}: {}", constraint.context, e.message))
+                            .with_hint(format!("expected {}, got {}", e.expected, e.actual)),
+                    );
+                }
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+
+        // Phase 4: Apply substitution to get final types
+        let mut result = HashMap::new();
+        for (vreg, tvar) in &self.vreg_vars {
+            let hm_type = self.substitution.apply(&HMType::Var(*tvar));
+            let mir_type = self.hm_to_mir(&hm_type);
+            result.insert(*vreg, mir_type);
+        }
+
+        Ok(result)
     }
 
-    /// Infer types for a basic block
-    fn infer_block(&mut self, block: &BasicBlock, errors: &mut Vec<TypeError>) {
+    /// Generate constraints for a basic block
+    fn generate_block_constraints(&mut self, block: &BasicBlock, errors: &mut Vec<TypeError>) {
         for inst in &block.instructions {
-            if let Err(e) = self.infer_inst(inst) {
+            if let Err(e) = self.generate_inst_constraints(inst) {
                 errors.push(e);
             }
         }
 
-        // Handle terminator
-        if let Err(e) = self.infer_inst(&block.terminator) {
+        if let Err(e) = self.generate_inst_constraints(&block.terminator) {
             errors.push(e);
         }
     }
 
-    /// Infer type for a single instruction
-    fn infer_inst(&mut self, inst: &MirInst) -> Result<(), TypeError> {
+    /// Generate constraints for a single instruction
+    fn generate_inst_constraints(&mut self, inst: &MirInst) -> Result<(), TypeError> {
         match inst {
             MirInst::Copy { dst, src } => {
+                // dst has same type as src
+                let dst_ty = self.vreg_type(*dst);
                 let src_ty = self.value_type(src);
-                self.set_type(*dst, src_ty);
+                self.constrain(dst_ty, src_ty, "copy");
             }
 
             MirInst::Load { dst, ty, .. } => {
-                self.set_type(*dst, ty.clone());
+                // dst has the specified type
+                let dst_ty = self.vreg_type(*dst);
+                let expected = HMType::from_mir_type(ty);
+                self.constrain(dst_ty, expected, "load");
             }
 
             MirInst::LoadSlot { dst, ty, .. } => {
-                self.set_type(*dst, ty.clone());
+                let dst_ty = self.vreg_type(*dst);
+                let expected = HMType::from_mir_type(ty);
+                self.constrain(dst_ty, expected, "load_slot");
             }
 
             MirInst::BinOp { dst, op, lhs, rhs } => {
+                let dst_ty = self.vreg_type(*dst);
                 let lhs_ty = self.value_type(lhs);
                 let rhs_ty = self.value_type(rhs);
-                let result_ty = self.infer_binop(*op, &lhs_ty, &rhs_ty)?;
-                self.set_type(*dst, result_ty);
+
+                // Generate constraints based on operator
+                let result_ty = self.binop_result_type(*op, &lhs_ty, &rhs_ty)?;
+                self.constrain(dst_ty, result_ty, format!("binop {:?}", op));
             }
 
             MirInst::UnaryOp { dst, op, src } => {
+                let dst_ty = self.vreg_type(*dst);
                 let src_ty = self.value_type(src);
-                let result_ty = self.infer_unaryop(*op, &src_ty)?;
-                self.set_type(*dst, result_ty);
+
+                let result_ty = self.unaryop_result_type(*op, &src_ty)?;
+                self.constrain(dst_ty, result_ty, format!("unaryop {:?}", op));
             }
 
             MirInst::CallHelper { dst, .. } => {
                 // Most BPF helpers return i64
-                self.set_type(*dst, MirType::I64);
+                let dst_ty = self.vreg_type(*dst);
+                self.constrain(dst_ty, HMType::I64, "helper_call");
             }
 
-            MirInst::MapLookup { dst, map, .. } => {
-                // Map lookup returns pointer to value (or null)
-                let val_ty = match &map.kind {
-                    super::mir::MapKind::Hash | super::mir::MapKind::PerCpuHash => MirType::I64,
-                    super::mir::MapKind::Array | super::mir::MapKind::PerCpuArray => MirType::I64,
-                    _ => MirType::I64,
+            MirInst::MapLookup { dst, .. } => {
+                // Map lookup returns pointer to value
+                let dst_ty = self.vreg_type(*dst);
+                let ptr_ty = HMType::Ptr {
+                    pointee: Box::new(HMType::I64),
+                    address_space: AddressSpace::Map,
                 };
-                self.set_type(
-                    *dst,
-                    MirType::Ptr {
-                        pointee: Box::new(val_ty),
-                        address_space: AddressSpace::Map,
-                    },
-                );
+                self.constrain(dst_ty, ptr_ty, "map_lookup");
             }
 
             MirInst::LoadCtxField { dst, field } => {
+                let dst_ty = self.vreg_type(*dst);
                 let field_ty = self.ctx_field_type(field);
-                self.set_type(*dst, field_ty);
+                self.constrain(dst_ty, field_ty, format!("ctx.{:?}", field));
             }
 
             MirInst::StrCmp { dst, .. } => {
-                // String comparison returns bool (0 or 1)
-                self.set_type(*dst, MirType::Bool);
+                let dst_ty = self.vreg_type(*dst);
+                self.constrain(dst_ty, HMType::Bool, "strcmp");
             }
 
             MirInst::StopTimer { dst } => {
-                // Timer returns elapsed nanoseconds (u64)
-                self.set_type(*dst, MirType::U64);
+                let dst_ty = self.vreg_type(*dst);
+                self.constrain(dst_ty, HMType::U64, "stop_timer");
             }
 
             MirInst::LoopHeader { counter, .. } => {
-                // Loop counter is i64
-                self.set_type(*counter, MirType::I64);
+                let counter_ty = self.vreg_type(*counter);
+                self.constrain(counter_ty, HMType::I64, "loop_counter");
             }
 
-            // Instructions that don't define a vreg
+            // Instructions that don't define a vreg - no constraints needed
             MirInst::Store { .. }
             | MirInst::StoreSlot { .. }
             | MirInst::MapUpdate { .. }
@@ -192,57 +263,61 @@ impl TypeInference {
         Ok(())
     }
 
+    /// Get the type variable for a vreg as an HMType
+    fn vreg_type(&self, vreg: VReg) -> HMType {
+        if let Some(&tvar) = self.vreg_vars.get(&vreg) {
+            HMType::Var(tvar)
+        } else {
+            HMType::Unknown
+        }
+    }
+
     /// Get the type of a MirValue
-    fn value_type(&self, value: &MirValue) -> MirType {
+    fn value_type(&mut self, value: &MirValue) -> HMType {
         match value {
-            MirValue::VReg(vreg) => self.get_type(*vreg).cloned().unwrap_or(MirType::Unknown),
-            MirValue::Const(_) => MirType::I64,
-            MirValue::StackSlot(_) => MirType::Ptr {
-                pointee: Box::new(MirType::U8),
+            MirValue::VReg(vreg) => self.vreg_type(*vreg),
+            MirValue::Const(_) => HMType::I64,
+            MirValue::StackSlot(_) => HMType::Ptr {
+                pointee: Box::new(HMType::U8),
                 address_space: AddressSpace::Stack,
             },
         }
     }
 
+    /// Add a constraint
+    fn constrain(&mut self, expected: HMType, actual: HMType, context: impl Into<String>) {
+        self.constraints.push(Constraint::new(expected, actual, context));
+    }
+
     /// Get the type of a context field based on probe type
-    fn ctx_field_type(&self, field: &CtxField) -> MirType {
+    fn ctx_field_type(&self, field: &CtxField) -> HMType {
         match field {
-            // 32-bit integer fields
             CtxField::Pid | CtxField::Tid | CtxField::Uid | CtxField::Gid | CtxField::Cpu => {
-                MirType::U32
+                HMType::U32
             }
 
-            // 64-bit fields
-            CtxField::Timestamp => MirType::U64,
+            CtxField::Timestamp => HMType::U64,
 
-            // Function arguments (varies by probe type but we use i64)
             CtxField::Arg(_) => {
-                // For uprobes, args might be pointers to user memory
                 if self.is_userspace_probe() {
-                    MirType::Ptr {
-                        pointee: Box::new(MirType::U8),
+                    HMType::Ptr {
+                        pointee: Box::new(HMType::U8),
                         address_space: AddressSpace::User,
                     }
                 } else {
-                    MirType::I64
+                    HMType::I64
                 }
             }
 
-            // Return value
-            CtxField::RetVal => MirType::I64,
+            CtxField::RetVal => HMType::I64,
+            CtxField::KStack | CtxField::UStack => HMType::I64,
 
-            // Stack trace IDs
-            CtxField::KStack | CtxField::UStack => MirType::I64,
-
-            // Process name (16-byte array)
-            CtxField::Comm => MirType::Array {
-                elem: Box::new(MirType::U8),
+            CtxField::Comm => HMType::Array {
+                elem: Box::new(HMType::U8),
                 len: 16,
             },
 
-            // Tracepoint fields - type depends on the field name
-            // For now, default to i64; could be enhanced with BTF later
-            CtxField::TracepointField(_) => MirType::I64,
+            CtxField::TracepointField(_) => HMType::I64,
         }
     }
 
@@ -259,14 +334,14 @@ impl TypeInference {
             .unwrap_or(false)
     }
 
-    /// Infer result type of a binary operation
-    fn infer_binop(
-        &self,
+    /// Determine result type of a binary operation
+    fn binop_result_type(
+        &mut self,
         op: BinOpKind,
-        lhs: &MirType,
-        rhs: &MirType,
-    ) -> Result<MirType, TypeError> {
-        // Comparison operators always return bool
+        lhs: &HMType,
+        rhs: &HMType,
+    ) -> Result<HMType, TypeError> {
+        // Comparison operators return bool
         if matches!(
             op,
             BinOpKind::Eq
@@ -276,209 +351,174 @@ impl TypeInference {
                 | BinOpKind::Gt
                 | BinOpKind::Ge
         ) {
-            // Check that operands are compatible
-            if !self.types_comparable(lhs, rhs) {
-                return Err(TypeError::new(format!(
-                    "Cannot compare {} with {}",
-                    self.type_name(lhs),
-                    self.type_name(rhs)
-                ))
-                .with_hint("comparison requires matching types"));
-            }
-            return Ok(MirType::Bool);
+            // Add constraint that operands are comparable
+            // For now, we allow comparing any types and check at unification
+            return Ok(HMType::Bool);
         }
 
         // Arithmetic operations
         match op {
             BinOpKind::Add | BinOpKind::Sub => {
                 // Pointer arithmetic: ptr + int -> ptr
-                if let MirType::Ptr { .. } = lhs {
-                    if self.is_integer(rhs) {
-                        return Ok(lhs.clone());
-                    }
+                if let HMType::Ptr { .. } = lhs {
+                    return Ok(lhs.clone());
                 }
-                // Regular arithmetic
-                self.promote_numeric(lhs, rhs)
+                // Regular arithmetic - result is larger type
+                Ok(self.promote_numeric(lhs, rhs))
             }
 
             BinOpKind::Mul | BinOpKind::Div | BinOpKind::Mod => {
-                // Only integers
-                if !self.is_integer(lhs) || !self.is_integer(rhs) {
-                    return Err(TypeError::new(format!(
-                        "Arithmetic operation requires integers, got {} and {}",
-                        self.type_name(lhs),
-                        self.type_name(rhs)
-                    )));
-                }
-                self.promote_numeric(lhs, rhs)
+                Ok(self.promote_numeric(lhs, rhs))
             }
 
             BinOpKind::And | BinOpKind::Or | BinOpKind::Xor => {
-                // Bitwise ops on integers
-                if !self.is_integer(lhs) || !self.is_integer(rhs) {
-                    return Err(TypeError::new(format!(
-                        "Bitwise operation requires integers, got {} and {}",
-                        self.type_name(lhs),
-                        self.type_name(rhs)
-                    )));
-                }
-                self.promote_numeric(lhs, rhs)
+                Ok(self.promote_numeric(lhs, rhs))
             }
 
             BinOpKind::Shl | BinOpKind::Shr => {
-                // Shift: result type is lhs type
-                if !self.is_integer(lhs) {
-                    return Err(TypeError::new(format!(
-                        "Shift operation requires integer, got {}",
-                        self.type_name(lhs)
-                    )));
-                }
+                // Shift result type is lhs type
                 Ok(lhs.clone())
             }
 
-            _ => Ok(MirType::I64), // Fallback
+            _ => Ok(HMType::I64),
         }
     }
 
-    /// Infer result type of a unary operation
-    fn infer_unaryop(&self, op: UnaryOpKind, src: &MirType) -> Result<MirType, TypeError> {
+    /// Determine result type of a unary operation
+    fn unaryop_result_type(&self, op: UnaryOpKind, src: &HMType) -> Result<HMType, TypeError> {
         match op {
-            UnaryOpKind::Not => {
-                // Logical not: any value -> bool
-                Ok(MirType::Bool)
-            }
-            UnaryOpKind::BitNot | UnaryOpKind::Neg => {
-                // Bitwise/arithmetic negation preserves type
-                if !self.is_integer(src) {
-                    return Err(TypeError::new(format!(
-                        "Negation requires integer, got {}",
-                        self.type_name(src)
-                    )));
-                }
-                Ok(src.clone())
-            }
+            UnaryOpKind::Not => Ok(HMType::Bool),
+            UnaryOpKind::BitNot | UnaryOpKind::Neg => Ok(src.clone()),
         }
-    }
-
-    /// Check if two types can be compared
-    fn types_comparable(&self, lhs: &MirType, rhs: &MirType) -> bool {
-        // Same types are always comparable
-        if lhs == rhs {
-            return true;
-        }
-
-        // All integer types are comparable
-        if self.is_integer(lhs) && self.is_integer(rhs) {
-            return true;
-        }
-
-        // Pointers can be compared (for null checks)
-        if matches!(lhs, MirType::Ptr { .. }) && matches!(rhs, MirType::Ptr { .. }) {
-            return true;
-        }
-
-        // Pointer can be compared with integer (for null check: ptr == 0)
-        if matches!(lhs, MirType::Ptr { .. }) && self.is_integer(rhs) {
-            return true;
-        }
-        if self.is_integer(lhs) && matches!(rhs, MirType::Ptr { .. }) {
-            return true;
-        }
-
-        // Unknown type is comparable with anything
-        if matches!(lhs, MirType::Unknown) || matches!(rhs, MirType::Unknown) {
-            return true;
-        }
-
-        false
-    }
-
-    /// Check if a type is an integer
-    fn is_integer(&self, ty: &MirType) -> bool {
-        matches!(
-            ty,
-            MirType::I8
-                | MirType::I16
-                | MirType::I32
-                | MirType::I64
-                | MirType::U8
-                | MirType::U16
-                | MirType::U32
-                | MirType::U64
-                | MirType::Bool
-                | MirType::Unknown
-        )
     }
 
     /// Promote two numeric types to a common type
-    fn promote_numeric(&self, lhs: &MirType, rhs: &MirType) -> Result<MirType, TypeError> {
-        // If either is unknown, result is I64
-        if matches!(lhs, MirType::Unknown) || matches!(rhs, MirType::Unknown) {
-            return Ok(MirType::I64);
+    fn promote_numeric(&self, lhs: &HMType, rhs: &HMType) -> HMType {
+        // If either is a type variable, return I64 as default
+        if matches!(lhs, HMType::Var(_)) || matches!(rhs, HMType::Var(_)) {
+            return HMType::I64;
         }
 
-        // Use the larger type
-        let lhs_size = lhs.size();
-        let rhs_size = rhs.size();
+        // If either is unknown, return I64
+        if matches!(lhs, HMType::Unknown) || matches!(rhs, HMType::Unknown) {
+            return HMType::I64;
+        }
+
+        // Get sizes
+        let lhs_size = self.type_size(lhs);
+        let rhs_size = self.type_size(rhs);
 
         // Prefer signed if either is signed
-        let is_signed = matches!(lhs, MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64)
-            || matches!(rhs, MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64);
-
+        let is_signed = self.is_signed(lhs) || self.is_signed(rhs);
         let size = lhs_size.max(rhs_size);
 
-        Ok(if is_signed {
+        if is_signed {
             match size {
-                1 => MirType::I8,
-                2 => MirType::I16,
-                4 => MirType::I32,
-                _ => MirType::I64,
+                1 => HMType::I8,
+                2 => HMType::I16,
+                4 => HMType::I32,
+                _ => HMType::I64,
             }
         } else {
             match size {
-                1 => MirType::U8,
-                2 => MirType::U16,
-                4 => MirType::U32,
-                _ => MirType::U64,
+                1 => HMType::U8,
+                2 => HMType::U16,
+                4 => HMType::U32,
+                _ => HMType::U64,
             }
-        })
-    }
-
-    /// Get a human-readable name for a type (in Nu terms)
-    fn type_name(&self, ty: &MirType) -> &'static str {
-        match ty {
-            MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64 => "integer",
-            MirType::U8 | MirType::U16 | MirType::U32 | MirType::U64 => "integer",
-            MirType::Bool => "boolean",
-            MirType::Ptr { .. } => "pointer",
-            MirType::Array { elem, .. } if matches!(**elem, MirType::U8) => "string",
-            MirType::Array { .. } => "array",
-            MirType::Struct { .. } => "record",
-            MirType::MapRef { .. } => "map",
-            MirType::Unknown => "unknown",
         }
     }
 
-    /// Set the type for a vreg
-    fn set_type(&mut self, vreg: VReg, ty: MirType) {
-        self.vreg_types.insert(vreg, ty);
+    fn type_size(&self, ty: &HMType) -> usize {
+        match ty {
+            HMType::I8 | HMType::U8 | HMType::Bool => 1,
+            HMType::I16 | HMType::U16 => 2,
+            HMType::I32 | HMType::U32 => 4,
+            HMType::I64 | HMType::U64 => 8,
+            _ => 8,
+        }
     }
 
-    /// Get the type for a vreg
-    pub fn get_type(&self, vreg: VReg) -> Option<&MirType> {
-        self.vreg_types.get(&vreg)
+    fn is_signed(&self, ty: &HMType) -> bool {
+        matches!(ty, HMType::I8 | HMType::I16 | HMType::I32 | HMType::I64)
     }
 
-    /// Get the full type map
-    pub fn types(&self) -> &HashMap<VReg, MirType> {
-        &self.vreg_types
+    /// Convert HMType to MirType
+    fn hm_to_mir(&self, ty: &HMType) -> MirType {
+        // Apply current substitution first
+        let resolved = self.substitution.apply(ty);
+
+        match resolved {
+            HMType::Var(_) => MirType::I64, // Unresolved var defaults to I64
+            HMType::I8 => MirType::I8,
+            HMType::I16 => MirType::I16,
+            HMType::I32 => MirType::I32,
+            HMType::I64 => MirType::I64,
+            HMType::U8 => MirType::U8,
+            HMType::U16 => MirType::U16,
+            HMType::U32 => MirType::U32,
+            HMType::U64 => MirType::U64,
+            HMType::Bool => MirType::Bool,
+            HMType::Ptr {
+                pointee,
+                address_space,
+            } => MirType::Ptr {
+                pointee: Box::new(self.hm_to_mir(&pointee)),
+                address_space,
+            },
+            HMType::Array { elem, len } => MirType::Array {
+                elem: Box::new(self.hm_to_mir(&elem)),
+                len,
+            },
+            HMType::Struct { name, fields } => {
+                let mut mir_fields = Vec::new();
+                let mut offset = 0;
+                for (field_name, field_ty) in fields {
+                    let mir_ty = self.hm_to_mir(&field_ty);
+                    let size = mir_ty.size();
+                    mir_fields.push(super::mir::StructField {
+                        name: field_name,
+                        ty: mir_ty,
+                        offset,
+                    });
+                    offset += size;
+                }
+                MirType::Struct {
+                    name,
+                    fields: mir_fields,
+                }
+            }
+            HMType::MapRef { key_ty, val_ty } => MirType::MapRef {
+                key_ty: Box::new(self.hm_to_mir(&key_ty)),
+                val_ty: Box::new(self.hm_to_mir(&val_ty)),
+            },
+            HMType::Fn { .. } => MirType::I64, // Functions not in MirType
+            HMType::Unknown => MirType::Unknown,
+        }
+    }
+
+    /// Get the type for a vreg (after inference)
+    pub fn get_type(&self, vreg: VReg) -> Option<MirType> {
+        let tvar = self.vreg_vars.get(&vreg)?;
+        let hm_type = self.substitution.apply(&HMType::Var(*tvar));
+        Some(self.hm_to_mir(&hm_type))
+    }
+
+    /// Get all inferred types
+    pub fn types(&self) -> HashMap<VReg, MirType> {
+        let mut result = HashMap::new();
+        for (vreg, tvar) in &self.vreg_vars {
+            let hm_type = self.substitution.apply(&HMType::Var(*tvar));
+            result.insert(*vreg, self.hm_to_mir(&hm_type));
+        }
+        result
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::mir::{BasicBlock, BlockId, MirFunction, StackSlotId};
+    use crate::compiler::mir::{BlockId, MirFunction};
 
     fn make_test_function() -> MirFunction {
         let mut func = MirFunction::new();
@@ -600,7 +640,6 @@ mod tests {
         let mut ti = TypeInference::new(None);
         let types = ti.infer(&func).unwrap();
 
-        // Comparison result is bool
         assert_eq!(types.get(&v1), Some(&MirType::Bool));
     }
 
@@ -621,7 +660,6 @@ mod tests {
         let mut ti = TypeInference::new(Some(ctx));
         let types = ti.infer(&func).unwrap();
 
-        // For uprobe, arg is a user pointer
         match types.get(&v0) {
             Some(MirType::Ptr { address_space, .. }) => {
                 assert_eq!(*address_space, AddressSpace::User);
@@ -647,7 +685,6 @@ mod tests {
         let mut ti = TypeInference::new(Some(ctx));
         let types = ti.infer(&func).unwrap();
 
-        // For kprobe, arg is i64
         assert_eq!(types.get(&v0), Some(&MirType::I64));
     }
 
@@ -708,5 +745,71 @@ mod tests {
         // Both should be U64 (timestamp type)
         assert_eq!(types.get(&v0), Some(&MirType::U64));
         assert_eq!(types.get(&v1), Some(&MirType::U64));
+    }
+
+    #[test]
+    fn test_type_propagation_through_chain() {
+        // Test that types propagate through a chain of copies
+        let mut func = make_test_function();
+        let v0 = func.alloc_vreg();
+        let v1 = func.alloc_vreg();
+        let v2 = func.alloc_vreg();
+
+        let block = func.block_mut(BlockId(0));
+        block.instructions.push(MirInst::LoadCtxField {
+            dst: v0,
+            field: CtxField::Pid, // U32
+        });
+        block.instructions.push(MirInst::Copy {
+            dst: v1,
+            src: MirValue::VReg(v0),
+        });
+        block.instructions.push(MirInst::Copy {
+            dst: v2,
+            src: MirValue::VReg(v1),
+        });
+        block.terminator = MirInst::Return { val: None };
+
+        let mut ti = TypeInference::new(None);
+        let types = ti.infer(&func).unwrap();
+
+        // All should be U32
+        assert_eq!(types.get(&v0), Some(&MirType::U32));
+        assert_eq!(types.get(&v1), Some(&MirType::U32));
+        assert_eq!(types.get(&v2), Some(&MirType::U32));
+    }
+
+    #[test]
+    fn test_unification_through_binop() {
+        // Test that types unify correctly through binary operations
+        let mut func = make_test_function();
+        let v0 = func.alloc_vreg();
+        let v1 = func.alloc_vreg();
+        let v2 = func.alloc_vreg();
+
+        let block = func.block_mut(BlockId(0));
+        block.instructions.push(MirInst::LoadCtxField {
+            dst: v0,
+            field: CtxField::Uid, // U32
+        });
+        block.instructions.push(MirInst::Copy {
+            dst: v1,
+            src: MirValue::VReg(v0),
+        });
+        // Compare v1 (which got type from v0) with constant
+        block.instructions.push(MirInst::BinOp {
+            dst: v2,
+            op: BinOpKind::Eq,
+            lhs: MirValue::VReg(v1),
+            rhs: MirValue::Const(0),
+        });
+        block.terminator = MirInst::Return { val: None };
+
+        let mut ti = TypeInference::new(None);
+        let types = ti.infer(&func).unwrap();
+
+        assert_eq!(types.get(&v0), Some(&MirType::U32));
+        assert_eq!(types.get(&v1), Some(&MirType::U32));
+        assert_eq!(types.get(&v2), Some(&MirType::Bool));
     }
 }

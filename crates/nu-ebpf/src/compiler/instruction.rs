@@ -415,6 +415,17 @@ impl EbpfInsn {
         )
     }
 
+    /// STXB [dst+off], src - Store 8-bit value from register to memory
+    pub const fn stxb(dst: EbpfReg, offset: i16, src: EbpfReg) -> Self {
+        Self::new(
+            opcode::BPF_STX | opcode::BPF_B | opcode::BPF_MEM,
+            dst.as_u8(),
+            src.as_u8(),
+            offset,
+            0,
+        )
+    }
+
     /// LDXB dst, [src+off] - Load 8-bit value from memory to register
     pub const fn ldxb(dst: EbpfReg, src: EbpfReg, offset: i16) -> Self {
         Self::new(

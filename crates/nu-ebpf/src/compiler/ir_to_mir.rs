@@ -561,8 +561,8 @@ impl<'a> IrToMirLowering<'a> {
                             .map(|m| m.literal_string.is_some())
                             .unwrap_or(false)
                         {
-                            let len = val_meta.as_ref().unwrap().literal_string.as_ref().unwrap().len();
-                            StringAppendType::Literal { len }
+                            let bytes = val_meta.as_ref().unwrap().literal_string.as_ref().unwrap().as_bytes().to_vec();
+                            StringAppendType::Literal { bytes }
                         } else {
                             // Default to integer
                             StringAppendType::Integer

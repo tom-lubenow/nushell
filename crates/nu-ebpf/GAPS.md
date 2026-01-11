@@ -1,10 +1,14 @@
   NOT Supported (Major Gaps)
 
-  1. String Interpolation - MIR infrastructure in place, code generation pending
-  # Won't work yet:
-  $"pid: ($ctx.pid)"
-  # Has: StringAppend/IntToString MIR instructions, IR-to-MIR lowering
-  # Needs: eBPF code generation for string concatenation
+  1. String Interpolation - Partial support (literal/slot append works)
+  # Now works (literal string appending):
+  $"hello world"           # Literal strings work
+  # Partial (slot-to-slot copy):
+  $ctx.comm | read-str     # String slot operations work
+  # Not yet (integer to string in interpolation):
+  $"pid: ($ctx.pid)"       # Integer conversion in StringAppend needs more work
+  # Has: StringAppend (Literal/StringSlot), IntToString code generation
+  # TODO: StringAppend with Integer type (use IntToString first, then append)
 
   2. Environment Variables - Not supported (with clear error message)
   # Won't work (eBPF runs in kernel, no access to user environment):

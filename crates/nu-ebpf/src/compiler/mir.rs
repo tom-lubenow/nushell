@@ -62,10 +62,10 @@ pub enum MapKind {
 }
 
 /// Type of value being appended in StringAppend
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StringAppendType {
-    /// Append a literal string (from data section, with known length)
-    Literal { len: usize },
+    /// Append a literal string (bytes embedded in MIR)
+    Literal { bytes: Vec<u8> },
     /// Append from a string slot on the stack
     StringSlot { slot: StackSlotId, max_len: usize },
     /// Append an integer converted to decimal

@@ -504,7 +504,7 @@ impl<'a> SsaBuilder<'a> {
                 dst_buffer: *dst_buffer,
                 dst_len: self.rename_vreg(*dst_len),
                 val: self.rename_value(val),
-                val_type: *val_type,
+                val_type: val_type.clone(),
             },
             MirInst::IntToString {
                 dst_buffer,

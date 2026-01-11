@@ -1,14 +1,12 @@
   NOT Supported (Major Gaps)
 
-  1. String Interpolation - Partial support (literal/slot append works)
-  # Now works (literal string appending):
-  $"hello world"           # Literal strings work
-  # Partial (slot-to-slot copy):
-  $ctx.comm | read-str     # String slot operations work
-  # Not yet (integer to string in interpolation):
-  $"pid: ($ctx.pid)"       # Integer conversion in StringAppend needs more work
-  # Has: StringAppend (Literal/StringSlot), IntToString code generation
-  # TODO: StringAppend with Integer type (use IntToString first, then append)
+  1. String Interpolation - Full code generation support
+  # Now works:
+  $"hello world"           # Literal strings
+  $ctx.comm | read-str     # String slot operations
+  $"pid: ($ctx.pid)"       # Integer interpolation
+  # Has: StringAppend (Literal/StringSlot/Integer), IntToString code generation
+  # Note: Large integers (20+ digits) and complex expressions may hit instruction limits
 
   2. Environment Variables - Not supported (with clear error message)
   # Won't work (eBPF runs in kernel, no access to user environment):

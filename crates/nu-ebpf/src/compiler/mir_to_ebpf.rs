@@ -766,7 +766,7 @@ impl<'a> MirToEbpfCompiler<'a> {
             MirInst::StringAppend {
                 dst_buffer,
                 dst_len,
-                val: _,
+                val,
                 val_type,
             } => {
                 // Get destination buffer offset
@@ -852,22 +852,145 @@ impl<'a> MirToEbpfCompiler<'a> {
                     }
 
                     StringAppendType::Integer => {
-                        // Integer to string conversion
-                        // This is complex - we need to extract digits and store them
-                        // For now, emit a simplified version that handles positive integers
+                        // Integer to string conversion then append
+                        // Strategy:
+                        // 1. Allocate 24-byte temp buffer for digit extraction
+                        // 2. Extract digits in reverse order (at temp+19 down)
+                        // 3. Copy digits in correct order to dst_buffer at dst_len
+                        // 4. Update dst_len
 
-                        // We'll use a helper approach: convert to string in reverse order
-                        // then reverse. But for eBPF simplicity, we'll just format simple numbers.
+                        // Get the integer value register
+                        let val_reg = match val {
+                            MirValue::VReg(v) => self.ensure_reg(*v)?,
+                            MirValue::Const(c) => {
+                                // Load constant into R0
+                                self.instructions
+                                    .push(EbpfInsn::mov64_imm(EbpfReg::R0, *c as i32));
+                                EbpfReg::R0
+                            }
+                            MirValue::StackSlot(_) => {
+                                return Err(CompileError::UnsupportedInstruction(
+                                    "Stack slot as integer value not supported".into(),
+                                ));
+                            }
+                        };
 
-                        // This is a placeholder - full implementation requires:
-                        // 1. Handle negative numbers
-                        // 2. Extract digits via repeated division
-                        // 3. Store in correct order
+                        // Allocate temporary buffer for digit extraction (24 bytes)
+                        self.check_stack_space(24)?;
+                        self.stack_offset -= 24;
+                        let temp_offset = self.stack_offset;
 
-                        // For now, return error for complex case
-                        return Err(CompileError::UnsupportedInstruction(
-                            "Integer to string conversion in StringAppend not yet fully implemented".into(),
-                        ));
+                        // Check for zero special case
+                        // We need to preserve val_reg, so copy to R3
+                        self.instructions
+                            .push(EbpfInsn::mov64_reg(EbpfReg::R3, val_reg));
+
+                        // R4 = digit count
+                        self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R4, 0));
+
+                        // Check if value is 0
+                        let non_zero_skip = 5i16;
+                        self.instructions
+                            .push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
+                        self.instructions
+                            .push(EbpfInsn::jne_reg(EbpfReg::R3, EbpfReg::R0, non_zero_skip));
+
+                        // Value is 0: store '0' at temp+19, set digit count to 1
+                        self.instructions
+                            .push(EbpfInsn::mov64_imm(EbpfReg::R0, b'0' as i32));
+                        self.instructions
+                            .push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
+                        self.instructions
+                            .push(EbpfInsn::add64_imm(EbpfReg::R1, (temp_offset + 19) as i32));
+                        self.instructions
+                            .push(EbpfInsn::stxb(EbpfReg::R1, 0, EbpfReg::R0));
+                        self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R4, 1));
+
+                        // Extract digits for non-zero value (bounded loop for verifier)
+                        for _ in 0..20 {
+                            // Skip if R3 == 0
+                            let done_offset = 8i16;
+                            self.instructions
+                                .push(EbpfInsn::jeq_imm(EbpfReg::R3, 0, done_offset));
+
+                            // R0 = R3 % 10 (digit)
+                            self.instructions
+                                .push(EbpfInsn::mov64_reg(EbpfReg::R0, EbpfReg::R3));
+                            self.instructions.push(EbpfInsn::mod64_imm(EbpfReg::R0, 10));
+
+                            // Convert to ASCII: R0 += '0'
+                            self.instructions
+                                .push(EbpfInsn::add64_imm(EbpfReg::R0, b'0' as i32));
+
+                            // Store digit at temp + 19 - R4
+                            self.instructions
+                                .push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
+                            self.instructions
+                                .push(EbpfInsn::add64_imm(EbpfReg::R1, (temp_offset + 19) as i32));
+                            self.instructions
+                                .push(EbpfInsn::sub64_reg(EbpfReg::R1, EbpfReg::R4));
+                            self.instructions
+                                .push(EbpfInsn::stxb(EbpfReg::R1, 0, EbpfReg::R0));
+
+                            // R3 = R3 / 10
+                            self.instructions.push(EbpfInsn::div64_imm(EbpfReg::R3, 10));
+
+                            // R4++ (digit count)
+                            self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R4, 1));
+                        }
+
+                        // Now copy digits from temp buffer to dst_buffer
+                        // Digits are at temp + (20 - R4) to temp + 19
+                        // Copy to dst_buffer + dst_len
+
+                        // R5 = start position in temp = 20 - R4
+                        self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R5, 20));
+                        self.instructions
+                            .push(EbpfInsn::sub64_reg(EbpfReg::R5, EbpfReg::R4));
+
+                        // Copy loop (bounded by max 20 digits)
+                        for i in 0..20 {
+                            // Skip if we've copied all digits (i >= R4)
+                            self.instructions
+                                .push(EbpfInsn::mov64_imm(EbpfReg::R0, i));
+                            let skip_copy = 7i16;
+                            // Jump if R0 >= R4 (unsigned)
+                            self.instructions.push(EbpfInsn::new(
+                                opcode::BPF_JMP | opcode::BPF_JGE | opcode::BPF_X,
+                                EbpfReg::R0.as_u8(),
+                                EbpfReg::R4.as_u8(),
+                                skip_copy,
+                                0,
+                            ));
+
+                            // Load byte from temp + R5 + i
+                            self.instructions
+                                .push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R10));
+                            self.instructions
+                                .push(EbpfInsn::add64_imm(EbpfReg::R1, temp_offset as i32));
+                            self.instructions
+                                .push(EbpfInsn::add64_reg(EbpfReg::R1, EbpfReg::R5));
+                            self.instructions
+                                .push(EbpfInsn::add64_imm(EbpfReg::R1, i));
+                            self.instructions
+                                .push(EbpfInsn::ldxb(EbpfReg::R0, EbpfReg::R1, 0));
+
+                            // Store to dst_buffer + dst_len + i
+                            self.instructions
+                                .push(EbpfInsn::mov64_reg(EbpfReg::R2, EbpfReg::R10));
+                            self.instructions
+                                .push(EbpfInsn::add64_imm(EbpfReg::R2, dst_offset as i32));
+                            self.instructions
+                                .push(EbpfInsn::add64_reg(EbpfReg::R2, len_reg));
+                            self.instructions
+                                .push(EbpfInsn::add64_imm(EbpfReg::R2, i));
+                            self.instructions
+                                .push(EbpfInsn::stxb(EbpfReg::R2, 0, EbpfReg::R0));
+                        }
+
+                        // Update dst_len += digit_count (R4)
+                        self.instructions
+                            .push(EbpfInsn::add64_reg(len_reg, EbpfReg::R4));
                     }
                 }
             }
@@ -3685,6 +3808,112 @@ mod tests {
         let result = compiler.compile();
 
         assert!(result.is_ok(), "StringAppend slot should compile");
+        let result = result.unwrap();
+        assert!(!result.bytecode.is_empty(), "Should generate bytecode");
+    }
+
+    #[test]
+    fn test_string_append_integer() {
+        // Test appending an integer to a string (integer interpolation)
+        use crate::compiler::mir::*;
+
+        let mut func = MirFunction::new();
+        let entry = func.alloc_block();
+        func.entry = entry;
+
+        // Allocate stack slot for string buffer
+        let slot = func.alloc_stack_slot(64, 8, StackSlotKind::StringBuffer);
+
+        // Allocate vregs
+        let len_vreg = func.alloc_vreg();
+        let int_vreg = func.alloc_vreg();
+
+        // Initialize length to 0
+        func.block_mut(entry).instructions.push(MirInst::Copy {
+            dst: len_vreg,
+            src: MirValue::Const(0),
+        });
+
+        // Load integer value 12345
+        func.block_mut(entry).instructions.push(MirInst::Copy {
+            dst: int_vreg,
+            src: MirValue::Const(12345),
+        });
+
+        // Append integer to string
+        func.block_mut(entry).instructions.push(MirInst::StringAppend {
+            dst_buffer: slot,
+            dst_len: len_vreg,
+            val: MirValue::VReg(int_vreg),
+            val_type: StringAppendType::Integer,
+        });
+
+        func.block_mut(entry).terminator = MirInst::Return {
+            val: Some(MirValue::Const(0)),
+        };
+
+        let program = MirProgram {
+            main: func,
+            subfunctions: vec![],
+        };
+
+        let compiler = MirToEbpfCompiler::new(&program, None);
+        let result = compiler.compile();
+
+        assert!(result.is_ok(), "StringAppend integer should compile");
+        let result = result.unwrap();
+        assert!(!result.bytecode.is_empty(), "Should generate bytecode");
+    }
+
+    #[test]
+    fn test_string_append_integer_zero() {
+        // Test appending zero to a string (edge case)
+        use crate::compiler::mir::*;
+
+        let mut func = MirFunction::new();
+        let entry = func.alloc_block();
+        func.entry = entry;
+
+        // Allocate stack slot for string buffer
+        let slot = func.alloc_stack_slot(64, 8, StackSlotKind::StringBuffer);
+
+        // Allocate vregs
+        let len_vreg = func.alloc_vreg();
+        let int_vreg = func.alloc_vreg();
+
+        // Initialize length to 0
+        func.block_mut(entry).instructions.push(MirInst::Copy {
+            dst: len_vreg,
+            src: MirValue::Const(0),
+        });
+
+        // Load integer value 0
+        func.block_mut(entry).instructions.push(MirInst::Copy {
+            dst: int_vreg,
+            src: MirValue::Const(0),
+        });
+
+        // Append integer to string
+        func.block_mut(entry).instructions.push(MirInst::StringAppend {
+            dst_buffer: slot,
+            dst_len: len_vreg,
+            val: MirValue::VReg(int_vreg),
+            val_type: StringAppendType::Integer,
+        });
+
+        func.block_mut(entry).terminator = MirInst::Return {
+            val: Some(MirValue::Const(0)),
+        };
+
+        let program = MirProgram {
+            main: func,
+            subfunctions: vec![],
+        };
+
+        let compiler = MirToEbpfCompiler::new(&program, None);
+        let result = compiler.compile();
+
+        assert!(result.is_ok(), "StringAppend integer zero should compile");
         let result = result.unwrap();
         assert!(!result.bytecode.is_empty(), "Should generate bytecode");
     }

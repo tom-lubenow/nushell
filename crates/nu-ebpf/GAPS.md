@@ -17,12 +17,15 @@
   count --per-cpu      # Named arg tracked
   # Not all commands use them yet - extend lower_call as needed
 
-  4. Full Match Expressions - Only boolean patterns work
-  # Won't work:
+  4. Match Expressions - Expanded support
+  # Now works:
   match $x {
       0 => "zero"
-      _ => "other"
+      1 | 2 => "small"   # Or patterns
+      $y => $y           # Variable binding
+      _ => "other"       # Wildcard
   }
+  # Not yet: record/list destructuring patterns
 
   5. Cell Path Updates - UpsertCellPath missing
   # Won't work:

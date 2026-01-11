@@ -917,7 +917,7 @@ impl<'a> IrToMirLowering<'a> {
         Ok(())
     }
 
-    /// Lower Match instruction (used for short-circuit boolean evaluation)
+    /// Lower Match instruction (used for pattern matching and short-circuit boolean evaluation)
     fn lower_match(
         &mut self,
         pattern: &Pattern,
@@ -930,40 +930,113 @@ impl<'a> IrToMirLowering<'a> {
 
         match pattern {
             Pattern::Value(value) => {
-                // Branch if src matches the literal value
-                if let Value::Bool { val, .. } = value {
-                    // For `and`: match(false) - jump if src == 0
-                    // For `or`: match(true) - jump if src != 0
-                    if *val {
-                        // Jump if src != 0 (true)
-                        self.terminate(MirInst::Branch {
-                            cond: src_vreg,
-                            if_true: target_block,
-                            if_false: continue_block,
+                match value {
+                    Value::Bool { val, .. } => {
+                        // For `and`: match(false) - jump if src == 0
+                        // For `or`: match(true) - jump if src != 0
+                        if *val {
+                            // Jump if src != 0 (true)
+                            self.terminate(MirInst::Branch {
+                                cond: src_vreg,
+                                if_true: target_block,
+                                if_false: continue_block,
+                            });
+                        } else {
+                            // Jump if src == 0 (false) - need to negate
+                            let tmp = self.func.alloc_vreg();
+                            self.emit(MirInst::UnaryOp {
+                                dst: tmp,
+                                op: super::mir::UnaryOpKind::Not,
+                                src: MirValue::VReg(src_vreg),
+                            });
+                            self.terminate(MirInst::Branch {
+                                cond: tmp,
+                                if_true: target_block,
+                                if_false: continue_block,
+                            });
+                        }
+                    }
+                    Value::Int { val, .. } => {
+                        // Compare src == val, branch if equal
+                        let cmp_result = self.func.alloc_vreg();
+                        self.emit(MirInst::BinOp {
+                            dst: cmp_result,
+                            op: BinOpKind::Eq,
+                            lhs: MirValue::VReg(src_vreg),
+                            rhs: MirValue::Const(*val),
                         });
-                    } else {
-                        // Jump if src == 0 (false) - need to negate
-                        let tmp = self.func.alloc_vreg();
-                        self.emit(MirInst::UnaryOp {
-                            dst: tmp,
-                            op: super::mir::UnaryOpKind::Not,
-                            src: MirValue::VReg(src_vreg),
-                        });
                         self.terminate(MirInst::Branch {
-                            cond: tmp,
+                            cond: cmp_result,
                             if_true: target_block,
                             if_false: continue_block,
                         });
                     }
-                } else {
-                    return Err(CompileError::UnsupportedInstruction(
-                        "Match pattern must be boolean".into(),
-                    ));
+                    Value::Nothing { .. } => {
+                        // Match against 0 (Nothing is represented as 0 in eBPF)
+                        let cmp_result = self.func.alloc_vreg();
+                        self.emit(MirInst::BinOp {
+                            dst: cmp_result,
+                            op: BinOpKind::Eq,
+                            lhs: MirValue::VReg(src_vreg),
+                            rhs: MirValue::Const(0),
+                        });
+                        self.terminate(MirInst::Branch {
+                            cond: cmp_result,
+                            if_true: target_block,
+                            if_false: continue_block,
+                        });
+                    }
+                    _ => {
+                        return Err(CompileError::UnsupportedInstruction(format!(
+                            "Match against value type {:?} not supported in eBPF",
+                            value.get_type()
+                        )));
+                    }
                 }
             }
+
+            Pattern::Variable(var_id) => {
+                // Variable pattern always matches, binds the value to the variable
+                // Store the value in the variable mapping
+                self.var_mappings.insert(*var_id, src_vreg);
+                // Always jump to target (unconditional match)
+                self.terminate(MirInst::Jump {
+                    target: target_block,
+                });
+            }
+
+            Pattern::IgnoreValue => {
+                // The `_` wildcard pattern always matches
+                // Just jump to target unconditionally
+                self.terminate(MirInst::Jump {
+                    target: target_block,
+                });
+            }
+
+            Pattern::Or(patterns) => {
+                // Or pattern: if any sub-pattern matches, jump to target
+                // Create a chain of blocks, each testing one pattern
+                let mut current = self.current_block;
+
+                for (i, sub_pattern) in patterns.iter().enumerate() {
+                    self.current_block = current;
+                    let next = if i == patterns.len() - 1 {
+                        continue_block // Last pattern falls through to continue if no match
+                    } else {
+                        self.func.alloc_block() // More patterns to try
+                    };
+
+                    // Recursively lower the sub-pattern
+                    // Note: this modifies self.current_block
+                    self.lower_match(&sub_pattern.pattern, src, index)?;
+
+                    current = next;
+                }
+            }
+
             _ => {
                 return Err(CompileError::UnsupportedInstruction(format!(
-                    "Match pattern {:?} not supported",
+                    "Match pattern {:?} not yet supported in eBPF",
                     pattern
                 )));
             }

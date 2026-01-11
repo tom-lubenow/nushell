@@ -628,6 +628,10 @@ impl<'a> IrToMirLowering<'a> {
                 // Span tracking - no-op
             }
 
+            Instruction::Collect { .. } => {
+                // Collect stream to value - in eBPF we don't have streams, so no-op
+            }
+
             Instruction::OnError { index } | Instruction::OnErrorInto { index, .. } => {
                 // Error handling - we don't have try/catch in eBPF, record jump target
                 let _ = index;
@@ -893,6 +897,17 @@ impl<'a> IrToMirLowering<'a> {
 
             Literal::Block(block_id) => {
                 // Track block ID same as closure
+                let meta = self.get_or_create_metadata(dst);
+                meta.closure_block_id = Some(*block_id);
+                // Store a placeholder value
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::Const(0),
+                });
+            }
+
+            Literal::RowCondition(block_id) => {
+                // RowCondition is used by `where` command - same as Closure
                 let meta = self.get_or_create_metadata(dst);
                 meta.closure_block_id = Some(*block_id);
                 // Store a placeholder value
@@ -2130,15 +2145,60 @@ impl<'a> IrToMirLowering<'a> {
             CompileError::UnsupportedInstruction("Closure has no IR (not compiled)".into())
         })?;
 
-        // Map $in variable to in_vreg
-        // In Nushell, $in has a well-known variable ID (typically 0)
-        // We'll map it through var_mappings
+        // Save old mappings to restore later
         use nu_protocol::IN_VARIABLE_ID;
         let old_in_mapping = self.var_mappings.get(&IN_VARIABLE_ID).copied();
+
+        // Map $in variable (ID 1) to in_vreg
         self.var_mappings.insert(IN_VARIABLE_ID, in_vreg);
+
+        // Also map any signature parameters to in_vreg
+        // RowCondition blocks may declare their own input variable
+        let mut param_var_ids: Vec<nu_protocol::VarId> = Vec::new();
+        for param in &block.signature.required_positional {
+            if let Some(var_id) = param.var_id {
+                param_var_ids.push(var_id);
+                self.var_mappings.insert(var_id, in_vreg);
+            }
+        }
+        for param in &block.signature.optional_positional {
+            if let Some(var_id) = param.var_id {
+                param_var_ids.push(var_id);
+                self.var_mappings.insert(var_id, in_vreg);
+            }
+        }
+
+        // Also map captures to in_vreg if they're the $in variable
+        // (captures may reference $in from outer scope)
+        for (var_id, _span) in &block.captures {
+            param_var_ids.push(*var_id);
+            self.var_mappings.insert(*var_id, in_vreg);
+        }
+
+        // Scan the IR block for LoadVariable instructions and map any variable
+        // that looks like it could be the row input (position 0)
+        // This handles cases where the block defines its own input variable
+        for inst in &ir_block.instructions {
+            if let Instruction::LoadVariable { var_id, .. } = inst {
+                // Map any variable we don't already have mapped
+                if !self.var_mappings.contains_key(var_id) {
+                    // Assume this is the row input variable
+                    self.var_mappings.insert(*var_id, in_vreg);
+                    param_var_ids.push(*var_id);
+                }
+            }
+        }
 
         // Allocate a vreg for the result
         let result_vreg = self.func.alloc_vreg();
+
+        // Save current register mappings (closure has its own register space)
+        let old_reg_map = std::mem::take(&mut self.reg_map);
+        let old_reg_metadata = std::mem::take(&mut self.reg_metadata);
+
+        // The closure expects its input in RegId(0), so pre-map that
+        // RegId(0) in the closure's IR should map to in_vreg
+        self.reg_map.insert(0, in_vreg);
 
         // Lower the closure body
         // We need to process each instruction in the closure's IR
@@ -2157,11 +2217,20 @@ impl<'a> IrToMirLowering<'a> {
             self.lower_instruction(inst, ir_idx)?;
         }
 
+        // Restore register mappings
+        self.reg_map = old_reg_map;
+        self.reg_metadata = old_reg_metadata;
+
         // Restore old $in mapping (if any)
         if let Some(old) = old_in_mapping {
             self.var_mappings.insert(IN_VARIABLE_ID, old);
         } else {
             self.var_mappings.remove(&IN_VARIABLE_ID);
+        }
+
+        // Remove signature parameter mappings
+        for var_id in param_var_ids {
+            self.var_mappings.remove(&var_id);
         }
 
         Ok(result_vreg)

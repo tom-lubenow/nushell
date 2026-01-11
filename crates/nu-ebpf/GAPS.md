@@ -47,7 +47,7 @@
   [[name, age]; [Alice, 30]]
   # Limited by stack size (~10-15 rows max depending on record size)
 
-  8. Pipelines with Multiple Commands - Now supports where/each/filter
+  8. Pipelines with Multiple Commands - Now supports where/each/filter/skip/take
   # Terminal commands:
   $ctx.pid | count                        # Works
   $ctx.pid | emit                         # Works
@@ -57,6 +57,11 @@
   $ctx.pid | where { $in > 100 } | count  # Works - filters then counts
   $ctx.pid | filter { $in > 100 } | count # Works - same as where
   $items | each { $in * 2 } | emit        # Works - transforms then emits
+
+  # List slicing with skip/take:
+  [1, 2, 3, 4, 5] | skip 2                # Works - returns [3, 4, 5]
+  [1, 2, 3, 4, 5] | take 3                # Works - returns [1, 2, 3]
+  [1, 2, 3, 4, 5] | skip 1 | take 2       # Works - returns [2, 3]
 
   # Lists with each (unrolled loop, max 16 elements):
   [1, 2, 3] | each { $in * 2 }            # Works

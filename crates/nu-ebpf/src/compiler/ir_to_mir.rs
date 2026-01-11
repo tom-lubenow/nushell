@@ -1620,6 +1620,216 @@ impl<'a> IrToMirLowering<'a> {
                 }
             }
 
+            "skip" => {
+                // skip N - skip the first N elements of a list
+                let input_vreg = self.pipeline_input.unwrap_or(dst_vreg);
+                let input_reg = self.pipeline_input_reg;
+
+                // Get the skip count from positional args
+                let skip_count = self
+                    .positional_args
+                    .first()
+                    .and_then(|(_, reg)| self.get_metadata(*reg))
+                    .and_then(|m| m.literal_int)
+                    .unwrap_or(1) as usize;
+
+                // Check if input is a list
+                let list_info = input_reg
+                    .and_then(|reg| self.get_metadata(reg))
+                    .and_then(|m| m.list_buffer);
+
+                if let Some((_src_slot, max_len)) = list_info {
+                    // Create output list
+                    let out_slot = self
+                        .func
+                        .alloc_stack_slot((max_len + 1) * 8, 8, StackSlotKind::ListBuffer);
+                    let out_list_vreg = self.func.alloc_vreg();
+                    self.emit(MirInst::ListNew {
+                        dst: out_list_vreg,
+                        buffer: out_slot,
+                        max_len,
+                    });
+
+                    // Get length of input list
+                    let len_vreg = self.func.alloc_vreg();
+                    self.emit(MirInst::ListLen {
+                        dst: len_vreg,
+                        list: input_vreg,
+                    });
+
+                    // Copy elements starting from skip_count
+                    for i in 0..max_len.min(16) {
+                        let actual_idx = i + skip_count;
+                        if actual_idx >= max_len {
+                            break;
+                        }
+
+                        // Skip if actual_idx >= len
+                        let skip_block = self.func.alloc_block();
+                        let process_block = self.func.alloc_block();
+
+                        let idx_vreg = self.func.alloc_vreg();
+                        self.emit(MirInst::Copy {
+                            dst: idx_vreg,
+                            src: MirValue::Const(actual_idx as i64),
+                        });
+
+                        let in_bounds = self.func.alloc_vreg();
+                        self.emit(MirInst::BinOp {
+                            dst: in_bounds,
+                            op: BinOpKind::Lt,
+                            lhs: MirValue::VReg(idx_vreg),
+                            rhs: MirValue::VReg(len_vreg),
+                        });
+                        self.terminate(MirInst::Branch {
+                            cond: in_bounds,
+                            if_true: process_block,
+                            if_false: skip_block,
+                        });
+
+                        // Process: get element and push to output
+                        self.current_block = process_block;
+                        let elem_vreg = self.func.alloc_vreg();
+                        self.emit(MirInst::ListGet {
+                            dst: elem_vreg,
+                            list: input_vreg,
+                            idx: MirValue::Const(actual_idx as i64),
+                        });
+                        self.emit(MirInst::ListPush {
+                            list: out_list_vreg,
+                            item: elem_vreg,
+                        });
+                        self.terminate(MirInst::Jump { target: skip_block });
+
+                        self.current_block = skip_block;
+                    }
+
+                    self.emit(MirInst::Copy {
+                        dst: dst_vreg,
+                        src: MirValue::VReg(out_list_vreg),
+                    });
+
+                    let meta = self.get_or_create_metadata(src_dst);
+                    meta.list_buffer = Some((out_slot, max_len.saturating_sub(skip_count)));
+                } else {
+                    // For non-list values, skip N means return nothing (exit)
+                    if skip_count > 0 {
+                        self.terminate(MirInst::Return {
+                            val: Some(MirValue::Const(0)),
+                        });
+                        let continue_block = self.func.alloc_block();
+                        self.current_block = continue_block;
+                    }
+                    self.emit(MirInst::Copy {
+                        dst: dst_vreg,
+                        src: MirValue::VReg(input_vreg),
+                    });
+                }
+            }
+
+            "take" => {
+                // take N - take only the first N elements of a list
+                let input_vreg = self.pipeline_input.unwrap_or(dst_vreg);
+                let input_reg = self.pipeline_input_reg;
+
+                // Get the take count from positional args
+                let take_count = self
+                    .positional_args
+                    .first()
+                    .and_then(|(_, reg)| self.get_metadata(*reg))
+                    .and_then(|m| m.literal_int)
+                    .unwrap_or(1) as usize;
+
+                // Check if input is a list
+                let list_info = input_reg
+                    .and_then(|reg| self.get_metadata(reg))
+                    .and_then(|m| m.list_buffer);
+
+                if let Some((_src_slot, max_len)) = list_info {
+                    // Create output list
+                    let out_max = take_count.min(max_len);
+                    let out_slot = self
+                        .func
+                        .alloc_stack_slot((out_max + 1) * 8, 8, StackSlotKind::ListBuffer);
+                    let out_list_vreg = self.func.alloc_vreg();
+                    self.emit(MirInst::ListNew {
+                        dst: out_list_vreg,
+                        buffer: out_slot,
+                        max_len: out_max,
+                    });
+
+                    // Get length of input list
+                    let len_vreg = self.func.alloc_vreg();
+                    self.emit(MirInst::ListLen {
+                        dst: len_vreg,
+                        list: input_vreg,
+                    });
+
+                    // Copy up to take_count elements
+                    for i in 0..take_count.min(16) {
+                        // Skip if i >= len
+                        let skip_block = self.func.alloc_block();
+                        let process_block = self.func.alloc_block();
+
+                        let idx_vreg = self.func.alloc_vreg();
+                        self.emit(MirInst::Copy {
+                            dst: idx_vreg,
+                            src: MirValue::Const(i as i64),
+                        });
+
+                        let in_bounds = self.func.alloc_vreg();
+                        self.emit(MirInst::BinOp {
+                            dst: in_bounds,
+                            op: BinOpKind::Lt,
+                            lhs: MirValue::VReg(idx_vreg),
+                            rhs: MirValue::VReg(len_vreg),
+                        });
+                        self.terminate(MirInst::Branch {
+                            cond: in_bounds,
+                            if_true: process_block,
+                            if_false: skip_block,
+                        });
+
+                        // Process: get element and push to output
+                        self.current_block = process_block;
+                        let elem_vreg = self.func.alloc_vreg();
+                        self.emit(MirInst::ListGet {
+                            dst: elem_vreg,
+                            list: input_vreg,
+                            idx: MirValue::Const(i as i64),
+                        });
+                        self.emit(MirInst::ListPush {
+                            list: out_list_vreg,
+                            item: elem_vreg,
+                        });
+                        self.terminate(MirInst::Jump { target: skip_block });
+
+                        self.current_block = skip_block;
+                    }
+
+                    self.emit(MirInst::Copy {
+                        dst: dst_vreg,
+                        src: MirValue::VReg(out_list_vreg),
+                    });
+
+                    let meta = self.get_or_create_metadata(src_dst);
+                    meta.list_buffer = Some((out_slot, out_max));
+                } else {
+                    // For non-list values, take 1+ means pass through, take 0 means nothing
+                    if take_count == 0 {
+                        self.terminate(MirInst::Return {
+                            val: Some(MirValue::Const(0)),
+                        });
+                        let continue_block = self.func.alloc_block();
+                        self.current_block = continue_block;
+                    }
+                    self.emit(MirInst::Copy {
+                        dst: dst_vreg,
+                        src: MirValue::VReg(input_vreg),
+                    });
+                }
+            }
+
             _ => {
                 return Err(CompileError::UnsupportedInstruction(format!(
                     "Command '{}' not supported in eBPF",

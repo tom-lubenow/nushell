@@ -531,6 +531,33 @@ impl<'a> IrToMirLowering<'a> {
                 // No-op in eBPF
             }
 
+            // === Environment Variables (not supported in eBPF) ===
+            Instruction::LoadEnv { key, .. } | Instruction::LoadEnvOpt { key, .. } => {
+                // Environment variables are not accessible from eBPF (kernel space)
+                // Get the key name for a better error message
+                let key_name = self
+                    .get_data_slice(key.start as usize, key.len as usize)
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .unwrap_or("<unknown>");
+                return Err(CompileError::UnsupportedInstruction(format!(
+                    "Environment variable access ($env.{}) is not supported in eBPF. \
+                     eBPF programs run in kernel space without access to user environment.",
+                    key_name
+                )));
+            }
+
+            Instruction::StoreEnv { key, .. } => {
+                let key_name = self
+                    .get_data_slice(key.start as usize, key.len as usize)
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .unwrap_or("<unknown>");
+                return Err(CompileError::UnsupportedInstruction(format!(
+                    "Setting environment variable ($env.{}) is not supported in eBPF. \
+                     eBPF programs run in kernel space without access to user environment.",
+                    key_name
+                )));
+            }
+
             // === No-ops ===
             Instruction::Span { .. } => {
                 // Span tracking - no-op

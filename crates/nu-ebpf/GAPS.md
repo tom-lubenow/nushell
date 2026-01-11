@@ -6,9 +6,10 @@
   # Has: StringAppend/IntToString MIR instructions, IR-to-MIR lowering
   # Needs: eBPF code generation for string concatenation
 
-  2. Environment Variables - LoadEnv/StoreEnv missing
-  # Won't work:
+  2. Environment Variables - Not supported (with clear error message)
+  # Won't work (eBPF runs in kernel, no access to user environment):
   $env.PATH
+  # Error: "Environment variable access is not supported in eBPF"
 
   3. Named Arguments/Flags - PushFlag/PushNamed missing
   # Won't work:

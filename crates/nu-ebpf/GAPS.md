@@ -40,9 +40,10 @@
   # Error: "Closures as first-class values are not supported in eBPF"
   # Workaround: Use inline closures (e.g., `$items | each { $in + 1 }`)
 
-  7. Tables - Built on lists, so don't work
-  # Won't work:
+  7. Tables - Now supported (tables are lists of records)
+  # Should work (uses list + record infrastructure):
   [[name, age]; [Alice, 30]]
+  # Limited by stack size (~10-15 rows max depending on record size)
 
   8. Pipelines with Multiple Commands
   # Limited support - some built-ins only:

@@ -249,6 +249,40 @@ impl TypeInference {
                 self.constrain(counter_ty, HMType::I64, "loop_counter");
             }
 
+            MirInst::ListNew { dst, .. } => {
+                // List pointer is essentially a pointer to stack (list buffer)
+                let dst_ty = self.vreg_type(*dst);
+                let list_ptr_ty = HMType::Ptr {
+                    pointee: Box::new(HMType::I64),
+                    address_space: AddressSpace::Stack,
+                };
+                self.constrain(dst_ty, list_ptr_ty, "list_new");
+            }
+
+            MirInst::ListLen { dst, list } => {
+                // Length is u64
+                let dst_ty = self.vreg_type(*dst);
+                let list_ty = self.vreg_type(*list);
+                let list_ptr_ty = HMType::Ptr {
+                    pointee: Box::new(HMType::I64),
+                    address_space: AddressSpace::Stack,
+                };
+                self.constrain(dst_ty, HMType::U64, "list_len");
+                self.constrain(list_ty, list_ptr_ty, "list_len_src");
+            }
+
+            MirInst::ListGet { dst, list, .. } => {
+                // Element is i64 (all values stored as 64-bit)
+                let dst_ty = self.vreg_type(*dst);
+                let list_ty = self.vreg_type(*list);
+                let list_ptr_ty = HMType::Ptr {
+                    pointee: Box::new(HMType::I64),
+                    address_space: AddressSpace::Stack,
+                };
+                self.constrain(dst_ty, HMType::I64, "list_get");
+                self.constrain(list_ty, list_ptr_ty, "list_get_src");
+            }
+
             MirInst::Phi { dst, args } => {
                 // Phi destination has same type as all its arguments
                 let dst_ty = self.vreg_type(*dst);
@@ -269,6 +303,7 @@ impl TypeInference {
             | MirInst::EmitRecord { .. }
             | MirInst::ReadStr { .. }
             | MirInst::RecordStore { .. }
+            | MirInst::ListPush { .. }
             | MirInst::Jump { .. }
             | MirInst::Branch { .. }
             | MirInst::Return { .. }

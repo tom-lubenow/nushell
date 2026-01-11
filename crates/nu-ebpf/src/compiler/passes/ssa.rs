@@ -448,6 +448,24 @@ impl<'a> SsaBuilder<'a> {
                 val: self.rename_value(val),
                 ty: ty.clone(),
             },
+            MirInst::ListNew { dst, buffer, max_len } => MirInst::ListNew {
+                dst: *dst,
+                buffer: *buffer,
+                max_len: *max_len,
+            },
+            MirInst::ListPush { list, item } => MirInst::ListPush {
+                list: self.rename_vreg(*list),
+                item: self.rename_vreg(*item),
+            },
+            MirInst::ListLen { dst, list } => MirInst::ListLen {
+                dst: *dst,
+                list: self.rename_vreg(*list),
+            },
+            MirInst::ListGet { dst, list, idx } => MirInst::ListGet {
+                dst: *dst,
+                list: self.rename_vreg(*list),
+                idx: self.rename_value(idx),
+            },
             MirInst::Histogram { value } => MirInst::Histogram {
                 value: self.rename_vreg(*value),
             },

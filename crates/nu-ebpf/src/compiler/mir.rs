@@ -194,6 +194,8 @@ pub enum StackSlotKind {
     StringBuffer,
     /// Record field storage
     RecordField,
+    /// List buffer storage (length + elements)
+    ListBuffer,
 }
 
 /// Value that can be used as an operand
@@ -436,6 +438,37 @@ pub enum MirInst {
         ty: MirType,
     },
 
+    // List operations
+    /// Initialize an empty list on the stack
+    /// Layout: [length: u64, elem0: u64, elem1: u64, ...]
+    /// max_len determines the allocated buffer size
+    ListNew {
+        dst: VReg,
+        buffer: StackSlotId,
+        max_len: usize,
+    },
+
+    /// Push an element onto the end of a list
+    /// Stores at offset (length * 8) + 8, then increments length
+    ListPush {
+        list: VReg,
+        item: VReg,
+    },
+
+    /// Get the current length of a list
+    ListLen {
+        dst: VReg,
+        list: VReg,
+    },
+
+    /// Get an element from a list by index
+    /// Returns 0 if index out of bounds
+    ListGet {
+        dst: VReg,
+        list: VReg,
+        idx: MirValue,
+    },
+
     // SSA phi function
     /// Phi node for SSA form - selects value based on incoming edge
     /// Must appear at the start of a block, before any non-phi instructions
@@ -514,6 +547,9 @@ impl MirInst {
             | MirInst::StrCmp { dst, .. }
             | MirInst::StopTimer { dst, .. }
             | MirInst::LoopHeader { counter: dst, .. }
+            | MirInst::ListNew { dst, .. }
+            | MirInst::ListLen { dst, .. }
+            | MirInst::ListGet { dst, .. }
             | MirInst::Phi { dst, .. } => Some(*dst),
             _ => None,
         }
@@ -571,6 +607,16 @@ impl MirInst {
             MirInst::ReadStr { ptr, .. } => uses.push(*ptr),
             MirInst::StrCmp { .. } => {}
             MirInst::RecordStore { val, .. } => add_value(&mut uses, val),
+            MirInst::ListNew { .. } => {}
+            MirInst::ListPush { list, item } => {
+                uses.push(*list);
+                uses.push(*item);
+            }
+            MirInst::ListLen { list, .. } => uses.push(*list),
+            MirInst::ListGet { list, idx, .. } => {
+                uses.push(*list);
+                add_value(&mut uses, idx);
+            }
             MirInst::Jump { .. } => {}
             MirInst::Branch { cond, .. } => uses.push(*cond),
             MirInst::Return { val } => {

@@ -1,0 +1,39 @@
+  NOT Supported (Major Gaps)
+
+  1. String Interpolation - StringAppend missing
+  # Won't work:
+  $"pid: ($ctx.pid)"
+
+  2. Environment Variables - LoadEnv/StoreEnv missing
+  # Won't work:
+  $env.PATH
+
+  3. Named Arguments/Flags - PushFlag/PushNamed missing
+  # Won't work:
+  some-cmd --verbose
+  count --per-cpu
+
+  4. Full Match Expressions - Only boolean patterns work
+  # Won't work:
+  match $x {
+      0 => "zero"
+      _ => "other"
+  }
+
+  5. Cell Path Updates - UpsertCellPath missing
+  # Won't work:
+  $record.field = 42
+
+  6. Closures as Values - Can't pass closures around
+  # Won't work:
+  let f = {|x| $x + 1 }
+  $items | each $f
+
+  7. Tables - Built on lists, so don't work
+  # Won't work:
+  [[name, age]; [Alice, 30]]
+
+  8. Pipelines with Multiple Commands
+  # Limited support - some built-ins only:
+  $ctx.pid | count   # Works
+  $ctx.pid | where { $in > 100 } | count  # Won't work

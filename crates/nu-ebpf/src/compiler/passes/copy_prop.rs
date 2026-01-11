@@ -246,6 +246,37 @@ impl CopyPropagation {
                 }
             }
 
+            // List operations
+            MirInst::ListNew { .. } => {}
+
+            MirInst::ListPush { list, item } => {
+                if let Some(&new_list) = copy_map.get(list) {
+                    *list = new_list;
+                    changed = true;
+                }
+                if let Some(&new_item) = copy_map.get(item) {
+                    *item = new_item;
+                    changed = true;
+                }
+            }
+
+            MirInst::ListLen { list, .. } => {
+                if let Some(&new_list) = copy_map.get(list) {
+                    *list = new_list;
+                    changed = true;
+                }
+            }
+
+            MirInst::ListGet { list, idx, .. } => {
+                if let Some(&new_list) = copy_map.get(list) {
+                    *list = new_list;
+                    changed = true;
+                }
+                if self.replace_value(idx, copy_map) {
+                    changed = true;
+                }
+            }
+
             // No operands to propagate
             MirInst::LoadSlot { .. }
             | MirInst::LoadCtxField { .. }

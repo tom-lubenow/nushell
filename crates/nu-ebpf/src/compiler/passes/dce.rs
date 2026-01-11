@@ -107,12 +107,16 @@ fn has_side_effects(inst: &MirInst) -> bool {
         | MirInst::Load { .. }
         | MirInst::LoadSlot { .. }
         | MirInst::LoadCtxField { .. }
+        | MirInst::ListLen { .. }
+        | MirInst::ListGet { .. }
         | MirInst::Phi { .. } => false,
 
         // Side effects - cannot be removed
         MirInst::Store { .. }
         | MirInst::StoreSlot { .. }
         | MirInst::RecordStore { .. }
+        | MirInst::ListNew { .. }
+        | MirInst::ListPush { .. }
         | MirInst::CallHelper { .. }
         | MirInst::CallSubfn { .. }
         | MirInst::MapLookup { .. }

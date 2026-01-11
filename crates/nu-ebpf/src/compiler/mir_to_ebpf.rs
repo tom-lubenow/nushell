@@ -659,6 +659,110 @@ impl<'a> MirToEbpfCompiler<'a> {
                 ));
             }
 
+            // List operations
+            // List layout on stack: [length: u64, elem0: u64, elem1: u64, ...]
+            MirInst::ListNew { dst, buffer, .. } => {
+                // Get buffer address and store in dst
+                let offset = self.slot_offsets.get(buffer).copied().unwrap_or(0);
+                let dst_reg = self.alloc_dst_reg(*dst)?;
+
+                // dst = R10 + offset (pointer to list buffer)
+                self.instructions
+                    .push(EbpfInsn::mov64_reg(dst_reg, EbpfReg::R10));
+                self.instructions
+                    .push(EbpfInsn::add64_imm(dst_reg, offset as i32));
+
+                // Initialize length to 0: *(u64*)(dst) = 0
+                self.instructions.push(EbpfInsn::stxdw(dst_reg, 0, EbpfReg::R0));
+                // R0 is 0 from any previous computation or we set it
+                self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
+                self.instructions.push(EbpfInsn::stxdw(dst_reg, 0, EbpfReg::R0));
+            }
+
+            MirInst::ListPush { list, item } => {
+                // Load current length
+                let list_reg = self.ensure_reg(*list)?;
+                let item_reg = self.ensure_reg(*item)?;
+
+                // R0 = length = *(u64*)(list)
+                self.instructions
+                    .push(EbpfInsn::ldxdw(EbpfReg::R0, list_reg, 0));
+
+                // R1 = offset = length * 8 + 8
+                self.instructions
+                    .push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R0));
+                self.instructions
+                    .push(EbpfInsn::mul64_imm(EbpfReg::R1, 8));
+                self.instructions
+                    .push(EbpfInsn::add64_imm(EbpfReg::R1, 8));
+
+                // R2 = list + offset (address of new element)
+                self.instructions
+                    .push(EbpfInsn::mov64_reg(EbpfReg::R2, list_reg));
+                self.instructions
+                    .push(EbpfInsn::add64_reg(EbpfReg::R2, EbpfReg::R1));
+
+                // Store item at R2
+                self.instructions
+                    .push(EbpfInsn::stxdw(EbpfReg::R2, 0, item_reg));
+
+                // Increment length
+                self.instructions
+                    .push(EbpfInsn::add64_imm(EbpfReg::R0, 1));
+                self.instructions
+                    .push(EbpfInsn::stxdw(list_reg, 0, EbpfReg::R0));
+            }
+
+            MirInst::ListLen { dst, list } => {
+                let list_reg = self.ensure_reg(*list)?;
+                let dst_reg = self.alloc_dst_reg(*dst)?;
+
+                // Load length from list buffer
+                self.instructions
+                    .push(EbpfInsn::ldxdw(dst_reg, list_reg, 0));
+            }
+
+            MirInst::ListGet { dst, list, idx } => {
+                let list_reg = self.ensure_reg(*list)?;
+                let dst_reg = self.alloc_dst_reg(*dst)?;
+
+                match idx {
+                    MirValue::Const(i) => {
+                        // Static index: load from fixed offset
+                        let offset = (*i as i16) * 8 + 8;
+                        self.instructions
+                            .push(EbpfInsn::ldxdw(dst_reg, list_reg, offset));
+                    }
+                    MirValue::VReg(idx_vreg) => {
+                        // Dynamic index: compute offset
+                        let idx_reg = self.ensure_reg(*idx_vreg)?;
+
+                        // R0 = idx * 8 + 8
+                        self.instructions
+                            .push(EbpfInsn::mov64_reg(EbpfReg::R0, idx_reg));
+                        self.instructions
+                            .push(EbpfInsn::mul64_imm(EbpfReg::R0, 8));
+                        self.instructions
+                            .push(EbpfInsn::add64_imm(EbpfReg::R0, 8));
+
+                        // R1 = list + R0
+                        self.instructions
+                            .push(EbpfInsn::mov64_reg(EbpfReg::R1, list_reg));
+                        self.instructions
+                            .push(EbpfInsn::add64_reg(EbpfReg::R1, EbpfReg::R0));
+
+                        // Load element
+                        self.instructions
+                            .push(EbpfInsn::ldxdw(dst_reg, EbpfReg::R1, 0));
+                    }
+                    MirValue::StackSlot(_) => {
+                        return Err(CompileError::UnsupportedInstruction(
+                            "Stack slot as list index not supported".into(),
+                        ));
+                    }
+                }
+            }
+
             // Instructions reserved for future features
             MirInst::Load { .. }
             | MirInst::Store { .. }

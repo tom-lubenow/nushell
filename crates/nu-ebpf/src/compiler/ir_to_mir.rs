@@ -123,6 +123,10 @@ pub struct IrToMirLowering<'a> {
     pipeline_input_reg: Option<RegId>,
     /// Positional arguments for the next call (vreg, source RegId for metadata)
     positional_args: Vec<(VReg, RegId)>,
+    /// Named flags for the next call (e.g., --verbose)
+    named_flags: Vec<String>,
+    /// Named arguments with values for the next call (e.g., --count 5)
+    named_args: HashMap<String, (VReg, RegId)>,
     /// Variable mappings for inlined functions (VarId -> VReg)
     var_mappings: HashMap<VarId, VReg>,
     /// Needs ringbuf map
@@ -171,6 +175,8 @@ impl<'a> IrToMirLowering<'a> {
             pipeline_input: None,
             pipeline_input_reg: None,
             positional_args: Vec::new(),
+            named_flags: Vec::new(),
+            named_args: HashMap::new(),
             var_mappings: HashMap::new(),
             needs_ringbuf: false,
             needs_counter_map: false,
@@ -404,6 +410,29 @@ impl<'a> IrToMirLowering<'a> {
                 // Also set pipeline_input for built-in commands
                 self.pipeline_input = Some(src_vreg);
                 self.pipeline_input_reg = Some(*src);
+            }
+
+            Instruction::PushFlag { name } => {
+                // Track boolean flag for the next call
+                if let Some(flag_name) = self
+                    .get_data_slice(name.start as usize, name.len as usize)
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                {
+                    self.named_flags.push(flag_name.to_string());
+                }
+            }
+
+            Instruction::PushNamed { name, src } => {
+                // Track named argument with value for the next call
+                // Extract name first to avoid borrow conflict
+                let arg_name = self
+                    .get_data_slice(name.start as usize, name.len as usize)
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                    .map(|s| s.to_string());
+                if let Some(arg_name) = arg_name {
+                    let src_vreg = self.get_vreg(*src);
+                    self.named_args.insert(arg_name, (src_vreg, *src));
+                }
             }
 
             // === Records ===
@@ -1252,6 +1281,8 @@ impl<'a> IrToMirLowering<'a> {
         self.pipeline_input = None;
         self.pipeline_input_reg = None;
         self.positional_args.clear();
+        self.named_flags.clear();
+        self.named_args.clear();
         Ok(())
     }
 
@@ -1290,6 +1321,8 @@ impl<'a> IrToMirLowering<'a> {
         self.pipeline_input = None;
         self.pipeline_input_reg = None;
         self.positional_args.clear();
+        self.named_flags.clear();
+        self.named_args.clear();
 
         Ok(())
     }

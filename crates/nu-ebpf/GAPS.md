@@ -11,10 +11,11 @@
   $env.PATH
   # Error: "Environment variable access is not supported in eBPF"
 
-  3. Named Arguments/Flags - PushFlag/PushNamed missing
-  # Won't work:
-  some-cmd --verbose
-  count --per-cpu
+  3. Named Arguments/Flags - Infrastructure in place
+  # Now tracked during compilation:
+  some-cmd --verbose   # Flag tracked
+  count --per-cpu      # Named arg tracked
+  # Not all commands use them yet - extend lower_call as needed
 
   4. Full Match Expressions - Only boolean patterns work
   # Won't work:

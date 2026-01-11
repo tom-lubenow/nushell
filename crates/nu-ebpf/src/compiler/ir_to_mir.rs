@@ -876,6 +876,28 @@ impl<'a> IrToMirLowering<'a> {
                 meta.list_buffer = Some((slot, max_len));
             }
 
+            Literal::Closure(block_id) => {
+                // Closures as first-class values are not supported in eBPF
+                // because eBPF cannot dynamically dispatch to different code paths.
+                // Inline closures (like in `each { ... }`) work because they're
+                // compiled directly into the eBPF program.
+                let _ = block_id;
+                return Err(CompileError::UnsupportedInstruction(
+                    "Closures as first-class values are not supported in eBPF. \
+                     Inline closures (e.g., `$items | each { ... }`) work fine. \
+                     Instead of `let f = {|x| ... }; do $f $arg`, use the closure inline."
+                        .into(),
+                ));
+            }
+
+            Literal::Block(block_id) => {
+                // Blocks as values have the same limitation as closures
+                let _ = block_id;
+                return Err(CompileError::UnsupportedInstruction(
+                    "Blocks as first-class values are not supported in eBPF.".into(),
+                ));
+            }
+
             _ => {
                 return Err(CompileError::UnsupportedLiteral);
             }

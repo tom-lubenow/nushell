@@ -33,10 +33,12 @@
   # Error: "Cell path update (.field = ...) is not supported in eBPF"
   # Workaround: Build record with correct value initially
 
-  6. Closures as Values - Can't pass closures around
-  # Won't work:
+  6. Closures as Values - Not supported (with clear error message)
+  # Won't work (eBPF can't dynamically dispatch):
   let f = {|x| $x + 1 }
-  $items | each $f
+  do $f 5
+  # Error: "Closures as first-class values are not supported in eBPF"
+  # Workaround: Use inline closures (e.g., `$items | each { $in + 1 }`)
 
   7. Tables - Built on lists, so don't work
   # Won't work:

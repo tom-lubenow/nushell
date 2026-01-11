@@ -94,6 +94,8 @@ struct RegMetadata {
     bounded_range: Option<BoundedRange>,
     /// List buffer (stack slot, max_len) for list construction
     list_buffer: Option<(StackSlotId, usize)>,
+    /// Closure block ID (for inline execution in where/each)
+    closure_block_id: Option<nu_protocol::BlockId>,
 }
 
 /// Lowering context for IR to MIR conversion
@@ -877,25 +879,27 @@ impl<'a> IrToMirLowering<'a> {
             }
 
             Literal::Closure(block_id) => {
-                // Closures as first-class values are not supported in eBPF
-                // because eBPF cannot dynamically dispatch to different code paths.
-                // Inline closures (like in `each { ... }`) work because they're
-                // compiled directly into the eBPF program.
-                let _ = block_id;
-                return Err(CompileError::UnsupportedInstruction(
-                    "Closures as first-class values are not supported in eBPF. \
-                     Inline closures (e.g., `$items | each { ... }`) work fine. \
-                     Instead of `let f = {|x| ... }; do $f $arg`, use the closure inline."
-                        .into(),
-                ));
+                // Track the closure block ID for use in where/each
+                // Closures as first-class values (stored in variables, passed around)
+                // are not supported, but inline closures for where/each work.
+                let meta = self.get_or_create_metadata(dst);
+                meta.closure_block_id = Some(*block_id);
+                // Store a placeholder value
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::Const(0),
+                });
             }
 
             Literal::Block(block_id) => {
-                // Blocks as values have the same limitation as closures
-                let _ = block_id;
-                return Err(CompileError::UnsupportedInstruction(
-                    "Blocks as first-class values are not supported in eBPF.".into(),
-                ));
+                // Track block ID same as closure
+                let meta = self.get_or_create_metadata(dst);
+                meta.closure_block_id = Some(*block_id);
+                // Store a placeholder value
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::Const(0),
+                });
             }
 
             _ => {
@@ -1399,6 +1403,190 @@ impl<'a> IrToMirLowering<'a> {
                 self.emit(MirInst::StopTimer { dst: dst_vreg });
             }
 
+            "where" => {
+                // where { condition } - filter pipeline by condition
+                // Get the pipeline input (value to filter)
+                let input_vreg = self.pipeline_input.unwrap_or(dst_vreg);
+                let input_reg = self.pipeline_input_reg;
+
+                // Get the closure block ID from positional args
+                let closure_block_id = self
+                    .positional_args
+                    .first()
+                    .and_then(|(_, reg)| self.get_metadata(*reg))
+                    .and_then(|m| m.closure_block_id);
+
+                if let Some(block_id) = closure_block_id {
+                    // Inline the closure with $in bound to input_vreg
+                    let result_vreg = self.inline_closure_with_in(block_id, input_vreg)?;
+
+                    // Create exit block and continue block
+                    let exit_block = self.func.alloc_block();
+                    let continue_block = self.func.alloc_block();
+
+                    // Branch: if result is 0/false, exit
+                    let negated = self.func.alloc_vreg();
+                    self.emit(MirInst::UnaryOp {
+                        dst: negated,
+                        op: super::mir::UnaryOpKind::Not,
+                        src: MirValue::VReg(result_vreg),
+                    });
+                    self.terminate(MirInst::Branch {
+                        cond: negated,
+                        if_true: exit_block,
+                        if_false: continue_block,
+                    });
+
+                    // Exit block returns 0
+                    self.current_block = exit_block;
+                    self.terminate(MirInst::Return {
+                        val: Some(MirValue::Const(0)),
+                    });
+
+                    // Continue block passes the original value through
+                    self.current_block = continue_block;
+                    self.emit(MirInst::Copy {
+                        dst: dst_vreg,
+                        src: MirValue::VReg(input_vreg),
+                    });
+
+                    // Copy metadata from input to output
+                    if let Some(reg) = input_reg {
+                        if let Some(meta) = self.get_metadata(reg).cloned() {
+                            let out_meta = self.get_or_create_metadata(src_dst);
+                            out_meta.field_type = meta.field_type;
+                            out_meta.string_slot = meta.string_slot;
+                            out_meta.record_fields = meta.record_fields;
+                            out_meta.list_buffer = meta.list_buffer;
+                        }
+                    }
+                } else {
+                    return Err(CompileError::UnsupportedInstruction(
+                        "where requires a closure argument".into(),
+                    ));
+                }
+            }
+
+            "each" => {
+                // each { transform } - transform pipeline value(s)
+                // Get the pipeline input
+                let input_vreg = self.pipeline_input.unwrap_or(dst_vreg);
+                let input_reg = self.pipeline_input_reg;
+
+                // Get the closure block ID from positional args
+                let closure_block_id = self
+                    .positional_args
+                    .first()
+                    .and_then(|(_, reg)| self.get_metadata(*reg))
+                    .and_then(|m| m.closure_block_id);
+
+                // Check if input is a list
+                let is_list = input_reg
+                    .and_then(|reg| self.get_metadata(reg))
+                    .and_then(|m| m.list_buffer)
+                    .is_some();
+
+                if let Some(block_id) = closure_block_id {
+                    if is_list {
+                        // List transformation: iterate and transform each element
+                        let list_info = input_reg
+                            .and_then(|reg| self.get_metadata(reg))
+                            .and_then(|m| m.list_buffer)
+                            .unwrap();
+                        let (_src_slot, max_len) = list_info;
+
+                        // Allocate output list
+                        let out_slot = self
+                            .func
+                            .alloc_stack_slot((max_len + 1) * 8, 8, StackSlotKind::ListBuffer);
+                        let out_list_vreg = self.func.alloc_vreg();
+                        self.emit(MirInst::ListNew {
+                            dst: out_list_vreg,
+                            buffer: out_slot,
+                            max_len,
+                        });
+
+                        // Get length of input list
+                        let len_vreg = self.func.alloc_vreg();
+                        self.emit(MirInst::ListLen {
+                            dst: len_vreg,
+                            list: input_vreg,
+                        });
+
+                        // Unrolled loop: for i in 0..max_len
+                        for i in 0..max_len.min(16) {
+                            // Skip if i >= len
+                            let skip_block = self.func.alloc_block();
+                            let process_block = self.func.alloc_block();
+
+                            let idx_vreg = self.func.alloc_vreg();
+                            self.emit(MirInst::Copy {
+                                dst: idx_vreg,
+                                src: MirValue::Const(i as i64),
+                            });
+
+                            // Compare i < len
+                            let in_bounds = self.func.alloc_vreg();
+                            self.emit(MirInst::BinOp {
+                                dst: in_bounds,
+                                op: BinOpKind::Lt,
+                                lhs: MirValue::VReg(idx_vreg),
+                                rhs: MirValue::VReg(len_vreg),
+                            });
+                            self.terminate(MirInst::Branch {
+                                cond: in_bounds,
+                                if_true: process_block,
+                                if_false: skip_block,
+                            });
+
+                            // Process block: get element, transform, push to output
+                            self.current_block = process_block;
+                            let elem_vreg = self.func.alloc_vreg();
+                            self.emit(MirInst::ListGet {
+                                dst: elem_vreg,
+                                list: input_vreg,
+                                idx: MirValue::Const(i as i64),
+                            });
+
+                            // Transform element with closure
+                            let transformed = self.inline_closure_with_in(block_id, elem_vreg)?;
+
+                            // Push to output list
+                            self.emit(MirInst::ListPush {
+                                list: out_list_vreg,
+                                item: transformed,
+                            });
+
+                            self.terminate(MirInst::Jump { target: skip_block });
+
+                            // Continue to next iteration
+                            self.current_block = skip_block;
+                        }
+
+                        // Output is the new list
+                        self.emit(MirInst::Copy {
+                            dst: dst_vreg,
+                            src: MirValue::VReg(out_list_vreg),
+                        });
+
+                        // Track output list metadata
+                        let meta = self.get_or_create_metadata(src_dst);
+                        meta.list_buffer = Some((out_slot, max_len));
+                    } else {
+                        // Single value transformation
+                        let result_vreg = self.inline_closure_with_in(block_id, input_vreg)?;
+                        self.emit(MirInst::Copy {
+                            dst: dst_vreg,
+                            src: MirValue::VReg(result_vreg),
+                        });
+                    }
+                } else {
+                    return Err(CompileError::UnsupportedInstruction(
+                        "each requires a closure argument".into(),
+                    ));
+                }
+            }
+
             _ => {
                 return Err(CompileError::UnsupportedInstruction(format!(
                     "Command '{}' not supported in eBPF",
@@ -1680,6 +1868,60 @@ impl<'a> IrToMirLowering<'a> {
         meta.record_fields.push(field);
 
         Ok(())
+    }
+
+    /// Inline a closure with $in bound to a specific value
+    /// Returns the vreg containing the closure's result
+    fn inline_closure_with_in(
+        &mut self,
+        block_id: nu_protocol::BlockId,
+        in_vreg: VReg,
+    ) -> Result<VReg, CompileError> {
+        let es = self.engine_state.ok_or_else(|| {
+            CompileError::UnsupportedInstruction("No engine state for closure lookup".into())
+        })?;
+
+        // Get the block and its IR
+        let block = es.get_block(block_id);
+        let ir_block = block.ir_block.as_ref().ok_or_else(|| {
+            CompileError::UnsupportedInstruction("Closure has no IR (not compiled)".into())
+        })?;
+
+        // Map $in variable to in_vreg
+        // In Nushell, $in has a well-known variable ID (typically 0)
+        // We'll map it through var_mappings
+        use nu_protocol::IN_VARIABLE_ID;
+        let old_in_mapping = self.var_mappings.get(&IN_VARIABLE_ID).copied();
+        self.var_mappings.insert(IN_VARIABLE_ID, in_vreg);
+
+        // Allocate a vreg for the result
+        let result_vreg = self.func.alloc_vreg();
+
+        // Lower the closure body
+        // We need to process each instruction in the closure's IR
+        for (ir_idx, inst) in ir_block.instructions.iter().enumerate() {
+            // Handle Return specially to capture the result
+            if let Instruction::Return { src } = inst {
+                let src_vreg = self.get_vreg(*src);
+                self.emit(MirInst::Copy {
+                    dst: result_vreg,
+                    src: MirValue::VReg(src_vreg),
+                });
+                break;
+            }
+
+            // Lower other instructions normally
+            self.lower_instruction(inst, ir_idx)?;
+        }
+
+        // Restore old $in mapping (if any)
+        if let Some(old) = old_in_mapping {
+            self.var_mappings.insert(IN_VARIABLE_ID, old);
+        } else {
+            self.var_mappings.remove(&IN_VARIABLE_ID);
+        }
+
+        Ok(result_vreg)
     }
 
     /// Lower LoadVariable instruction

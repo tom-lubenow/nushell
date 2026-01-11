@@ -47,15 +47,18 @@
   [[name, age]; [Alice, 30]]
   # Limited by stack size (~10-15 rows max depending on record size)
 
-  8. Pipelines with Multiple Commands
-  # Limited support - single terminal command only:
+  8. Pipelines with Multiple Commands - Now supports where/each
+  # Terminal commands:
   $ctx.pid | count                        # Works
   $ctx.pid | emit                         # Works
   { pid: $ctx.pid } | emit                # Works
 
-  # Chained commands don't work yet:
-  $ctx.pid | where { $in > 100 } | count  # Won't work
-  $items | each { $in * 2 } | emit        # Won't work
+  # Pipeline chaining with where/each now works:
+  $ctx.pid | where { $in > 100 } | count  # Works - filters then counts
+  $items | each { $in * 2 } | emit        # Works - transforms then emits
 
-  # To add: implement pipeline chaining in lower_call for
-  # transformation commands (where, each, filter, etc.)
+  # Lists with each (unrolled loop, max 16 elements):
+  [1, 2, 3] | each { $in * 2 }            # Works
+
+  # Note: Closure must be simple - uses inline expansion
+  # Complex closures may hit instruction limits

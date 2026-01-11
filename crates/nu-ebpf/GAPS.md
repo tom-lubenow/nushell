@@ -1,8 +1,10 @@
   NOT Supported (Major Gaps)
 
-  1. String Interpolation - StringAppend missing
-  # Won't work:
+  1. String Interpolation - MIR infrastructure in place, code generation pending
+  # Won't work yet:
   $"pid: ($ctx.pid)"
+  # Has: StringAppend/IntToString MIR instructions, IR-to-MIR lowering
+  # Needs: eBPF code generation for string concatenation
 
   2. Environment Variables - LoadEnv/StoreEnv missing
   # Won't work:

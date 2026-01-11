@@ -61,6 +61,17 @@ pub enum MapKind {
     ProgArray,
 }
 
+/// Type of value being appended in StringAppend
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringAppendType {
+    /// Append a literal string (from data section, with known length)
+    Literal { len: usize },
+    /// Append from a string slot on the stack
+    StringSlot { slot: StackSlotId, max_len: usize },
+    /// Append an integer converted to decimal
+    Integer,
+}
+
 /// MIR type system - internal, inferred from context
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MirType {
@@ -429,6 +440,25 @@ pub enum MirInst {
         len: usize,
     },
 
+    /// Append a value to a string buffer
+    /// dst_buffer is the destination string buffer on stack
+    /// dst_len is a vreg holding the current string length
+    /// val is the value to append (string slot or int)
+    StringAppend {
+        dst_buffer: StackSlotId,
+        dst_len: VReg,
+        val: MirValue,
+        val_type: StringAppendType,
+    },
+
+    /// Format an integer as decimal string into a buffer
+    /// Used for string interpolation with integers
+    IntToString {
+        dst_buffer: StackSlotId,
+        dst_len: VReg,
+        val: VReg,
+    },
+
     // Record building
     /// Store field to record buffer
     RecordStore {
@@ -631,6 +661,14 @@ impl MirInst {
                 for (_, vreg) in args {
                     uses.push(*vreg);
                 }
+            }
+            MirInst::StringAppend { dst_len, val, .. } => {
+                uses.push(*dst_len);
+                add_value(&mut uses, val);
+            }
+            MirInst::IntToString { dst_len, val, .. } => {
+                uses.push(*dst_len);
+                uses.push(*val);
             }
         }
         uses

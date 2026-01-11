@@ -304,6 +304,8 @@ impl TypeInference {
             | MirInst::ReadStr { .. }
             | MirInst::RecordStore { .. }
             | MirInst::ListPush { .. }
+            | MirInst::StringAppend { .. }
+            | MirInst::IntToString { .. }
             | MirInst::Jump { .. }
             | MirInst::Branch { .. }
             | MirInst::Return { .. }

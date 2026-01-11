@@ -287,6 +287,29 @@ impl CopyPropagation {
             | MirInst::TailCall { .. }
             | MirInst::LoopHeader { .. }
             | MirInst::LoopBack { .. } => {}
+
+            MirInst::StringAppend { dst_len, val, .. } => {
+                if let Some(&copy_src) = copy_map.get(dst_len) {
+                    *dst_len = copy_src;
+                    changed = true;
+                }
+                if let MirValue::VReg(vreg) = val {
+                    if let Some(&copy_src) = copy_map.get(vreg) {
+                        *val = MirValue::VReg(copy_src);
+                        changed = true;
+                    }
+                }
+            }
+            MirInst::IntToString { dst_len, val, .. } => {
+                if let Some(&copy_src) = copy_map.get(dst_len) {
+                    *dst_len = copy_src;
+                    changed = true;
+                }
+                if let Some(&copy_src) = copy_map.get(val) {
+                    *val = copy_src;
+                    changed = true;
+                }
+            }
         }
 
         changed

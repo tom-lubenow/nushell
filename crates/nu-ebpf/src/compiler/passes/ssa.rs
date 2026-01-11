@@ -495,6 +495,26 @@ impl<'a> SsaBuilder<'a> {
                 step: *step,
                 header: *header,
             },
+            MirInst::StringAppend {
+                dst_buffer,
+                dst_len,
+                val,
+                val_type,
+            } => MirInst::StringAppend {
+                dst_buffer: *dst_buffer,
+                dst_len: self.rename_vreg(*dst_len),
+                val: self.rename_value(val),
+                val_type: *val_type,
+            },
+            MirInst::IntToString {
+                dst_buffer,
+                dst_len,
+                val,
+            } => MirInst::IntToString {
+                dst_buffer: *dst_buffer,
+                dst_len: self.rename_vreg(*dst_len),
+                val: self.rename_vreg(*val),
+            },
             MirInst::Phi { dst, args } => {
                 // Phi args are handled separately by fill_phi_args
                 MirInst::Phi {

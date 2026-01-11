@@ -772,7 +772,9 @@ impl<'a> MirToEbpfCompiler<'a> {
             | MirInst::MapLookup { .. }
             | MirInst::MapDelete { .. }
             | MirInst::StrCmp { .. }
-            | MirInst::RecordStore { .. } => {
+            | MirInst::RecordStore { .. }
+            | MirInst::StringAppend { .. }
+            | MirInst::IntToString { .. } => {
                 return Err(CompileError::UnsupportedInstruction(format!(
                     "MIR instruction {:?} not yet implemented",
                     inst

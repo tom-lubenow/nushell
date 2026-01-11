@@ -128,7 +128,9 @@ fn has_side_effects(inst: &MirInst) -> bool {
         | MirInst::StrCmp { .. }
         | MirInst::Histogram { .. }
         | MirInst::StartTimer
-        | MirInst::StopTimer { .. } => true,
+        | MirInst::StopTimer { .. }
+        | MirInst::StringAppend { .. }
+        | MirInst::IntToString { .. } => true,
 
         // Control flow - handled separately (terminators)
         MirInst::Jump { .. }

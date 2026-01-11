@@ -14,7 +14,8 @@ use super::CompileError;
 use super::elf::ProbeContext;
 use super::mir::{
     BasicBlock, BinOpKind, BlockId, CtxField, MapKind, MapRef, MirFunction, MirInst, MirProgram,
-    MirType, MirValue, RecordFieldDef, StackSlotId, StackSlotKind, SubfunctionId, VReg,
+    MirType, MirValue, RecordFieldDef, StackSlotId, StackSlotKind, StringAppendType, SubfunctionId,
+    VReg,
 };
 
 /// Command types we recognize for eBPF
@@ -458,6 +459,59 @@ impl<'a> IrToMirLowering<'a> {
                                 item: item_vreg,
                             });
                         }
+                    }
+                }
+            }
+
+            // === String Interpolation ===
+            Instruction::StringAppend { src_dst, val } => {
+                // Get the destination string buffer info
+                let dst_meta = self.get_metadata(*src_dst).cloned();
+                let val_meta = self.get_metadata(*val).cloned();
+
+                // For string append, we need:
+                // 1. A string buffer (from Literal::String or a built interpolation)
+                // 2. A value to append (string, int, etc.)
+                if let Some(meta) = dst_meta {
+                    if let Some(slot) = meta.string_slot {
+                        // Create a length tracker vreg if not present
+                        let len_vreg = self.func.alloc_vreg();
+                        // Initialize length to 0 (or we could track actual length)
+                        self.emit(MirInst::Copy {
+                            dst: len_vreg,
+                            src: MirValue::Const(0),
+                        });
+
+                        // Determine what type of value we're appending
+                        let val_type = if val_meta
+                            .as_ref()
+                            .map(|m| m.string_slot.is_some())
+                            .unwrap_or(false)
+                        {
+                            let val_slot = val_meta.as_ref().unwrap().string_slot.unwrap();
+                            StringAppendType::StringSlot {
+                                slot: val_slot,
+                                max_len: 256,
+                            }
+                        } else if val_meta
+                            .as_ref()
+                            .map(|m| m.literal_string.is_some())
+                            .unwrap_or(false)
+                        {
+                            let len = val_meta.as_ref().unwrap().literal_string.as_ref().unwrap().len();
+                            StringAppendType::Literal { len }
+                        } else {
+                            // Default to integer
+                            StringAppendType::Integer
+                        };
+
+                        let val_vreg = self.get_vreg(*val);
+                        self.emit(MirInst::StringAppend {
+                            dst_buffer: slot,
+                            dst_len: len_vreg,
+                            val: MirValue::VReg(val_vreg),
+                            val_type,
+                        });
                     }
                 }
             }

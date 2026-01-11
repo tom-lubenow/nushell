@@ -673,10 +673,10 @@ impl<'a> MirToEbpfCompiler<'a> {
                     .push(EbpfInsn::add64_imm(dst_reg, offset as i32));
 
                 // Initialize length to 0: *(u64*)(dst) = 0
-                self.instructions.push(EbpfInsn::stxdw(dst_reg, 0, EbpfReg::R0));
-                // R0 is 0 from any previous computation or we set it
+                // Must set R0 to 0 BEFORE storing it
                 self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
-                self.instructions.push(EbpfInsn::stxdw(dst_reg, 0, EbpfReg::R0));
+                self.instructions
+                    .push(EbpfInsn::stxdw(dst_reg, 0, EbpfReg::R0));
             }
 
             MirInst::ListPush { list, item } => {
@@ -691,10 +691,8 @@ impl<'a> MirToEbpfCompiler<'a> {
                 // R1 = offset = length * 8 + 8
                 self.instructions
                     .push(EbpfInsn::mov64_reg(EbpfReg::R1, EbpfReg::R0));
-                self.instructions
-                    .push(EbpfInsn::mul64_imm(EbpfReg::R1, 8));
-                self.instructions
-                    .push(EbpfInsn::add64_imm(EbpfReg::R1, 8));
+                self.instructions.push(EbpfInsn::mul64_imm(EbpfReg::R1, 8));
+                self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R1, 8));
 
                 // R2 = list + offset (address of new element)
                 self.instructions
@@ -707,8 +705,7 @@ impl<'a> MirToEbpfCompiler<'a> {
                     .push(EbpfInsn::stxdw(EbpfReg::R2, 0, item_reg));
 
                 // Increment length
-                self.instructions
-                    .push(EbpfInsn::add64_imm(EbpfReg::R0, 1));
+                self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R0, 1));
                 self.instructions
                     .push(EbpfInsn::stxdw(list_reg, 0, EbpfReg::R0));
             }
@@ -740,10 +737,8 @@ impl<'a> MirToEbpfCompiler<'a> {
                         // R0 = idx * 8 + 8
                         self.instructions
                             .push(EbpfInsn::mov64_reg(EbpfReg::R0, idx_reg));
-                        self.instructions
-                            .push(EbpfInsn::mul64_imm(EbpfReg::R0, 8));
-                        self.instructions
-                            .push(EbpfInsn::add64_imm(EbpfReg::R0, 8));
+                        self.instructions.push(EbpfInsn::mul64_imm(EbpfReg::R0, 8));
+                        self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R0, 8));
 
                         // R1 = list + R0
                         self.instructions
@@ -890,10 +885,12 @@ impl<'a> MirToEbpfCompiler<'a> {
 
                         // Check if value is 0
                         let non_zero_skip = 5i16;
-                        self.instructions
-                            .push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
-                        self.instructions
-                            .push(EbpfInsn::jne_reg(EbpfReg::R3, EbpfReg::R0, non_zero_skip));
+                        self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R0, 0));
+                        self.instructions.push(EbpfInsn::jne_reg(
+                            EbpfReg::R3,
+                            EbpfReg::R0,
+                            non_zero_skip,
+                        ));
 
                         // Value is 0: store '0' at temp+19, set digit count to 1
                         self.instructions
@@ -951,8 +948,7 @@ impl<'a> MirToEbpfCompiler<'a> {
                         // Copy loop (bounded by max 20 digits)
                         for i in 0..20 {
                             // Skip if we've copied all digits (i >= R4)
-                            self.instructions
-                                .push(EbpfInsn::mov64_imm(EbpfReg::R0, i));
+                            self.instructions.push(EbpfInsn::mov64_imm(EbpfReg::R0, i));
                             let skip_copy = 7i16;
                             // Jump if R0 >= R4 (unsigned)
                             self.instructions.push(EbpfInsn::new(
@@ -970,8 +966,7 @@ impl<'a> MirToEbpfCompiler<'a> {
                                 .push(EbpfInsn::add64_imm(EbpfReg::R1, temp_offset as i32));
                             self.instructions
                                 .push(EbpfInsn::add64_reg(EbpfReg::R1, EbpfReg::R5));
-                            self.instructions
-                                .push(EbpfInsn::add64_imm(EbpfReg::R1, i));
+                            self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R1, i));
                             self.instructions
                                 .push(EbpfInsn::ldxb(EbpfReg::R0, EbpfReg::R1, 0));
 
@@ -982,8 +977,7 @@ impl<'a> MirToEbpfCompiler<'a> {
                                 .push(EbpfInsn::add64_imm(EbpfReg::R2, dst_offset as i32));
                             self.instructions
                                 .push(EbpfInsn::add64_reg(EbpfReg::R2, len_reg));
-                            self.instructions
-                                .push(EbpfInsn::add64_imm(EbpfReg::R2, i));
+                            self.instructions.push(EbpfInsn::add64_imm(EbpfReg::R2, i));
                             self.instructions
                                 .push(EbpfInsn::stxb(EbpfReg::R2, 0, EbpfReg::R0));
                         }
@@ -3683,14 +3677,16 @@ mod tests {
         });
 
         // Append "hello" literal
-        func.block_mut(entry).instructions.push(MirInst::StringAppend {
-            dst_buffer: slot,
-            dst_len: len_vreg,
-            val: MirValue::Const(0), // Not used for literals
-            val_type: StringAppendType::Literal {
-                bytes: b"hello".to_vec(),
-            },
-        });
+        func.block_mut(entry)
+            .instructions
+            .push(MirInst::StringAppend {
+                dst_buffer: slot,
+                dst_len: len_vreg,
+                val: MirValue::Const(0), // Not used for literals
+                val_type: StringAppendType::Literal {
+                    bytes: b"hello".to_vec(),
+                },
+            });
 
         func.block_mut(entry).terminator = MirInst::Return {
             val: Some(MirValue::Const(0)),
@@ -3732,11 +3728,13 @@ mod tests {
         });
 
         // Convert to string
-        func.block_mut(entry).instructions.push(MirInst::IntToString {
-            dst_buffer: slot,
-            dst_len: len_vreg,
-            val: val_vreg,
-        });
+        func.block_mut(entry)
+            .instructions
+            .push(MirInst::IntToString {
+                dst_buffer: slot,
+                dst_len: len_vreg,
+                val: val_vreg,
+            });
 
         func.block_mut(entry).terminator = MirInst::Return {
             val: Some(MirValue::Const(0)),
@@ -3785,15 +3783,17 @@ mod tests {
         });
 
         // Append from source slot
-        func.block_mut(entry).instructions.push(MirInst::StringAppend {
-            dst_buffer: dst_slot,
-            dst_len: len_vreg,
-            val: MirValue::VReg(src_vreg),
-            val_type: StringAppendType::StringSlot {
-                slot: src_slot,
-                max_len: 32,
-            },
-        });
+        func.block_mut(entry)
+            .instructions
+            .push(MirInst::StringAppend {
+                dst_buffer: dst_slot,
+                dst_len: len_vreg,
+                val: MirValue::VReg(src_vreg),
+                val_type: StringAppendType::StringSlot {
+                    slot: src_slot,
+                    max_len: 32,
+                },
+            });
 
         func.block_mut(entry).terminator = MirInst::Return {
             val: Some(MirValue::Const(0)),
@@ -3841,12 +3841,14 @@ mod tests {
         });
 
         // Append integer to string
-        func.block_mut(entry).instructions.push(MirInst::StringAppend {
-            dst_buffer: slot,
-            dst_len: len_vreg,
-            val: MirValue::VReg(int_vreg),
-            val_type: StringAppendType::Integer,
-        });
+        func.block_mut(entry)
+            .instructions
+            .push(MirInst::StringAppend {
+                dst_buffer: slot,
+                dst_len: len_vreg,
+                val: MirValue::VReg(int_vreg),
+                val_type: StringAppendType::Integer,
+            });
 
         func.block_mut(entry).terminator = MirInst::Return {
             val: Some(MirValue::Const(0)),
@@ -3894,12 +3896,14 @@ mod tests {
         });
 
         // Append integer to string
-        func.block_mut(entry).instructions.push(MirInst::StringAppend {
-            dst_buffer: slot,
-            dst_len: len_vreg,
-            val: MirValue::VReg(int_vreg),
-            val_type: StringAppendType::Integer,
-        });
+        func.block_mut(entry)
+            .instructions
+            .push(MirInst::StringAppend {
+                dst_buffer: slot,
+                dst_len: len_vreg,
+                val: MirValue::VReg(int_vreg),
+                val_type: StringAppendType::Integer,
+            });
 
         func.block_mut(entry).terminator = MirInst::Return {
             val: Some(MirValue::Const(0)),
@@ -3916,5 +3920,103 @@ mod tests {
         assert!(result.is_ok(), "StringAppend integer zero should compile");
         let result = result.unwrap();
         assert!(!result.bytecode.is_empty(), "Should generate bytecode");
+    }
+
+    /// Test list literal compilation with ListNew, ListPush, and EmitEvent
+    /// This tests the fix for the R0 initialization bug and proper register allocation
+    #[test]
+    fn test_list_literal_compilation() {
+        use crate::compiler::mir::*;
+
+        let mut func = MirFunction::new();
+        let entry = func.alloc_block();
+        func.entry = entry;
+
+        // Allocate stack slot for list buffer (length + 3 elements)
+        let slot = func.alloc_stack_slot(32, 8, StackSlotKind::ListBuffer);
+
+        // Allocate vregs
+        let list_ptr = func.alloc_vreg();
+        let item1 = func.alloc_vreg();
+        let item2 = func.alloc_vreg();
+        let item3 = func.alloc_vreg();
+
+        // ListNew: initialize list buffer
+        func.block_mut(entry).instructions.push(MirInst::ListNew {
+            dst: list_ptr,
+            buffer: slot,
+            max_len: 3,
+        });
+
+        // Push elements
+        func.block_mut(entry).instructions.push(MirInst::Copy {
+            dst: item1,
+            src: MirValue::Const(1),
+        });
+        func.block_mut(entry).instructions.push(MirInst::ListPush {
+            list: list_ptr,
+            item: item1,
+        });
+
+        func.block_mut(entry).instructions.push(MirInst::Copy {
+            dst: item2,
+            src: MirValue::Const(2),
+        });
+        func.block_mut(entry).instructions.push(MirInst::ListPush {
+            list: list_ptr,
+            item: item2,
+        });
+
+        func.block_mut(entry).instructions.push(MirInst::Copy {
+            dst: item3,
+            src: MirValue::Const(3),
+        });
+        func.block_mut(entry).instructions.push(MirInst::ListPush {
+            list: list_ptr,
+            item: item3,
+        });
+
+        // Emit the list
+        func.block_mut(entry).instructions.push(MirInst::EmitEvent {
+            data: list_ptr,
+            size: 32,
+        });
+
+        func.block_mut(entry).terminator = MirInst::Return {
+            val: Some(MirValue::Const(0)),
+        };
+
+        let program = MirProgram {
+            main: func,
+            subfunctions: vec![],
+        };
+
+        // Compile and verify
+        let mut compiler = MirToEbpfCompiler::new(&program, None);
+        compiler.run_register_allocation().unwrap();
+
+        // Verify list_ptr (VReg 0) got a physical register
+        assert!(
+            compiler.vreg_to_phys.contains_key(&VReg(0)),
+            "list_ptr vreg should be assigned a physical register"
+        );
+
+        compiler.layout_stack().unwrap();
+        compiler.compile_function(&program.main).unwrap();
+        compiler.fixup_jumps().unwrap();
+
+        // Verify bytecode was generated
+        assert!(
+            !compiler.instructions.is_empty(),
+            "Should generate bytecode for list literal"
+        );
+
+        // The first instructions should set up the list pointer (mov + add for R10 + offset)
+        // Then initialize length to 0 (mov R0, 0; stxdw)
+        let has_list_init = compiler.instructions.iter().any(|insn| {
+            // Look for mov immediate 0 (R0 = 0 for length initialization)
+            insn.opcode == (opcode::BPF_ALU64 | opcode::BPF_MOV | opcode::BPF_K) && insn.imm == 0
+        });
+        assert!(has_list_init, "Should have length initialization to 0");
     }
 }

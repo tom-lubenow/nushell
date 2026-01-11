@@ -444,76 +444,14 @@ impl GraphColoringAllocator {
 
     /// Get the vreg defined by an instruction (if any)
     fn get_def(&self, inst: &MirInst) -> Option<VReg> {
-        match inst {
-            MirInst::Copy { dst, .. }
-            | MirInst::BinOp { dst, .. }
-            | MirInst::UnaryOp { dst, .. }
-            | MirInst::Load { dst, .. }
-            | MirInst::LoadSlot { dst, .. }
-            | MirInst::LoadCtxField { dst, .. }
-            | MirInst::CallHelper { dst, .. }
-            | MirInst::MapLookup { dst, .. }
-            | MirInst::StopTimer { dst, .. }
-            | MirInst::StrCmp { dst, .. }
-            | MirInst::Phi { dst, .. } => Some(*dst),
-            _ => None,
-        }
+        // Use the MirInst::def() method which handles all instruction types
+        inst.def()
     }
 
     /// Get all vregs used by an instruction
     fn get_uses(&self, inst: &MirInst) -> Vec<VReg> {
-        let mut uses = Vec::new();
-
-        let add_value = |uses: &mut Vec<VReg>, val: &MirValue| {
-            if let MirValue::VReg(v) = val {
-                uses.push(*v);
-            }
-        };
-
-        match inst {
-            MirInst::Copy { src, .. } => add_value(&mut uses, src),
-            MirInst::BinOp { lhs, rhs, .. } => {
-                add_value(&mut uses, lhs);
-                add_value(&mut uses, rhs);
-            }
-            MirInst::UnaryOp { src, .. } => add_value(&mut uses, src),
-            MirInst::Load { ptr, .. } => uses.push(*ptr),
-            MirInst::Store { ptr, val, .. } => {
-                uses.push(*ptr);
-                add_value(&mut uses, val);
-            }
-            MirInst::Branch { cond, .. } => uses.push(*cond),
-            MirInst::Return { val: Some(val) } => add_value(&mut uses, val),
-            MirInst::CallHelper { args, .. } => {
-                for arg in args {
-                    add_value(&mut uses, arg);
-                }
-            }
-            MirInst::MapLookup { key, .. } => uses.push(*key),
-            MirInst::MapUpdate { key, val, .. } => {
-                uses.push(*key);
-                uses.push(*val);
-            }
-            MirInst::EmitEvent { data, .. } => uses.push(*data),
-            MirInst::EmitRecord { fields } => {
-                for field in fields {
-                    uses.push(field.value);
-                }
-            }
-            MirInst::StoreSlot { val, .. } => add_value(&mut uses, val),
-            MirInst::MapDelete { key, .. } => uses.push(*key),
-            MirInst::Histogram { value } => uses.push(*value),
-            MirInst::ReadStr { ptr, .. } => uses.push(*ptr),
-            MirInst::RecordStore { val, .. } => add_value(&mut uses, val),
-            MirInst::Phi { args, .. } => {
-                for (_, vreg) in args {
-                    uses.push(*vreg);
-                }
-            }
-            _ => {}
-        }
-
-        uses
+        // Use the MirInst::uses() method which handles all instruction types
+        inst.uses()
     }
 
     /// Compute spill costs for each vreg
@@ -1084,6 +1022,99 @@ mod tests {
         assert!(
             allocator.graph.interferes(VReg(0), VReg(1)),
             "v0 and v1 should interfere"
+        );
+    }
+
+    fn make_list_function() -> MirFunction {
+        use crate::compiler::mir::StackSlotKind;
+        // v0 = ListNew (list pointer)
+        // v1 = 1
+        // ListPush(v0, v1)
+        // v2 = 2
+        // ListPush(v0, v2)
+        // EmitEvent(v0)
+        // return
+        let mut func = MirFunction::new();
+        let bb0 = func.alloc_block();
+        func.entry = bb0;
+
+        let v0 = func.alloc_vreg(); // list ptr
+        let v1 = func.alloc_vreg(); // item 1
+        let v2 = func.alloc_vreg(); // item 2
+
+        // Allocate stack slot for list buffer
+        let slot = func.alloc_stack_slot(32, 8, StackSlotKind::ListBuffer);
+
+        func.block_mut(bb0).instructions.push(MirInst::ListNew {
+            dst: v0,
+            buffer: slot,
+            max_len: 3,
+        });
+        func.block_mut(bb0).instructions.push(MirInst::Copy {
+            dst: v1,
+            src: MirValue::Const(1),
+        });
+        func.block_mut(bb0)
+            .instructions
+            .push(MirInst::ListPush { list: v0, item: v1 });
+        func.block_mut(bb0).instructions.push(MirInst::Copy {
+            dst: v2,
+            src: MirValue::Const(2),
+        });
+        func.block_mut(bb0)
+            .instructions
+            .push(MirInst::ListPush { list: v0, item: v2 });
+        func.block_mut(bb0)
+            .instructions
+            .push(MirInst::EmitEvent { data: v0, size: 24 });
+        func.block_mut(bb0).terminator = MirInst::Return { val: None };
+
+        func
+    }
+
+    #[test]
+    fn test_list_register_allocation() {
+        let func = make_list_function();
+        let available = vec![EbpfReg::R6, EbpfReg::R7, EbpfReg::R8];
+
+        let result = allocate_registers(&func, available);
+
+        // All vregs should be colored (no spills needed for this simple case)
+        assert_eq!(result.coloring.len(), 3, "Should color all 3 vregs");
+        assert!(result.spills.is_empty(), "Should have no spills");
+
+        // v0 (list ptr) must have a register since it's used across multiple instructions
+        assert!(
+            result.coloring.contains_key(&VReg(0)),
+            "List pointer vreg v0 must be colored"
+        );
+
+        // Print the coloring for debugging
+        eprintln!("List register allocation:");
+        for (vreg, reg) in &result.coloring {
+            eprintln!("  {} -> {:?}", vreg, reg);
+        }
+    }
+
+    #[test]
+    fn test_list_interference() {
+        let func = make_list_function();
+        let cfg = CFG::build(&func);
+        let liveness = LivenessInfo::compute(&func, &cfg);
+        let mut allocator =
+            GraphColoringAllocator::new(vec![EbpfReg::R6, EbpfReg::R7, EbpfReg::R8]);
+        allocator.build(&func, &cfg, &liveness);
+
+        // v0 should be in the graph (defined by ListNew)
+        assert!(
+            allocator.graph.nodes.contains(&VReg(0)),
+            "v0 (list ptr from ListNew) should be in graph"
+        );
+
+        // v0 and v1 should interfere (v0 is live when v1 is used in ListPush)
+        assert!(
+            allocator.graph.interferes(VReg(0), VReg(1)),
+            "v0 (list) and v1 (item) should interfere"
         );
     }
 }

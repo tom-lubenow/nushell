@@ -480,16 +480,10 @@ pub enum MirInst {
 
     /// Push an element onto the end of a list
     /// Stores at offset (length * 8) + 8, then increments length
-    ListPush {
-        list: VReg,
-        item: VReg,
-    },
+    ListPush { list: VReg, item: VReg },
 
     /// Get the current length of a list
-    ListLen {
-        dst: VReg,
-        list: VReg,
-    },
+    ListLen { dst: VReg, list: VReg },
 
     /// Get an element from a list by index
     /// Returns 0 if index out of bounds

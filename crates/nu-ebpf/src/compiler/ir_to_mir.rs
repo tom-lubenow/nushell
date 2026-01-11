@@ -563,7 +563,14 @@ impl<'a> IrToMirLowering<'a> {
                             .map(|m| m.literal_string.is_some())
                             .unwrap_or(false)
                         {
-                            let bytes = val_meta.as_ref().unwrap().literal_string.as_ref().unwrap().as_bytes().to_vec();
+                            let bytes = val_meta
+                                .as_ref()
+                                .unwrap()
+                                .literal_string
+                                .as_ref()
+                                .unwrap()
+                                .as_bytes()
+                                .to_vec();
                             StringAppendType::Literal { bytes }
                         } else {
                             // Default to integer
@@ -1544,9 +1551,11 @@ impl<'a> IrToMirLowering<'a> {
                         let (_src_slot, max_len) = list_info;
 
                         // Allocate output list
-                        let out_slot = self
-                            .func
-                            .alloc_stack_slot((max_len + 1) * 8, 8, StackSlotKind::ListBuffer);
+                        let out_slot = self.func.alloc_stack_slot(
+                            (max_len + 1) * 8,
+                            8,
+                            StackSlotKind::ListBuffer,
+                        );
                         let out_list_vreg = self.func.alloc_vreg();
                         self.emit(MirInst::ListNew {
                             dst: out_list_vreg,
@@ -1655,9 +1664,9 @@ impl<'a> IrToMirLowering<'a> {
 
                 if let Some((_src_slot, max_len)) = list_info {
                     // Create output list
-                    let out_slot = self
-                        .func
-                        .alloc_stack_slot((max_len + 1) * 8, 8, StackSlotKind::ListBuffer);
+                    let out_slot =
+                        self.func
+                            .alloc_stack_slot((max_len + 1) * 8, 8, StackSlotKind::ListBuffer);
                     let out_list_vreg = self.func.alloc_vreg();
                     self.emit(MirInst::ListNew {
                         dst: out_list_vreg,
@@ -1763,9 +1772,9 @@ impl<'a> IrToMirLowering<'a> {
                 if let Some((_src_slot, max_len)) = list_info {
                     // Create output list
                     let out_max = take_count.min(max_len);
-                    let out_slot = self
-                        .func
-                        .alloc_stack_slot((out_max + 1) * 8, 8, StackSlotKind::ListBuffer);
+                    let out_slot =
+                        self.func
+                            .alloc_stack_slot((out_max + 1) * 8, 8, StackSlotKind::ListBuffer);
                     let out_list_vreg = self.func.alloc_vreg();
                     self.emit(MirInst::ListNew {
                         dst: out_list_vreg,
@@ -2592,7 +2601,11 @@ mod tests {
 
         // Verify list instructions have correct structure
         match &func.block(bb0).instructions[0] {
-            MirInst::ListNew { dst, buffer, max_len } => {
+            MirInst::ListNew {
+                dst,
+                buffer,
+                max_len,
+            } => {
                 assert_eq!(*dst, list_ptr);
                 assert_eq!(*buffer, slot);
                 assert_eq!(*max_len, 8);

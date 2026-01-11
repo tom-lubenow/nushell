@@ -448,7 +448,11 @@ impl<'a> SsaBuilder<'a> {
                 val: self.rename_value(val),
                 ty: ty.clone(),
             },
-            MirInst::ListNew { dst, buffer, max_len } => MirInst::ListNew {
+            MirInst::ListNew {
+                dst,
+                buffer,
+                max_len,
+            } => MirInst::ListNew {
                 dst: *dst,
                 buffer: *buffer,
                 max_len: *max_len,

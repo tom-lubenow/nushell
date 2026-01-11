@@ -274,11 +274,21 @@ The compiler pipeline:
 
 ## Limitations
 
+### Platform & Resources
 - **Linux only**: eBPF is a Linux kernel feature
-- **Bounded loops only**: Loops require compile-time known bounds (e.g., `for i in 1..10`). Dynamic iterators are not supported.
-- **No strings in eBPF**: String operations happen at emit time or userspace
 - **Stack limit**: eBPF programs have a 512-byte stack limit
-- **Verifier constraints**: The kernel verifier may reject some valid-looking programs
+- **Verifier constraints**: The kernel verifier may reject complex programs
+
+### Language Features Not Supported
+These Nushell features cannot work in eBPF due to kernel constraints:
+
+| Feature | Reason | Workaround |
+|---------|--------|------------|
+| `$env.VAR` | Kernel has no access to user environment | Pass values as captures |
+| `$record.field = x` | eBPF records are immutable once built | Build record with correct values initially |
+| `let f = {❘x❘ ...}; do $f` | eBPF cannot dynamically dispatch closures | Use inline closures: `$x ❘ each { $in + 1 }` |
+| Unbounded loops | Verifier requires provable termination | Use `for i in 1..N` with literal bounds |
+| Dynamic iterators | Same as above | Use bounded ranges or list literals |
 
 ## Troubleshooting
 

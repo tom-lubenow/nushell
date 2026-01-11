@@ -27,9 +27,11 @@
   }
   # Not yet: record/list destructuring patterns
 
-  5. Cell Path Updates - UpsertCellPath missing
-  # Won't work:
+  5. Cell Path Updates - Not supported (with clear error message)
+  # Won't work (eBPF records are built once then emitted):
   $record.field = 42
+  # Error: "Cell path update (.field = ...) is not supported in eBPF"
+  # Workaround: Build record with correct value initially
 
   6. Closures as Values - Can't pass closures around
   # Won't work:

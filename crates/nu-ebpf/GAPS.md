@@ -64,7 +64,11 @@
   [1, 2, 3, 4, 5] | skip 1 | take 2       # Works - returns [2, 3]
 
   # Lists with each (unrolled loop, max 16 elements):
-  [1, 2, 3] | each { $in * 2 }            # Works
+  [1, 2, 3] | each { $in * 2 }            # Has R0 initialization bug - needs fix
+
+  # Single value transformations work:
+  $ctx.pid | each { $in * 2 } | emit      # Works - transforms single value
 
   # Note: Closure must be simple - uses inline expansion
   # Complex closures may hit instruction limits
+  # List literals may have initialization bugs with some operations

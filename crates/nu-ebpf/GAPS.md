@@ -13,13 +13,13 @@
   $env.PATH
   # Error: "Environment variable access is not supported in eBPF"
 
-  3. Named Arguments/Flags - Infrastructure in place
-  # Now tracked during compilation:
-  some-cmd --verbose   # Flag tracked
-  count --per-cpu      # Named arg tracked
-  # Not all commands use them yet - extend lower_call as needed
+  3. Named Arguments/Flags - Now supported for key commands
+  # Works:
+  count --per-cpu                      # Uses per-CPU hash map (better performance)
+  $ctx.arg0 | read-str --max-len 64    # Custom string buffer size (default 128)
+  $ctx.arg0 | read-kernel-str --max-len 256  # Same for kernel strings
 
-  4. Match Expressions - Expanded support
+  4. Match Expressions - Full pattern support
   # Now works:
   match $x {
       0 => "zero"
@@ -27,7 +27,19 @@
       $y => $y           # Variable binding
       _ => "other"       # Wildcard
   }
-  # Not yet: record/list destructuring patterns
+
+  # Record destructuring:
+  match $record {
+      { name: $n, age: $a } => $"$n is $a years old"
+      { name: $n } => $"Hello $n"
+  }
+
+  # List destructuring:
+  match $list {
+      [$first, $second, ..$rest] => $first + $second
+      [$only] => $only
+      [] => 0
+  }
 
   5. Cell Path Updates - Not supported (with clear error message)
   # Won't work (eBPF records are built once then emitted):

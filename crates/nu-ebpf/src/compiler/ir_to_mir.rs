@@ -1116,11 +1116,168 @@ impl<'a> IrToMirLowering<'a> {
                 }
             }
 
-            _ => {
-                return Err(CompileError::UnsupportedInstruction(format!(
-                    "Match pattern {:?} not yet supported in eBPF",
-                    pattern
-                )));
+            Pattern::Record(field_patterns) => {
+                // Record destructuring: { name: $n, age: $a }
+                // Get record fields from metadata
+                let record_fields = self
+                    .get_metadata(src)
+                    .map(|m| m.record_fields.clone())
+                    .unwrap_or_default();
+
+                if record_fields.is_empty() {
+                    return Err(CompileError::UnsupportedInstruction(
+                        "Record pattern on non-record value in eBPF".into(),
+                    ));
+                }
+
+                // For each field in the pattern, extract the value and bind it
+                for (field_name, sub_pattern) in field_patterns {
+                    // Find the field in the record
+                    let field = record_fields.iter().find(|f| &f.name == field_name);
+
+                    if let Some(field) = field {
+                        // Bind the field value to the pattern
+                        match &sub_pattern.pattern {
+                            Pattern::Variable(var_id) => {
+                                // Bind field value to variable
+                                self.var_mappings.insert(*var_id, field.value_vreg);
+                            }
+                            Pattern::IgnoreValue => {
+                                // _ pattern - just ignore the field
+                            }
+                            _ => {
+                                return Err(CompileError::UnsupportedInstruction(format!(
+                                    "Nested pattern {:?} in record field not yet supported",
+                                    sub_pattern.pattern
+                                )));
+                            }
+                        }
+                    } else {
+                        // Field not found - pattern doesn't match
+                        // Jump to continue block (no match)
+                        self.terminate(MirInst::Jump {
+                            target: continue_block,
+                        });
+                        self.current_block = continue_block;
+                        return Ok(());
+                    }
+                }
+
+                // All fields matched - jump to target
+                self.terminate(MirInst::Jump {
+                    target: target_block,
+                });
+            }
+
+            Pattern::List(element_patterns) => {
+                // List destructuring: [$first, $second, ..$rest]
+                // Get list info from metadata
+                let list_info = self.get_metadata(src).and_then(|m| m.list_buffer);
+
+                if list_info.is_none() {
+                    return Err(CompileError::UnsupportedInstruction(
+                        "List pattern on non-list value in eBPF".into(),
+                    ));
+                }
+
+                let list_vreg = src_vreg;
+                let mut idx = 0;
+
+                for sub_pattern in element_patterns {
+                    match &sub_pattern.pattern {
+                        Pattern::Variable(var_id) => {
+                            // Extract element at index and bind to variable
+                            let elem_vreg = self.func.alloc_vreg();
+                            self.emit(MirInst::ListGet {
+                                dst: elem_vreg,
+                                list: list_vreg,
+                                idx: MirValue::Const(idx as i64),
+                            });
+                            self.var_mappings.insert(*var_id, elem_vreg);
+                            idx += 1;
+                        }
+                        Pattern::IgnoreValue => {
+                            // _ pattern - skip this element
+                            idx += 1;
+                        }
+                        Pattern::Rest(var_id) => {
+                            // ..$rest - bind remaining elements as a new list
+                            // For now, create a new list with remaining elements
+                            let remaining_slot = self.func.alloc_stack_slot(
+                                128, // Fixed size for rest list
+                                8,
+                                StackSlotKind::ListBuffer,
+                            );
+                            let rest_vreg = self.func.alloc_vreg();
+                            self.emit(MirInst::ListNew {
+                                dst: rest_vreg,
+                                buffer: remaining_slot,
+                                max_len: 16,
+                            });
+
+                            // Get list length
+                            let len_vreg = self.func.alloc_vreg();
+                            self.emit(MirInst::ListLen {
+                                dst: len_vreg,
+                                list: list_vreg,
+                            });
+
+                            // Copy remaining elements (bounded loop)
+                            // For simplicity, unroll for up to 8 elements
+                            for i in 0..8 {
+                                let actual_idx = idx + i;
+                                let elem_vreg = self.func.alloc_vreg();
+                                self.emit(MirInst::ListGet {
+                                    dst: elem_vreg,
+                                    list: list_vreg,
+                                    idx: MirValue::Const(actual_idx as i64),
+                                });
+                                self.emit(MirInst::ListPush {
+                                    list: rest_vreg,
+                                    item: elem_vreg,
+                                });
+                            }
+
+                            self.var_mappings.insert(*var_id, rest_vreg);
+                            break; // Rest pattern must be last
+                        }
+                        Pattern::IgnoreRest => {
+                            // .. pattern - ignore remaining elements
+                            break;
+                        }
+                        _ => {
+                            return Err(CompileError::UnsupportedInstruction(format!(
+                                "Nested pattern {:?} in list element not yet supported",
+                                sub_pattern.pattern
+                            )));
+                        }
+                    }
+                }
+
+                // Pattern matched - jump to target
+                self.terminate(MirInst::Jump {
+                    target: target_block,
+                });
+            }
+
+            Pattern::Rest(_) | Pattern::IgnoreRest => {
+                // Rest patterns only valid inside List patterns
+                return Err(CompileError::UnsupportedInstruction(
+                    "Rest pattern (..) only valid inside list patterns".into(),
+                ));
+            }
+
+            Pattern::Expression(_) => {
+                // Expression patterns need evaluation at compile time
+                return Err(CompileError::UnsupportedInstruction(
+                    "Expression patterns in match not yet supported in eBPF".into(),
+                ));
+            }
+
+            Pattern::Garbage => {
+                return Err(CompileError::UnsupportedInstruction(
+                    "Invalid pattern in match expression".into(),
+                ));
             }
         }
 
@@ -1296,22 +1453,38 @@ impl<'a> IrToMirLowering<'a> {
                         self.get_metadata(src_dst)
                             .and_then(|m| m.field_type.clone())
                     });
-                let map_name = match key_type {
+
+                // Check for --per-cpu flag
+                let per_cpu = self.named_flags.contains(&"per-cpu".to_string());
+
+                let (map_name, map_kind) = match key_type {
                     Some(MirType::Array { elem, len }) if matches!(elem.as_ref(), MirType::U8) => {
                         if len == 16 {
-                            "str_counters"
+                            let kind = if per_cpu {
+                                MapKind::PerCpuHash
+                            } else {
+                                MapKind::Hash
+                            };
+                            ("str_counters", kind)
                         } else {
                             return Err(CompileError::UnsupportedInstruction(
                                 "count only supports 16-byte strings (e.g., $ctx.comm)".into(),
                             ));
                         }
                     }
-                    _ => "counters",
+                    _ => {
+                        let kind = if per_cpu {
+                            MapKind::PerCpuHash
+                        } else {
+                            MapKind::Hash
+                        };
+                        ("counters", kind)
+                    }
                 };
                 self.emit(MirInst::MapUpdate {
                     map: MapRef {
                         name: map_name.to_string(),
-                        kind: MapKind::Hash,
+                        kind: map_kind,
                     },
                     key: key_vreg,
                     val: dst_vreg, // Will be handled specially in MIR->eBPF
@@ -1388,14 +1561,24 @@ impl<'a> IrToMirLowering<'a> {
 
             "read-str" => {
                 let ptr_vreg = self.pipeline_input.unwrap_or(dst_vreg);
+
+                // Check for --max-len argument (default 128)
+                let max_len = self
+                    .named_args
+                    .get("max-len")
+                    .and_then(|(_, reg)| self.get_metadata(*reg))
+                    .and_then(|m| m.literal_int)
+                    .map(|v| v as usize)
+                    .unwrap_or(128);
+
                 let slot = self
                     .func
-                    .alloc_stack_slot(128, 8, StackSlotKind::StringBuffer);
+                    .alloc_stack_slot(max_len, 8, StackSlotKind::StringBuffer);
                 self.emit(MirInst::ReadStr {
                     dst: slot,
                     ptr: ptr_vreg,
                     user_space: true,
-                    max_len: 128,
+                    max_len,
                 });
                 self.emit(MirInst::Copy {
                     dst: dst_vreg,
@@ -1405,20 +1588,30 @@ impl<'a> IrToMirLowering<'a> {
                 meta.string_slot = Some(slot);
                 meta.field_type = Some(MirType::Array {
                     elem: Box::new(MirType::U8),
-                    len: 128,
+                    len: max_len,
                 });
             }
 
             "read-kernel-str" => {
                 let ptr_vreg = self.pipeline_input.unwrap_or(dst_vreg);
+
+                // Check for --max-len argument (default 128)
+                let max_len = self
+                    .named_args
+                    .get("max-len")
+                    .and_then(|(_, reg)| self.get_metadata(*reg))
+                    .and_then(|m| m.literal_int)
+                    .map(|v| v as usize)
+                    .unwrap_or(128);
+
                 let slot = self
                     .func
-                    .alloc_stack_slot(128, 8, StackSlotKind::StringBuffer);
+                    .alloc_stack_slot(max_len, 8, StackSlotKind::StringBuffer);
                 self.emit(MirInst::ReadStr {
                     dst: slot,
                     ptr: ptr_vreg,
                     user_space: false,
-                    max_len: 128,
+                    max_len,
                 });
                 self.emit(MirInst::Copy {
                     dst: dst_vreg,
@@ -1428,7 +1621,7 @@ impl<'a> IrToMirLowering<'a> {
                 meta.string_slot = Some(slot);
                 meta.field_type = Some(MirType::Array {
                     elem: Box::new(MirType::U8),
-                    len: 128,
+                    len: max_len,
                 });
             }
 

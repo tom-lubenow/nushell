@@ -1302,18 +1302,36 @@ impl<'a> IrToMirLowering<'a> {
             }
 
             "filter" => {
-                // Filter: if input is 0/false, exit early
+                // Filter: filter pipeline by condition closure (like where)
+                // If no closure provided, falls back to checking if input is truthy
                 let input_vreg = self.pipeline_input.unwrap_or(dst_vreg);
+                let input_reg = self.pipeline_input_reg;
+
+                // Check if a closure was provided
+                let closure_block_id = self
+                    .positional_args
+                    .first()
+                    .and_then(|(_, reg)| self.get_metadata(*reg))
+                    .and_then(|m| m.closure_block_id);
+
+                let condition_vreg = if let Some(block_id) = closure_block_id {
+                    // Inline the closure with $in bound to input_vreg
+                    self.inline_closure_with_in(block_id, input_vreg)?
+                } else {
+                    // No closure - use input value directly as condition
+                    input_vreg
+                };
+
                 // Create exit block and continue block
                 let exit_block = self.func.alloc_block();
                 let continue_block = self.func.alloc_block();
 
-                // Branch: if input is 0, exit
+                // Branch: if condition is 0/false, exit
                 let negated = self.func.alloc_vreg();
                 self.emit(MirInst::UnaryOp {
                     dst: negated,
                     op: super::mir::UnaryOpKind::Not,
-                    src: MirValue::VReg(input_vreg),
+                    src: MirValue::VReg(condition_vreg),
                 });
                 self.terminate(MirInst::Branch {
                     cond: negated,
@@ -1327,8 +1345,23 @@ impl<'a> IrToMirLowering<'a> {
                     val: Some(MirValue::Const(0)),
                 });
 
-                // Continue in the continue block
+                // Continue block passes the original value through
                 self.current_block = continue_block;
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::VReg(input_vreg),
+                });
+
+                // Copy metadata from input to output (for chaining)
+                if let Some(reg) = input_reg {
+                    if let Some(meta) = self.get_metadata(reg).cloned() {
+                        let out_meta = self.get_or_create_metadata(src_dst);
+                        out_meta.field_type = meta.field_type;
+                        out_meta.string_slot = meta.string_slot;
+                        out_meta.record_fields = meta.record_fields;
+                        out_meta.list_buffer = meta.list_buffer;
+                    }
+                }
             }
 
             "read-str" => {

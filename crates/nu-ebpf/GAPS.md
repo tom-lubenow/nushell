@@ -47,14 +47,15 @@
   [[name, age]; [Alice, 30]]
   # Limited by stack size (~10-15 rows max depending on record size)
 
-  8. Pipelines with Multiple Commands - Now supports where/each
+  8. Pipelines with Multiple Commands - Now supports where/each/filter
   # Terminal commands:
   $ctx.pid | count                        # Works
   $ctx.pid | emit                         # Works
   { pid: $ctx.pid } | emit                # Works
 
-  # Pipeline chaining with where/each now works:
+  # Pipeline chaining with where/each/filter now works:
   $ctx.pid | where { $in > 100 } | count  # Works - filters then counts
+  $ctx.pid | filter { $in > 100 } | count # Works - same as where
   $items | each { $in * 2 } | emit        # Works - transforms then emits
 
   # Lists with each (unrolled loop, max 16 elements):

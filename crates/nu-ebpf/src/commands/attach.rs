@@ -86,11 +86,19 @@ Userspace probe formats:
   uprobe:/path:func+0x10    - Attach to function + offset
   uprobe:/path:func@1234    - Attach only to process with PID 1234
 
+User-defined functions:
+  Functions defined with 'def' can be called from eBPF closures and will be
+  inlined at compile time:
+    def is_root [uid] { $uid == 0 }
+    ebpf attach -s 'kprobe:vfs_read' {|ctx| if (is_root $ctx.uid) { $ctx.pid | emit } }
+
+  Each call site gets its own copy of the function, so the same function can be
+  called with different types (polymorphic inlining).
+
 Captured variables:
   - Integer variables from outer scope can be captured and inlined:
       let pid = 1234; {|ctx| if $ctx.pid == $pid { ... } }  # OK
   - Non-integer captures (strings, lists, etc.) are not supported
-  - Only a subset of Nushell operations are supported (no loops, closures, etc.)
   - String comparisons limited to 8 characters
 
 Requirements:
@@ -188,6 +196,11 @@ Requirements:
             Example {
                 example: "ebpf attach -s 'tracepoint:syscalls/sys_exit_read' {|ctx| $ctx.ret | emit }",
                 description: "Stream read syscall return values",
+                result: None,
+            },
+            Example {
+                example: "def is_root [uid] { $uid == 0 }; ebpf attach -s 'kprobe:vfs_read' {|ctx| if (is_root $ctx.uid) { $ctx.pid | emit } }",
+                description: "Use a helper function to check if running as root",
                 result: None,
             },
         ]

@@ -118,6 +118,10 @@ pub struct IrToMirLowering<'a> {
     pipeline_input: Option<VReg>,
     /// Pipeline input source RegId (for metadata lookup)
     pipeline_input_reg: Option<RegId>,
+    /// Positional arguments for the next call (vreg, source RegId for metadata)
+    positional_args: Vec<(VReg, RegId)>,
+    /// Variable mappings for inlined functions (VarId -> VReg)
+    var_mappings: HashMap<VarId, VReg>,
     /// Needs ringbuf map
     pub needs_ringbuf: bool,
     /// Needs counter map
@@ -157,6 +161,8 @@ impl<'a> IrToMirLowering<'a> {
             ctx_param,
             pipeline_input: None,
             pipeline_input_reg: None,
+            positional_args: Vec::new(),
+            var_mappings: HashMap::new(),
             needs_ringbuf: false,
             needs_counter_map: false,
             needs_histogram_map: false,
@@ -371,15 +377,19 @@ impl<'a> IrToMirLowering<'a> {
             }
 
             Instruction::PushPositional { src } => {
-                // Set up pipeline input for the next command
+                // Track positional argument for user-defined functions
                 let src_vreg = self.get_vreg(*src);
+                self.positional_args.push((src_vreg, *src));
+                // Also set pipeline_input for built-in commands (backwards compatibility)
                 self.pipeline_input = Some(src_vreg);
                 self.pipeline_input_reg = Some(*src);
             }
 
             Instruction::AppendRest { src } => {
-                // Same as PushPositional for our simple case
+                // Track as positional argument
                 let src_vreg = self.get_vreg(*src);
+                self.positional_args.push((src_vreg, *src));
+                // Also set pipeline_input for built-in commands
                 self.pipeline_input = Some(src_vreg);
                 self.pipeline_input_reg = Some(*src);
             }
@@ -847,8 +857,16 @@ impl<'a> IrToMirLowering<'a> {
         Ok(())
     }
 
-    /// Lower Call instruction (emit, count, etc.)
+    /// Lower Call instruction (emit, count, etc. or user-defined functions)
     fn lower_call(&mut self, decl_id: DeclId, src_dst: RegId) -> Result<(), CompileError> {
+        // Check if this is a user-defined command that we should inline
+        if let Some(es) = self.engine_state {
+            let decl = es.get_decl(decl_id);
+            if decl.is_custom() {
+                return self.inline_user_function(decl_id, src_dst);
+            }
+        }
+
         let cmd_name = self
             .engine_state
             .map(|es| es.get_decl(decl_id).name().to_string())
@@ -1065,6 +1083,120 @@ impl<'a> IrToMirLowering<'a> {
 
         self.pipeline_input = None;
         self.pipeline_input_reg = None;
+        self.positional_args.clear();
+        Ok(())
+    }
+
+    /// Inline a user-defined function at the call site
+    fn inline_user_function(&mut self, decl_id: DeclId, src_dst: RegId) -> Result<(), CompileError> {
+        let es = self.engine_state.ok_or_else(|| {
+            CompileError::UnsupportedInstruction("No engine state for user function lookup".into())
+        })?;
+
+        let decl = es.get_decl(decl_id);
+        let cmd_name = decl.name().to_string();
+
+        // Get the block ID for the user-defined command
+        let block_id = decl.block_id().ok_or_else(|| {
+            CompileError::UnsupportedInstruction(format!(
+                "Command '{}' has no block (not a def command)",
+                cmd_name
+            ))
+        })?;
+
+        // Get the block and its IR
+        let block = es.get_block(block_id);
+        let ir_block = block.ir_block.as_ref().ok_or_else(|| {
+            CompileError::UnsupportedInstruction(format!(
+                "Command '{}' has no IR (not compiled)",
+                cmd_name
+            ))
+        })?;
+
+        // Get the signature to map parameters to VarIds
+        let signature = decl.signature();
+
+        // Map positional arguments to their parameter VarIds
+        let positional_args = std::mem::take(&mut self.positional_args);
+        for (i, (arg_vreg, _arg_reg)) in positional_args.iter().enumerate() {
+            if let Some(param) = signature.required_positional.get(i) {
+                if let Some(var_id) = param.var_id {
+                    self.var_mappings.insert(var_id, *arg_vreg);
+                }
+            } else if let Some(param) = signature
+                .optional_positional
+                .get(i.saturating_sub(signature.required_positional.len()))
+            {
+                if let Some(var_id) = param.var_id {
+                    self.var_mappings.insert(var_id, *arg_vreg);
+                }
+            }
+        }
+
+        // Save current IR context
+        let saved_ir_block = self.ir_block;
+
+        // Process the function's IR instructions
+        self.ir_block = Some(ir_block);
+        let dst_vreg = self.get_vreg(src_dst);
+
+        // Track the result register - we'll capture the last expression's value
+        let mut result_vreg: Option<VReg> = None;
+
+        for (ir_idx, inst) in ir_block.instructions.iter().enumerate() {
+            // Handle Return specially - capture the return value
+            if let Instruction::Return { src } = inst {
+                let src_vreg = self.get_vreg(*src);
+                result_vreg = Some(src_vreg);
+                // Don't emit the Return instruction - we're inlining
+                continue;
+            }
+
+            // Also handle ReturnEarly the same way
+            if let Instruction::ReturnEarly { src } = inst {
+                let src_vreg = self.get_vreg(*src);
+                result_vreg = Some(src_vreg);
+                continue;
+            }
+
+            // Lower the instruction normally
+            self.lower_instruction(inst, ir_idx)?;
+        }
+
+        // Restore IR context
+        self.ir_block = saved_ir_block;
+
+        // Copy result to destination register
+        if let Some(result) = result_vreg {
+            self.emit(MirInst::Copy {
+                dst: dst_vreg,
+                src: MirValue::VReg(result),
+            });
+        } else {
+            // No explicit return, set result to 0
+            self.emit(MirInst::Copy {
+                dst: dst_vreg,
+                src: MirValue::Const(0),
+            });
+        }
+
+        // Clean up var mappings for this function's parameters
+        for param in &signature.required_positional {
+            if let Some(var_id) = param.var_id {
+                self.var_mappings.remove(&var_id);
+            }
+        }
+        for param in &signature.optional_positional {
+            if let Some(var_id) = param.var_id {
+                self.var_mappings.remove(&var_id);
+            }
+        }
+
+        // Clear pipeline state
+        self.pipeline_input = None;
+        self.pipeline_input_reg = None;
+        self.positional_args.clear();
+
         Ok(())
     }
 
@@ -1120,11 +1252,22 @@ impl<'a> IrToMirLowering<'a> {
         dst: RegId,
         var_id: nu_protocol::VarId,
     ) -> Result<(), CompileError> {
+        let dst_vreg = self.get_vreg(dst);
+
+        // Check if this is a parameter from an inlined function
+        if let Some(&param_vreg) = self.var_mappings.get(&var_id) {
+            // Copy the parameter value to the destination
+            self.emit(MirInst::Copy {
+                dst: dst_vreg,
+                src: MirValue::VReg(param_vreg),
+            });
+            return Ok(());
+        }
+
         // Check if this is the context parameter variable
         if let Some(ctx_var) = self.ctx_param
             && var_id == ctx_var
         {
-            let dst_vreg = self.get_vreg(dst);
             // Mark this register as holding the context
             let meta = self.get_or_create_metadata(dst);
             meta.is_context = true;
@@ -1144,7 +1287,7 @@ impl<'a> IrToMirLowering<'a> {
         }
 
         Err(CompileError::UnsupportedInstruction(format!(
-            "Variable {} not found in captures",
+            "Variable {} not found in captures or function parameters",
             var_id.get()
         )))
     }

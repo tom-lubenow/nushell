@@ -46,6 +46,14 @@
   # Limited by stack size (~10-15 rows max depending on record size)
 
   8. Pipelines with Multiple Commands
-  # Limited support - some built-ins only:
-  $ctx.pid | count   # Works
+  # Limited support - single terminal command only:
+  $ctx.pid | count                        # Works
+  $ctx.pid | emit                         # Works
+  { pid: $ctx.pid } | emit                # Works
+
+  # Chained commands don't work yet:
   $ctx.pid | where { $in > 100 } | count  # Won't work
+  $items | each { $in * 2 } | emit        # Won't work
+
+  # To add: implement pipeline chaining in lower_call for
+  # transformation commands (where, each, filter, etc.)

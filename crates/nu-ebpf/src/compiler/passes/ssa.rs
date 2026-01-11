@@ -381,6 +381,11 @@ impl<'a> SsaBuilder<'a> {
                 helper: *helper,
                 args: args.iter().map(|v| self.rename_value(v)).collect(),
             },
+            MirInst::CallSubfn { dst, subfn, args } => MirInst::CallSubfn {
+                dst: *dst,
+                subfn: *subfn,
+                args: args.iter().map(|v| self.rename_vreg(*v)).collect(),
+            },
             MirInst::MapLookup { dst, map, key } => MirInst::MapLookup {
                 dst: *dst,
                 map: map.clone(),

@@ -32,6 +32,16 @@ impl fmt::Display for BlockId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StackSlotId(pub u32);
 
+/// Subfunction identifier for BPF-to-BPF calls
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubfunctionId(pub u32);
+
+impl fmt::Display for SubfunctionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "subfn{}", self.0)
+    }
+}
+
 /// Map reference for BPF map operations
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MapRef {
@@ -452,6 +462,14 @@ pub enum MirInst {
     /// Tail call to another program
     TailCall { prog_map: MapRef, index: MirValue },
 
+    /// Call a BPF subfunction (BPF-to-BPF call)
+    /// Arguments are passed in R1-R5, return value in R0
+    CallSubfn {
+        dst: VReg,
+        subfn: SubfunctionId,
+        args: Vec<VReg>,
+    },
+
     // Pseudo-instructions (expanded during lowering)
     /// Bounded loop header (eBPF verifier requirement)
     LoopHeader {
@@ -490,6 +508,7 @@ impl MirInst {
             | MirInst::BinOp { dst, .. }
             | MirInst::UnaryOp { dst, .. }
             | MirInst::CallHelper { dst, .. }
+            | MirInst::CallSubfn { dst, .. }
             | MirInst::MapLookup { dst, .. }
             | MirInst::LoadCtxField { dst, .. }
             | MirInst::StrCmp { dst, .. }
@@ -526,6 +545,11 @@ impl MirInst {
             MirInst::CallHelper { args, .. } => {
                 for arg in args {
                     add_value(&mut uses, arg);
+                }
+            }
+            MirInst::CallSubfn { args, .. } => {
+                for arg in args {
+                    uses.push(*arg);
                 }
             }
             MirInst::MapLookup { key, .. } => uses.push(*key),
@@ -605,6 +629,8 @@ impl BasicBlock {
 /// A complete MIR function
 #[derive(Debug, Clone)]
 pub struct MirFunction {
+    /// Function name (for debugging and ELF section naming)
+    pub name: Option<String>,
     /// Basic blocks (entry block is first)
     pub blocks: Vec<BasicBlock>,
     /// Entry block ID
@@ -615,17 +641,29 @@ pub struct MirFunction {
     pub stack_slots: Vec<StackSlot>,
     /// Maps used by this function
     pub maps_used: Vec<MapRef>,
+    /// Parameter count (for BPF subfunction calling convention)
+    pub param_count: usize,
 }
 
 impl MirFunction {
     /// Create a new empty MIR function
     pub fn new() -> Self {
         Self {
+            name: None,
             blocks: Vec::new(),
             entry: BlockId(0),
             vreg_count: 0,
             stack_slots: Vec::new(),
             maps_used: Vec::new(),
+            param_count: 0,
+        }
+    }
+
+    /// Create a new named MIR function (for subfunctions)
+    pub fn with_name(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            ..Self::new()
         }
     }
 
@@ -704,5 +742,22 @@ impl MirProgram {
             main,
             subfunctions: Vec::new(),
         }
+    }
+
+    /// Add a subfunction and return its ID
+    pub fn add_subfunction(&mut self, func: MirFunction) -> SubfunctionId {
+        let id = SubfunctionId(self.subfunctions.len() as u32);
+        self.subfunctions.push(func);
+        id
+    }
+
+    /// Get a subfunction by ID
+    pub fn get_subfunction(&self, id: SubfunctionId) -> Option<&MirFunction> {
+        self.subfunctions.get(id.0 as usize)
+    }
+
+    /// Get a mutable reference to a subfunction by ID
+    pub fn get_subfunction_mut(&mut self, id: SubfunctionId) -> Option<&mut MirFunction> {
+        self.subfunctions.get_mut(id.0 as usize)
     }
 }

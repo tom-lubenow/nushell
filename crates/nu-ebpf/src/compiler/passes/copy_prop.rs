@@ -166,6 +166,15 @@ impl CopyPropagation {
                 }
             }
 
+            MirInst::CallSubfn { args, .. } => {
+                for arg in args {
+                    if let Some(&new_arg) = copy_map.get(arg) {
+                        *arg = new_arg;
+                        changed = true;
+                    }
+                }
+            }
+
             MirInst::MapLookup { key, .. } => {
                 if let Some(&new_key) = copy_map.get(key) {
                     *key = new_key;

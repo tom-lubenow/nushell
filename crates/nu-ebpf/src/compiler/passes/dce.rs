@@ -114,6 +114,7 @@ fn has_side_effects(inst: &MirInst) -> bool {
         | MirInst::StoreSlot { .. }
         | MirInst::RecordStore { .. }
         | MirInst::CallHelper { .. }
+        | MirInst::CallSubfn { .. }
         | MirInst::MapLookup { .. }
         | MirInst::MapUpdate { .. }
         | MirInst::MapDelete { .. }

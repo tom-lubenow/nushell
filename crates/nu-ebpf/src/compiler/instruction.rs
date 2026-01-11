@@ -338,6 +338,13 @@ impl EbpfInsn {
         Self::new(opcode::CALL, 0, 0, 0, helper as i32)
     }
 
+    /// CALL local - BPF-to-BPF function call (src=1 indicates local call)
+    /// The imm field contains the offset to the target function in instructions
+    pub const fn call_local(offset: i32) -> Self {
+        // src_reg = 1 (BPF_PSEUDO_CALL) indicates this is a local function call
+        Self::new(opcode::CALL, 0, 1, 0, offset)
+    }
+
     /// EXIT - Exit the eBPF program (return value in r0)
     pub const fn exit() -> Self {
         Self::new(opcode::EXIT, 0, 0, 0, 0)

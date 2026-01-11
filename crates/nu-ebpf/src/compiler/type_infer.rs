@@ -211,6 +211,13 @@ impl TypeInference {
                 self.constrain(dst_ty, HMType::I64, "helper_call");
             }
 
+            MirInst::CallSubfn { dst, .. } => {
+                // Subfunction return type - default to i64 for now
+                // TODO: infer from subfunction signature
+                let dst_ty = self.vreg_type(*dst);
+                self.constrain(dst_ty, HMType::I64, "subfn_call");
+            }
+
             MirInst::MapLookup { dst, .. } => {
                 // Map lookup returns pointer to value
                 let dst_ty = self.vreg_type(*dst);

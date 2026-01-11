@@ -14,7 +14,7 @@ use super::CompileError;
 use super::elf::ProbeContext;
 use super::mir::{
     BasicBlock, BinOpKind, BlockId, CtxField, MapKind, MapRef, MirFunction, MirInst, MirProgram,
-    MirType, MirValue, RecordFieldDef, StackSlotId, StackSlotKind, VReg,
+    MirType, MirValue, RecordFieldDef, StackSlotId, StackSlotKind, SubfunctionId, VReg,
 };
 
 /// Command types we recognize for eBPF
@@ -134,6 +134,12 @@ pub struct IrToMirLowering<'a> {
     loop_contexts: Vec<LoopContext>,
     /// Mapping from IR instruction index to MIR block (for forward jumps)
     ir_index_to_block: HashMap<usize, BlockId>,
+    /// Generated subfunctions
+    subfunctions: Vec<MirFunction>,
+    /// Registry of generated subfunctions by DeclId
+    subfunction_registry: HashMap<DeclId, SubfunctionId>,
+    /// Call count for each user function (for inline vs subfunction decision)
+    call_counts: HashMap<DeclId, usize>,
 }
 
 impl<'a> IrToMirLowering<'a> {
@@ -169,6 +175,9 @@ impl<'a> IrToMirLowering<'a> {
             needs_timestamp_map: false,
             loop_contexts: Vec::new(),
             ir_index_to_block: HashMap::new(),
+            subfunctions: Vec::new(),
+            subfunction_registry: HashMap::new(),
+            call_counts: HashMap::new(),
         }
     }
 
@@ -1087,8 +1096,121 @@ impl<'a> IrToMirLowering<'a> {
         Ok(())
     }
 
-    /// Inline a user-defined function at the call site
-    fn inline_user_function(&mut self, decl_id: DeclId, src_dst: RegId) -> Result<(), CompileError> {
+    /// Call a user-defined function (inline for single use, subfunction for multiple calls)
+    fn inline_user_function(
+        &mut self,
+        decl_id: DeclId,
+        src_dst: RegId,
+    ) -> Result<(), CompileError> {
+        // Increment call count for this function
+        let count = self.call_counts.entry(decl_id).or_insert(0);
+        *count += 1;
+        let call_count = *count;
+
+        let dst_vreg = self.get_vreg(src_dst);
+        let positional_args = std::mem::take(&mut self.positional_args);
+
+        // If this is the first call, inline it directly
+        // (We could also always generate subfunctions, but inlining single-use functions is more efficient)
+        if call_count == 1 {
+            self.inline_function_body(decl_id, dst_vreg, &positional_args)?;
+        } else {
+            // For second+ calls, use subfunction
+            let subfn_id = self.get_or_create_subfunction(decl_id)?;
+
+            // Emit CallSubfn instruction
+            let arg_vregs: Vec<VReg> = positional_args.iter().map(|(vreg, _)| *vreg).collect();
+            self.emit(MirInst::CallSubfn {
+                dst: dst_vreg,
+                subfn: subfn_id,
+                args: arg_vregs,
+            });
+        }
+
+        // Clear pipeline state
+        self.pipeline_input = None;
+        self.pipeline_input_reg = None;
+        self.positional_args.clear();
+
+        Ok(())
+    }
+
+    /// Get or create a subfunction for a user-defined command
+    fn get_or_create_subfunction(
+        &mut self,
+        decl_id: DeclId,
+    ) -> Result<SubfunctionId, CompileError> {
+        // Check if we already have a subfunction for this decl
+        if let Some(&subfn_id) = self.subfunction_registry.get(&decl_id) {
+            return Ok(subfn_id);
+        }
+
+        let es = self.engine_state.ok_or_else(|| {
+            CompileError::UnsupportedInstruction("No engine state for user function lookup".into())
+        })?;
+
+        let decl = es.get_decl(decl_id);
+        let cmd_name = decl.name().to_string();
+
+        // Get the block ID for the user-defined command
+        let block_id = decl.block_id().ok_or_else(|| {
+            CompileError::UnsupportedInstruction(format!(
+                "Command '{}' has no block (not a def command)",
+                cmd_name
+            ))
+        })?;
+
+        // Get the block and its IR
+        let block = es.get_block(block_id);
+        let ir_block = block.ir_block.as_ref().ok_or_else(|| {
+            CompileError::UnsupportedInstruction(format!(
+                "Command '{}' has no IR (not compiled)",
+                cmd_name
+            ))
+        })?;
+
+        let signature = decl.signature();
+
+        // Create a new MIR function for the subfunction
+        let mut subfn = MirFunction::with_name(&cmd_name);
+        subfn.param_count =
+            signature.required_positional.len() + signature.optional_positional.len();
+
+        // Create entry block
+        let entry = subfn.alloc_block();
+        subfn.entry = entry;
+
+        // Allocate vregs for parameters (R1-R5 in BPF calling convention)
+        let mut param_vregs = Vec::new();
+        for param in &signature.required_positional {
+            let vreg = subfn.alloc_vreg();
+            param_vregs.push((param.var_id, vreg));
+        }
+        for param in &signature.optional_positional {
+            let vreg = subfn.alloc_vreg();
+            param_vregs.push((param.var_id, vreg));
+        }
+
+        // Lower the function body into the subfunction
+        // We need a separate lowering context for this
+        let mut subfn_lowering = SubfunctionLowering::new(&mut subfn, ir_block, &param_vregs);
+        subfn_lowering.lower()?;
+
+        // Add the subfunction to our list
+        let subfn_id = SubfunctionId(self.subfunctions.len() as u32);
+        self.subfunctions.push(subfn);
+        self.subfunction_registry.insert(decl_id, subfn_id);
+
+        Ok(subfn_id)
+    }
+
+    /// Inline a function body directly at the call site
+    fn inline_function_body(
+        &mut self,
+        decl_id: DeclId,
+        dst_vreg: VReg,
+        positional_args: &[(VReg, RegId)],
+    ) -> Result<(), CompileError> {
         let es = self.engine_state.ok_or_else(|| {
             CompileError::UnsupportedInstruction("No engine state for user function lookup".into())
         })?;
@@ -1117,7 +1239,6 @@ impl<'a> IrToMirLowering<'a> {
         let signature = decl.signature();
 
         // Map positional arguments to their parameter VarIds
-        let positional_args = std::mem::take(&mut self.positional_args);
         for (i, (arg_vreg, _arg_reg)) in positional_args.iter().enumerate() {
             if let Some(param) = signature.required_positional.get(i) {
                 if let Some(var_id) = param.var_id {
@@ -1138,7 +1259,6 @@ impl<'a> IrToMirLowering<'a> {
 
         // Process the function's IR instructions
         self.ir_block = Some(ir_block);
-        let dst_vreg = self.get_vreg(src_dst);
 
         // Track the result register - we'll capture the last expression's value
         let mut result_vreg: Option<VReg> = None;
@@ -1191,11 +1311,6 @@ impl<'a> IrToMirLowering<'a> {
                 self.var_mappings.remove(&var_id);
             }
         }
-
-        // Clear pipeline state
-        self.pipeline_input = None;
-        self.pipeline_input_reg = None;
-        self.positional_args.clear();
 
         Ok(())
     }
@@ -1294,7 +1409,9 @@ impl<'a> IrToMirLowering<'a> {
 
     /// Finish lowering and return the MIR program
     pub fn finish(self) -> MirProgram {
-        MirProgram::new(self.func)
+        let mut program = MirProgram::new(self.func);
+        program.subfunctions = self.subfunctions;
+        program
     }
 }
 
@@ -1311,6 +1428,203 @@ pub fn lower_ir_to_mir(
     let mut lowering = IrToMirLowering::new(ir_block, probe_ctx, engine_state, captures, ctx_param);
     lowering.lower_block(ir_block)?;
     Ok(lowering.finish())
+}
+
+/// Simplified lowering context for generating subfunction MIR
+/// Used when creating BPF-to-BPF subfunctions from user-defined commands
+struct SubfunctionLowering<'a> {
+    /// The MIR function being built
+    func: &'a mut MirFunction,
+    /// IR block to lower
+    ir_block: &'a IrBlock,
+    /// Parameter VarId -> VReg mappings
+    param_map: HashMap<VarId, VReg>,
+    /// Nushell RegId -> MIR VReg mappings
+    reg_map: HashMap<u32, VReg>,
+    /// Current basic block
+    current_block: BlockId,
+}
+
+impl<'a> SubfunctionLowering<'a> {
+    fn new(
+        func: &'a mut MirFunction,
+        ir_block: &'a IrBlock,
+        params: &[(Option<VarId>, VReg)],
+    ) -> Self {
+        let param_map: HashMap<VarId, VReg> = params
+            .iter()
+            .filter_map(|(var_id, vreg)| var_id.map(|v| (v, *vreg)))
+            .collect();
+
+        Self {
+            func,
+            ir_block,
+            param_map,
+            reg_map: HashMap::new(),
+            current_block: BlockId(0),
+        }
+    }
+
+    fn lower(&mut self) -> Result<(), CompileError> {
+        self.current_block = self.func.entry;
+
+        for (ir_idx, inst) in self.ir_block.instructions.iter().enumerate() {
+            self.lower_instruction(inst, ir_idx)?;
+        }
+
+        Ok(())
+    }
+
+    fn get_vreg(&mut self, reg: RegId) -> VReg {
+        let reg_id = reg.get();
+        if let Some(&vreg) = self.reg_map.get(&reg_id) {
+            vreg
+        } else {
+            let vreg = self.func.alloc_vreg();
+            self.reg_map.insert(reg_id, vreg);
+            vreg
+        }
+    }
+
+    fn emit(&mut self, inst: MirInst) {
+        self.func
+            .block_mut(self.current_block)
+            .instructions
+            .push(inst);
+    }
+
+    fn terminate(&mut self, inst: MirInst) {
+        self.func.block_mut(self.current_block).terminator = inst;
+    }
+
+    fn lower_instruction(
+        &mut self,
+        inst: &Instruction,
+        _ir_idx: usize,
+    ) -> Result<(), CompileError> {
+        match inst {
+            Instruction::LoadLiteral { dst, lit } => {
+                let dst_vreg = self.get_vreg(*dst);
+                match lit {
+                    nu_protocol::ir::Literal::Int(i) => {
+                        self.emit(MirInst::Copy {
+                            dst: dst_vreg,
+                            src: MirValue::Const(*i),
+                        });
+                    }
+                    nu_protocol::ir::Literal::Bool(b) => {
+                        self.emit(MirInst::Copy {
+                            dst: dst_vreg,
+                            src: MirValue::Const(if *b { 1 } else { 0 }),
+                        });
+                    }
+                    _ => {
+                        return Err(CompileError::UnsupportedInstruction(
+                            "Unsupported literal type in subfunction".into(),
+                        ));
+                    }
+                }
+            }
+
+            Instruction::LoadVariable { dst, var_id } => {
+                let dst_vreg = self.get_vreg(*dst);
+                if let Some(&param_vreg) = self.param_map.get(var_id) {
+                    self.emit(MirInst::Copy {
+                        dst: dst_vreg,
+                        src: MirValue::VReg(param_vreg),
+                    });
+                } else {
+                    return Err(CompileError::UnsupportedInstruction(format!(
+                        "Unknown variable {} in subfunction",
+                        var_id.get()
+                    )));
+                }
+            }
+
+            Instruction::Move { dst, src } => {
+                let dst_vreg = self.get_vreg(*dst);
+                let src_vreg = self.get_vreg(*src);
+                self.emit(MirInst::Copy {
+                    dst: dst_vreg,
+                    src: MirValue::VReg(src_vreg),
+                });
+            }
+
+            Instruction::BinaryOp { lhs_dst, op, rhs } => {
+                use nu_protocol::ast::{Comparison, Math, Operator};
+
+                let dst_vreg = self.get_vreg(*lhs_dst);
+                let rhs_vreg = self.get_vreg(*rhs);
+
+                let mir_op = match op {
+                    Operator::Math(Math::Add) => BinOpKind::Add,
+                    Operator::Math(Math::Subtract) => BinOpKind::Sub,
+                    Operator::Math(Math::Multiply) => BinOpKind::Mul,
+                    Operator::Math(Math::Divide) => BinOpKind::Div,
+                    Operator::Math(Math::Modulo) => BinOpKind::Mod,
+                    Operator::Comparison(Comparison::Equal) => BinOpKind::Eq,
+                    Operator::Comparison(Comparison::NotEqual) => BinOpKind::Ne,
+                    Operator::Comparison(Comparison::LessThan) => BinOpKind::Lt,
+                    Operator::Comparison(Comparison::LessThanOrEqual) => BinOpKind::Le,
+                    Operator::Comparison(Comparison::GreaterThan) => BinOpKind::Gt,
+                    Operator::Comparison(Comparison::GreaterThanOrEqual) => BinOpKind::Ge,
+                    Operator::Bits(nu_protocol::ast::Bits::BitAnd) => BinOpKind::And,
+                    Operator::Bits(nu_protocol::ast::Bits::BitOr) => BinOpKind::Or,
+                    Operator::Bits(nu_protocol::ast::Bits::BitXor) => BinOpKind::Xor,
+                    Operator::Bits(nu_protocol::ast::Bits::ShiftLeft) => BinOpKind::Shl,
+                    Operator::Bits(nu_protocol::ast::Bits::ShiftRight) => BinOpKind::Shr,
+                    _ => {
+                        return Err(CompileError::UnsupportedInstruction(format!(
+                            "Unsupported binary operator {:?} in subfunction",
+                            op
+                        )));
+                    }
+                };
+
+                let temp = self.func.alloc_vreg();
+                self.emit(MirInst::Copy {
+                    dst: temp,
+                    src: MirValue::VReg(dst_vreg),
+                });
+                self.emit(MirInst::BinOp {
+                    dst: dst_vreg,
+                    op: mir_op,
+                    lhs: MirValue::VReg(temp),
+                    rhs: MirValue::VReg(rhs_vreg),
+                });
+            }
+
+            Instruction::Return { src } => {
+                let src_vreg = self.get_vreg(*src);
+                self.terminate(MirInst::Return {
+                    val: Some(MirValue::VReg(src_vreg)),
+                });
+            }
+
+            Instruction::ReturnEarly { src } => {
+                let src_vreg = self.get_vreg(*src);
+                self.terminate(MirInst::Return {
+                    val: Some(MirValue::VReg(src_vreg)),
+                });
+            }
+
+            // Skip instructions that don't produce code
+            Instruction::Drop { .. }
+            | Instruction::Drain { .. }
+            | Instruction::Clone { .. }
+            | Instruction::Collect { .. }
+            | Instruction::Span { .. } => {}
+
+            _ => {
+                return Err(CompileError::UnsupportedInstruction(format!(
+                    "Instruction {:?} not supported in subfunctions",
+                    inst
+                )));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
